@@ -18,6 +18,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreText/CoreText.h>
+#import <IOSurface/IOSurface.h>
 #include <objc/runtime.h>
 
 #include <cmath>
@@ -537,6 +538,9 @@ struct CALSurface {
   CGContextRef ctx = nullptr;
   size_t width = 0, height = 0;  // pixels
   double scale = 1;
+  // when the bitmap lives in an IOSurface (zero-copy presentation), the
+  // surface owns a reference and the layer scans out of the same memory
+  IOSurfaceRef iosurface = nullptr;
 };
 
 static CALSurface* SurfaceFrom(Napi::Value v) {
@@ -571,6 +575,119 @@ static Napi::Value CreateSurface(const Napi::CallbackInfo& info) {
     CGContextRelease(s->ctx);
     delete s;
   });
+}
+
+// createSurfaceIOSurface(widthPx, heightPx, scale)
+//   -> { handle, iosurfaceId }
+// The zero-copy presentation surface: the CG bitmap is laid directly over
+// an IOSurface's memory, so presenting is `layer.contents = iosurface` —
+// the WindowServer composites out of the buffer the painters drew into,
+// and the window-sized CGImage copy the plain surface pays per frame
+// never happens. Same top-left CTM contract as createSurface.
+static Napi::Value CreateSurfaceIOSurface(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  size_t w = (size_t)info[0].As<Napi::Number>().Int64Value();
+  size_t h = (size_t)info[1].As<Napi::Number>().Int64Value();
+  double scale = info.Length() > 2 ? info[2].As<Napi::Number>().DoubleValue() : 1;
+  if (w < 1) w = 1;
+  if (h < 1) h = 1;
+
+  NSDictionary* props = @{
+    (id)kIOSurfaceWidth : @(w),
+    (id)kIOSurfaceHeight : @(h),
+    (id)kIOSurfaceBytesPerElement : @4,
+    (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+  };
+  IOSurfaceRef ios = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+  if (!ios) {
+    Napi::Error::New(env, "IOSurfaceCreate failed").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CGContextRef ctx = CGBitmapContextCreateWithData(
+      IOSurfaceGetBaseAddress(ios), w, h, 8, IOSurfaceGetBytesPerRow(ios), cs,
+      kCGImageAlphaPremultipliedFirst | (CGBitmapInfo)kCGBitmapByteOrder32Host,
+      NULL, NULL);
+  CGColorSpaceRelease(cs);
+  if (!ctx) {
+    CFRelease(ios);
+    Napi::Error::New(env, "CGBitmapContextCreateWithData over IOSurface failed")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  CGContextTranslateCTM(ctx, 0, (CGFloat)h);
+  CGContextScaleCTM(ctx, 1, -1);
+  CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+  auto* s = new CALSurface{ctx, w, h, scale, ios};
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("handle", Napi::External<void>::New(env, s, [](Napi::Env, void* d) {
+            auto* p = (CALSurface*)d;
+            CGContextRelease(p->ctx);
+            if (p->iosurface) CFRelease(p->iosurface);
+            delete p;
+          }));
+  out.Set("iosurfaceId", (double)IOSurfaceGetID(ios));
+  return out;
+}
+
+// CPU access bracketing for an IOSurface-backed surface: lock before the
+// frame's first draw, unlock before handing the buffer to the layer. No-op
+// on a plain surface, so callers need not care which kind they hold.
+static Napi::Value SurfaceLock(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (s->iosurface) IOSurfaceLock(s->iosurface, 0, NULL);
+  return info.Env().Undefined();
+}
+static Napi::Value SurfaceUnlock(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (s->iosurface) IOSurfaceUnlock(s->iosurface, 0, NULL);
+  return info.Env().Undefined();
+}
+
+// copySurfaceRegion(src, dst, [x, y, w, h, ...]) — bring a swapchain's new
+// back buffer current: memcpy the named device-px rects. Same-size
+// surfaces only; rects are clamped. Null/empty rects list copies all.
+static Napi::Value CopySurfaceRegion(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALSurface* src = SurfaceFrom(info[0]);
+  CALSurface* dst = SurfaceFrom(info[1]);
+  if (src->width != dst->width || src->height != dst->height) {
+    Napi::Error::New(env, "copySurfaceRegion: size mismatch")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  const uint8_t* sbase = (const uint8_t*)CGBitmapContextGetData(src->ctx);
+  uint8_t* dbase = (uint8_t*)CGBitmapContextGetData(dst->ctx);
+  size_t srow = CGBitmapContextGetBytesPerRow(src->ctx);
+  size_t drow = CGBitmapContextGetBytesPerRow(dst->ctx);
+  if (!sbase || !dbase) return env.Undefined();
+  auto copyRect = [&](long x, long y, long w, long h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (long)src->width) w = (long)src->width - x;
+    if (y + h > (long)src->height) h = (long)src->height - y;
+    if (w <= 0 || h <= 0) return;
+    for (long r = 0; r < h; r++) {
+      memcpy(dbase + (size_t)(y + r) * drow + (size_t)x * 4,
+             sbase + (size_t)(y + r) * srow + (size_t)x * 4, (size_t)w * 4);
+    }
+  };
+  if (info.Length() < 3 || info[2].IsNull() || info[2].IsUndefined()) {
+    copyRect(0, 0, (long)src->width, (long)src->height);
+    return env.Undefined();
+  }
+  Napi::Array rects = info[2].As<Napi::Array>();
+  if (rects.Length() == 0) {
+    copyRect(0, 0, (long)src->width, (long)src->height);
+    return env.Undefined();
+  }
+  for (uint32_t i = 0; i + 3 < rects.Length(); i += 4) {
+    copyRect((long)rects.Get(i).As<Napi::Number>().Int64Value(),
+             (long)rects.Get(i + 1).As<Napi::Number>().Int64Value(),
+             (long)rects.Get(i + 2).As<Napi::Number>().Int64Value(),
+             (long)rects.Get(i + 3).As<Napi::Number>().Int64Value());
+  }
+  return env.Undefined();
 }
 
 static Napi::Value SurfaceSize(const Napi::CallbackInfo& info) {
@@ -2240,6 +2357,10 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("setBackendEventCallback", SetBackendEventCallback);
   BFN("pump2", Pump2);
   BFN("createSurface", CreateSurface);
+  BFN("createSurfaceIOSurface", CreateSurfaceIOSurface);
+  BFN("surfaceLock", SurfaceLock);
+  BFN("surfaceUnlock", SurfaceUnlock);
+  BFN("copySurfaceRegion", CopySurfaceRegion);
   BFN("surfaceSize", SurfaceSize);
   BFN("ctxSave", CtxSave);
   BFN("ctxRestore", CtxRestore);

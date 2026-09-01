@@ -344,9 +344,19 @@ static void SetColorProp(CALayer* L, Napi::Object o, const char* key,
 static void ApplyLayerProps(CALayer* L, Napi::Object o) {
   if (o.Has("frame")) L.frame = RectFrom(o.Get("frame"));
   if (o.Has("bounds")) {
+    // [w, h] or [x, y, w, h] — the four-element form carries a bounds
+    // ORIGIN, which is Core Animation's native scroll: the layer shows its
+    // sublayers shifted by (-x, -y) with nothing repainted.
     Napi::Array a = o.Get("bounds").As<Napi::Array>();
-    L.bounds = CGRectMake(0, 0, a.Get(0u).As<Napi::Number>().DoubleValue(),
-                          a.Get(1u).As<Napi::Number>().DoubleValue());
+    if (a.Length() >= 4) {
+      L.bounds = CGRectMake(a.Get(0u).As<Napi::Number>().DoubleValue(),
+                            a.Get(1u).As<Napi::Number>().DoubleValue(),
+                            a.Get(2u).As<Napi::Number>().DoubleValue(),
+                            a.Get(3u).As<Napi::Number>().DoubleValue());
+    } else {
+      L.bounds = CGRectMake(0, 0, a.Get(0u).As<Napi::Number>().DoubleValue(),
+                            a.Get(1u).As<Napi::Number>().DoubleValue());
+    }
   }
   if (o.Has("position")) L.position = PointFrom(o.Get("position"));
   if (o.Has("anchorPoint")) L.anchorPoint = PointFrom(o.Get("anchorPoint"));

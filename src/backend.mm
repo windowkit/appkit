@@ -1006,8 +1006,11 @@ static Napi::Value SurfaceToLayer(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-// scrollSurface(surface, x, y, w, h, dx, dy) — move a rect of pixels within
-// the bitmap (the scroll-blit fast path's memmove half).
+// scrollSurface(surface, x, y, w, h, dx, dy) — scroll the pixels WITHIN
+// the rect by (dx, dy), ntk Window.scrollRegion's exact contract: the
+// destination band is rect ∩ (rect + delta), so nothing is ever written
+// outside the rect (an upward scroll used to stamp the moved band over
+// whatever sat above the viewport). Returns whether anything moved.
 static Napi::Value ScrollSurface(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
   long x = info[1].As<Napi::Number>().Int64Value();
@@ -1018,37 +1021,36 @@ static Napi::Value ScrollSurface(const Napi::CallbackInfo& info) {
   long dy = info[6].As<Napi::Number>().Int64Value();
   uint8_t* base = (uint8_t*)CGBitmapContextGetData(s->ctx);
   size_t stride = CGBitmapContextGetBytesPerRow(s->ctx);
-  if (!base) return info.Env().Undefined();
+  if (!base || (dx == 0 && dy == 0))
+    return Napi::Boolean::New(info.Env(), false);
   auto clampL = [](long v, long lo, long hi) {
     return v < lo ? lo : v > hi ? hi : v;
   };
   long sw = (long)s->width, sh = (long)s->height;
-  long sx0 = clampL(x, 0, sw), sy0 = clampL(y, 0, sh);
-  long sx1 = clampL(x + w, 0, sw), sy1 = clampL(y + h, 0, sh);
-  long width = sx1 - sx0, height = sy1 - sy0;
-  if (width <= 0 || height <= 0) return info.Env().Undefined();
+  long x0 = clampL(x, 0, sw), y0 = clampL(y, 0, sh);
+  long x1 = clampL(x + w, 0, sw), y1 = clampL(y + h, 0, sh);
+  // the band that survives: dest = clamped rect ∩ (clamped rect + delta)
+  long dstX0 = std::max(x0, x0 + dx);
+  long dstY0 = std::max(y0, y0 + dy);
+  long dstX1 = std::min(x1, x1 + dx);
+  long dstY1 = std::min(y1, y1 + dy);
+  if (dstX1 <= dstX0 || dstY1 <= dstY0)
+    return Napi::Boolean::New(info.Env(), false);
+  long copyW = dstX1 - dstX0;
   if (dy <= 0) {
-    for (long row = 0; row < height; row++) {
-      long from = sy0 + row, to = from + dy;
-      if (to < 0 || to >= sh) continue;
-      long tx = clampL(sx0 + dx, 0, sw);
-      long copyW = std::min(width, sw - tx);
-      if (copyW > 0)
-        memmove(base + to * stride + tx * 4, base + from * stride + sx0 * 4,
-                (size_t)copyW * 4);
+    for (long ty = dstY0; ty < dstY1; ty++) {
+      memmove(base + ty * stride + dstX0 * 4,
+              base + (ty - dy) * stride + (dstX0 - dx) * 4,
+              (size_t)copyW * 4);
     }
   } else {
-    for (long row = height - 1; row >= 0; row--) {
-      long from = sy0 + row, to = from + dy;
-      if (to < 0 || to >= sh) continue;
-      long tx = clampL(sx0 + dx, 0, sw);
-      long copyW = std::min(width, sw - tx);
-      if (copyW > 0)
-        memmove(base + to * stride + tx * 4, base + from * stride + sx0 * 4,
-                (size_t)copyW * 4);
+    for (long ty = dstY1 - 1; ty >= dstY0; ty--) {
+      memmove(base + ty * stride + dstX0 * 4,
+              base + (ty - dy) * stride + (dstX0 - dx) * 4,
+              (size_t)copyW * 4);
     }
   }
-  return info.Env().Undefined();
+  return Napi::Boolean::New(info.Env(), true);
 }
 
 // ---------------------------------------------------------------------------

@@ -592,12 +592,24 @@ static Napi::Value CreateSurfaceIOSurface(const Napi::CallbackInfo& info) {
   if (w < 1) w = 1;
   if (h < 1) h = 1;
 
-  NSDictionary* props = @{
+  bool shared = info.Length() > 3 && info[3].ToBoolean().Value();
+  NSMutableDictionary* props = [@{
     (id)kIOSurfaceWidth : @(w),
     (id)kIOSurfaceHeight : @(h),
     (id)kIOSurfaceBytesPerElement : @4,
     (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
-  };
+  } mutableCopy];
+  // kIOSurfaceIsGlobal is the v1 cross-process route: a pane process
+  // creates its buffers with it and the host looks them up by plain id.
+  // Deprecated but stable; the clean upgrade is a mach-port handshake. Set
+  // ONLY when sharing — an explicit @NO disables the global registry entry
+  // that same-process IOSurfaceLookup (the window's own present) relies on.
+  if (shared) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    props[(id)kIOSurfaceIsGlobal] = @YES;
+#pragma clang diagnostic pop
+  }
   IOSurfaceRef ios = IOSurfaceCreate((__bridge CFDictionaryRef)props);
   if (!ios) {
     Napi::Error::New(env, "IOSurfaceCreate failed").ThrowAsJavaScriptException();
@@ -627,6 +639,50 @@ static Napi::Value CreateSurfaceIOSurface(const Napi::CallbackInfo& info) {
             delete p;
           }));
   out.Set("iosurfaceId", (double)IOSurfaceGetID(ios));
+  return out;
+}
+
+// surfaceFromIOSurfaceID(id, scale) -> { handle, width, height }
+// The consumer end of a shared pane buffer: look the surface up by its
+// process-global id and lay a CG bitmap over its memory, so a child
+// process paints into the very bytes the host's layer scans out of.
+static Napi::Value SurfaceFromIOSurfaceID(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  uint32_t sid = info[0].As<Napi::Number>().Uint32Value();
+  double scale = info.Length() > 1 ? info[1].As<Napi::Number>().DoubleValue() : 1;
+  IOSurfaceRef ios = IOSurfaceLookup(sid);
+  if (!ios) {
+    Napi::Error::New(env, "IOSurfaceLookup: no surface with that id")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  size_t w = IOSurfaceGetWidth(ios);
+  size_t h = IOSurfaceGetHeight(ios);
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CGContextRef ctx = CGBitmapContextCreateWithData(
+      IOSurfaceGetBaseAddress(ios), w, h, 8, IOSurfaceGetBytesPerRow(ios), cs,
+      kCGImageAlphaPremultipliedFirst | (CGBitmapInfo)kCGBitmapByteOrder32Host,
+      NULL, NULL);
+  CGColorSpaceRelease(cs);
+  if (!ctx) {
+    CFRelease(ios);
+    Napi::Error::New(env, "CGBitmapContextCreateWithData over looked-up IOSurface failed")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  CGContextTranslateCTM(ctx, 0, (CGFloat)h);
+  CGContextScaleCTM(ctx, 1, -1);
+  CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+  auto* s = new CALSurface{ctx, w, h, scale, ios};
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("handle", Napi::External<void>::New(env, s, [](Napi::Env, void* d) {
+            auto* p = (CALSurface*)d;
+            CGContextRelease(p->ctx);
+            if (p->iosurface) CFRelease(p->iosurface);
+            delete p;
+          }));
+  out.Set("width", (double)w);
+  out.Set("height", (double)h);
   return out;
 }
 
@@ -2384,6 +2440,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("pump2", Pump2);
   BFN("createSurface", CreateSurface);
   BFN("createSurfaceIOSurface", CreateSurfaceIOSurface);
+  BFN("surfaceFromIOSurfaceID", SurfaceFromIOSurfaceID);
   BFN("surfaceLock", SurfaceLock);
   BFN("surfaceUnlock", SurfaceUnlock);
   BFN("copySurfaceRegion", CopySurfaceRegion);

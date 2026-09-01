@@ -582,6 +582,174 @@ static Napi::Value SurfaceSize(const Napi::CallbackInfo& info) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// native control bezels — NSCell/NSControl rendered offscreen (the WebKit/
+// Gecko form-control technique), measured and drawn in one vocabulary so the
+// JS side can cache by parameters. Everything is in points; the surface's
+// own scale says how many pixels a point is worth.
+// ---------------------------------------------------------------------------
+
+static NSString* BStrOr(Napi::Object o, const char* k, NSString* d) {
+  if (!o.Has(k)) return d;
+  Napi::Value v = o.Get(k);
+  return v.IsString() ? BToNSString(v) : d;
+}
+
+static NSView* BezelDrawView() {
+  // Cells only consult the view for flippedness and appearance; it never
+  // needs a window.
+  static CALBackendView* v = nil;
+  if (!v) v = [[CALBackendView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 1000)];
+  return v;
+}
+
+// The two render paths AppKit leaves us: classic cells draw offscreen via
+// drawWithFrame:, while NSSlider's cell now renders through the view's layer
+// machinery and NSSwitch has no cell at all — those go through a real
+// offscreen NSControl and displayRectIgnoringOpacity:inContext:.
+struct BezelControl {
+  NSCell* cell = nil;
+  NSControl* view = nil;
+};
+
+static BezelControl BuildBezel(Napi::Env env, Napi::Object o) {
+  BezelControl out;
+  NSString* kind = BStrOr(o, "kind", @"push");
+  bool pressed = BBoolOr(o, "pressed", false);
+  bool enabled = BBoolOr(o, "enabled", true);
+  int state = (int)BNumOr(o, "state", 0);  // 0 off, 1 on
+
+  if ([kind isEqualToString:@"checkbox"] || [kind isEqualToString:@"radio"] ||
+      [kind isEqualToString:@"push"]) {
+    NSButtonCell* c = [[NSButtonCell alloc] initTextCell:BStrOr(o, "title", @"")];
+    if ([kind isEqualToString:@"checkbox"]) {
+      c.buttonType = NSButtonTypeSwitch;
+    } else if ([kind isEqualToString:@"radio"]) {
+      c.buttonType = NSButtonTypeRadio;
+    } else {
+      c.buttonType = NSButtonTypeMomentaryPushIn;
+      c.bezelStyle = NSBezelStylePush;
+      // the Return key equivalent is what makes AppKit fill it with the
+      // user's accent — the "default button" look
+      if (BBoolOr(o, "isDefault", false)) c.keyEquivalent = @"\r";
+    }
+    c.state = state == 1 ? NSControlStateValueOn : NSControlStateValueOff;
+    out.cell = c;
+  } else if ([kind isEqualToString:@"popup"]) {
+    NSPopUpButtonCell* c = [[NSPopUpButtonCell alloc] initTextCell:@"" pullsDown:NO];
+    [c addItemWithTitle:BStrOr(o, "title", @"")];
+    out.cell = c;
+  } else if ([kind isEqualToString:@"slider"]) {
+    NSSlider* s = [[NSSlider alloc] init];
+    s.minValue = 0;
+    s.maxValue = 1;
+    s.doubleValue = BNumOr(o, "value", 0.5);
+    out.view = s;
+  } else if ([kind isEqualToString:@"switch"]) {
+    NSSwitch* s = [[NSSwitch alloc] init];
+    s.state = state == 1 ? NSControlStateValueOn : NSControlStateValueOff;
+    out.view = s;
+  } else {
+    Napi::Error::New(env, "unknown control kind").ThrowAsJavaScriptException();
+    return out;
+  }
+
+  NSString* sz = BStrOr(o, "controlSize", @"regular");
+  NSControlSize csize = NSControlSizeRegular;
+  if ([sz isEqualToString:@"small"]) csize = NSControlSizeSmall;
+  else if ([sz isEqualToString:@"mini"]) csize = NSControlSizeMini;
+  else if ([sz isEqualToString:@"large"]) csize = NSControlSizeLarge;
+
+  if (out.cell) {
+    out.cell.controlSize = csize;
+    out.cell.font =
+        [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:csize]];
+    out.cell.enabled = enabled;
+    out.cell.highlighted = pressed;
+  } else if (out.view) {
+    out.view.controlSize = csize;
+    out.view.enabled = enabled;
+  }
+  return out;
+}
+
+static NSAppearance* BezelAppearance(Napi::Object o) {
+  NSString* name = BStrOr(o, "appearance", @"system");
+  if ([name isEqualToString:@"dark"])
+    return [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  if ([name isEqualToString:@"light"])
+    return [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+  return NSApp.effectiveAppearance;
+}
+
+// measureControl({kind, controlSize, title?}) -> {width, height} in points —
+// the control's natural size, which is the size the bezel is *designed* at:
+// stretching a checkbox distorts it, so layout adopts these.
+static Napi::Value MeasureControl(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  Napi::Object o = info[0].As<Napi::Object>();
+  BezelControl c = BuildBezel(env, o);
+  if (env.IsExceptionPending()) return env.Undefined();
+  double w = 0, h = 0;
+  if (c.cell) {
+    NSSize natural = c.cell.cellSize;
+    w = ceil(natural.width);
+    h = ceil(natural.height);
+  } else if (c.view) {
+    NSSize natural = c.view.intrinsicContentSize;
+    w = natural.width > 0 ? ceil(natural.width) : 100;
+    h = natural.height > 0 ? ceil(natural.height) : 22;
+  }
+  Napi::Object r = Napi::Object::New(env);
+  r.Set("width", w);
+  r.Set("height", h);
+  return r;
+}
+
+// drawControlIntoSurface(surface, params) — render the bezel to fill the
+// whole surface (surface px / scale = the frame in points). Clears first:
+// bezels are alpha-composited art, not opaque tiles.
+static Napi::Value DrawControlIntoSurface(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  CALSurface* s = SurfaceFrom(info[0]);
+  Napi::Object o = info[1].As<Napi::Object>();
+  BezelControl c = BuildBezel(env, o);
+  if (env.IsExceptionPending()) return env.Undefined();
+
+  double scale = s->scale > 0 ? s->scale : 1;
+  double w = s->width / scale, h = s->height / scale;
+
+  CGContextSaveGState(s->ctx);
+  // the surface's base CTM is already top-left-origin device pixels; clear
+  // in that space, then move to points for AppKit
+  CGContextClearRect(s->ctx, CGRectMake(0, 0, (CGFloat)s->width, (CGFloat)s->height));
+  CGContextScaleCTM(s->ctx, scale, scale);
+
+  NSGraphicsContext* g =
+      [NSGraphicsContext graphicsContextWithCGContext:s->ctx flipped:YES];
+  [NSGraphicsContext saveGraphicsState];
+  [NSGraphicsContext setCurrentContext:g];
+
+  NSAppearance* ap = BezelAppearance(o);
+  if (c.view) {
+    c.view.frame = NSMakeRect(0, 0, w, h);
+    c.view.appearance = ap;
+    [c.view layoutSubtreeIfNeeded];
+    [c.view displayRectIgnoringOpacity:c.view.bounds inContext:g];
+  } else if (c.cell) {
+    NSCell* cell = c.cell;
+    [ap performAsCurrentDrawingAppearance:^{
+      [cell drawWithFrame:NSMakeRect(0, 0, w, h) inView:BezelDrawView()];
+    }];
+  }
+
+  [NSGraphicsContext restoreGraphicsState];
+  CGContextRestoreGState(s->ctx);
+  return env.Undefined();
+}
+
 // --- drawing verbs. All take the surface handle first. ---------------------
 
 static Napi::Value CtxSave(const Napi::CallbackInfo& info) {
@@ -1949,6 +2117,8 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("pasteboardReadText", PbReadTextFn);
   BFN("pasteboardClear", PbClearFn);
   BFN("pasteboardChangeCount", PbChangeCountFn);
+  BFN("measureControl", MeasureControl);
+  BFN("drawControlIntoSurface", DrawControlIntoSurface);
   BFN("listScreens", ListScreens);
   BFN("setCursor", SetCursorFn);
   BFN("postKeyEvent", PostKeyEvent);

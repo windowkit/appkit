@@ -604,6 +604,18 @@ static Napi::Value CtxScale(const Napi::CallbackInfo& info) {
                     info[2].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
+static Napi::Value CtxTransform(const Napi::CallbackInfo& info) {
+  CGContextConcatCTM(SurfaceFrom(info[0])->ctx,
+                     CGAffineTransformMake(
+                         info[1].As<Napi::Number>().DoubleValue(),
+                         info[2].As<Napi::Number>().DoubleValue(),
+                         info[3].As<Napi::Number>().DoubleValue(),
+                         info[4].As<Napi::Number>().DoubleValue(),
+                         info[5].As<Napi::Number>().DoubleValue(),
+                         info[6].As<Napi::Number>().DoubleValue()));
+  return info.Env().Undefined();
+}
+
 static Napi::Value CtxRotate(const Napi::CallbackInfo& info) {
   CGContextRotateCTM(SurfaceFrom(info[0])->ctx,
                      info[1].As<Napi::Number>().DoubleValue());
@@ -1162,6 +1174,132 @@ static Napi::Value FontHasGlyph(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(info.Env(), ok);
 }
 
+// --- direct font handles (custom faces that bypass registry matching) -----
+
+static double CssWeightOfCTFont(CTFontRef ct) {
+  double weight = 400;
+  CFDictionaryRef traits = CTFontCopyTraits(ct);
+  if (traits) {
+    CFNumberRef w =
+        (CFNumberRef)CFDictionaryGetValue(traits, kCTFontWeightTrait);
+    if (w) {
+      double t = 0;
+      CFNumberGetValue(w, kCFNumberDoubleType, &t);
+      // AppKit's weight trait scale, approximately, back to CSS steps
+      weight = t <= -0.5   ? 200
+               : t <= -0.25 ? 300
+               : t < 0.1    ? 400
+               : t < 0.27   ? 500
+               : t < 0.35   ? 600
+               : t < 0.5    ? 700
+               : t < 0.62   ? 800
+                            : 900;
+    }
+    CFRelease(traits);
+  }
+  return weight;
+}
+
+// fontFromData(buffer) -> { cg: External<CGFont>, familyName,
+// postScriptName, weight, italic }. The CGFont is the process's own handle
+// to the face — no registry round trip, so a face CoreText refuses to
+// register (in-memory data) still renders. Registration is attempted as a
+// best effort so descriptor matching elsewhere can also find it.
+static Napi::Value FontFromData(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
+  CFDataRef data = CFDataCreate(NULL, buf.Data(), (CFIndex)buf.Length());
+  CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+  CFRelease(data);
+  CGFontRef cg = provider ? CGFontCreateWithDataProvider(provider) : NULL;
+  if (provider) CGDataProviderRelease(provider);
+  if (!cg) return env.Null();
+  CTFontManagerRegisterGraphicsFont(cg, NULL);  // best effort
+  CTFontRef ct = CTFontCreateWithGraphicsFont(cg, 12, NULL, NULL);
+  Napi::Object r = Napi::Object::New(env);
+  r.Set("cg", Napi::External<void>::New(env, (void*)cg, [](Napi::Env, void* d) {
+          CGFontRelease((CGFontRef)d);
+        }));
+  CFStringRef fam = CTFontCopyFamilyName(ct);
+  CFStringRef ps = CTFontCopyPostScriptName(ct);
+  if (fam) {
+    r.Set("familyName", [(__bridge NSString*)fam UTF8String]);
+    CFRelease(fam);
+  }
+  if (ps) {
+    r.Set("postScriptName", [(__bridge NSString*)ps UTF8String]);
+    CFRelease(ps);
+  }
+  r.Set("weight", CssWeightOfCTFont(ct));
+  r.Set("italic",
+        (bool)(CTFontGetSymbolicTraits(ct) & kCTFontTraitItalic));
+  CFRelease(ct);
+  return r;
+}
+
+// cgFontWithSize(cgExternal, size) -> CTFont handle (what layouts take)
+static Napi::Value CgFontWithSize(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CGFontRef cg = (CGFontRef)info[0].As<Napi::External<void>>().Data();
+  double size = info[1].As<Napi::Number>().DoubleValue();
+  CTFontRef ct = CTFontCreateWithGraphicsFont(cg, size, NULL, NULL);
+  if (!ct) return env.Null();
+  return Napi::External<void>::New(env, (void*)ct, [](Napi::Env, void* d) {
+    CFRelease(d);
+  });
+}
+
+// fontByPostScriptName(name, size) -> CTFont handle or null. Exact: a
+// fallback answer (a substituted face) reads as null so the caller can try
+// the next route.
+static Napi::Value FontByPostScriptName(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSString* name = BToNSString(info[0]);
+  double size = info[1].As<Napi::Number>().DoubleValue();
+  CTFontRef ct =
+      CTFontCreateWithName((__bridge CFStringRef)name, size, NULL);
+  if (!ct) return env.Null();
+  CFStringRef got = CTFontCopyPostScriptName(ct);
+  bool exact = got && [(__bridge NSString*)got isEqualToString:name];
+  if (got) CFRelease(got);
+  if (!exact) {
+    CFRelease(ct);
+    return env.Null();
+  }
+  return Napi::External<void>::New(env, (void*)ct, [](Napi::Env, void* d) {
+    CFRelease(d);
+  });
+}
+
+// fontApplyVariations(ctExternal, { wght: 600, opsz: 28, ... }) -> CTFont
+static Napi::Value FontApplyVariations(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CTFontRef base = (CTFontRef)info[0].As<Napi::External<void>>().Data();
+  Napi::Object vars = info[1].As<Napi::Object>();
+  Napi::Array names = vars.GetPropertyNames();
+  NSMutableDictionary* axes = [NSMutableDictionary dictionary];
+  for (uint32_t i = 0; i < names.Length(); i++) {
+    std::string tag = names.Get(i).As<Napi::String>().Utf8Value();
+    if (tag.size() != 4) continue;
+    Napi::Value v = vars.Get(tag.c_str());
+    if (!v.IsNumber()) continue;
+    uint32_t code = ((uint32_t)tag[0] << 24) | ((uint32_t)tag[1] << 16) |
+                    ((uint32_t)tag[2] << 8) | (uint32_t)tag[3];
+    axes[@(code)] = @(v.As<Napi::Number>().DoubleValue());
+  }
+  if (axes.count == 0) return info[0];
+  CTFontDescriptorRef d = CTFontDescriptorCreateWithAttributes(
+      (__bridge CFDictionaryRef)
+          @{(__bridge id)kCTFontVariationAttribute : axes});
+  CTFontRef ct =
+      CTFontCreateCopyWithAttributes(base, CTFontGetSize(base), NULL, d);
+  CFRelease(d);
+  if (!ct) return info[0];
+  return Napi::External<void>::New(env, (void*)ct, [](Napi::Env, void* d2) {
+    CFRelease(d2);
+  });
+}
+
 // listFonts({ family? , limit? }) -> [{ postScriptName, familyName,
 // styleName, path }]. With a family: that family's faces, in CoreText's
 // matching order. Without: every installed face (bounded by limit).
@@ -1303,17 +1441,22 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
                          : @"";
     if (text.length == 0) continue;
     NSFont* font = BDeref<NSFont*>(span.Get("font"));
-    CGColorRef color = span.Has("color") ? BMakeColor(span.Get("color"))
-                                         : CGColorCreateSRGB(0, 0, 0, 1);
     NSMutableParagraphStyle* para = [[NSMutableParagraphStyle alloc] init];
     para.baseWritingDirection =
         rtl ? NSWritingDirectionRightToLeft : NSWritingDirectionLeftToRight;
-    NSDictionary* attrs = @{
-      (__bridge id)kCTFontAttributeName : font,
-      (__bridge id)kCTForegroundColorAttributeName : (__bridge id)color,
-      NSParagraphStyleAttributeName : para,
-    };
-    CGColorRelease(color);
+    NSMutableDictionary* attrs = [NSMutableDictionary dictionary];
+    attrs[(__bridge id)kCTFontAttributeName] = font;
+    attrs[NSParagraphStyleAttributeName] = para;
+    if (span.Has("color") && span.Get("color").IsArray()) {
+      CGColorRef color = BMakeColor(span.Get("color"));
+      attrs[(__bridge id)kCTForegroundColorAttributeName] =
+          (__bridge id)color;
+      CGColorRelease(color);
+    } else {
+      // no colour on the span: the glyphs take the drawing context's fill,
+      // exactly like fillText — the contract layout.draw() has on ntk
+      attrs[(__bridge id)kCTForegroundColorFromContextAttributeName] = @YES;
+    }
     lastAttrs = attrs;
     [as appendAttributedString:[[NSAttributedString alloc] initWithString:text
                                                                attributes:attrs]];
@@ -1467,6 +1610,100 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
     CTLineDraw(L.line, ctx);
   }
   CGContextRestoreGState(ctx);
+  return info.Env().Undefined();
+}
+
+// drawLayoutGradient(surface, layoutHandle, x, y, x0, y0, x1, y1,
+//                    stops [offset,r,g,b,a,...])
+// The glyph outlines become the clip and a linear gradient fills through
+// them — gradient text ink, canvas-style.
+static Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  CALLayout* layout = LayoutFrom(info[1]);
+  double x = info[2].As<Napi::Number>().DoubleValue();
+  double y = info[3].As<Napi::Number>().DoubleValue();
+  double gx0 = info[4].As<Napi::Number>().DoubleValue();
+  double gy0 = info[5].As<Napi::Number>().DoubleValue();
+  double gx1 = info[6].As<Napi::Number>().DoubleValue();
+  double gy1 = info[7].As<Napi::Number>().DoubleValue();
+  Napi::Array stopsArr = info[8].As<Napi::Array>();
+  std::vector<CGFloat> locs;
+  std::vector<CGFloat> comps;
+  for (uint32_t i = 0; i + 4 < stopsArr.Length(); i += 5) {
+    locs.push_back(stopsArr.Get(i).As<Napi::Number>().DoubleValue());
+    for (uint32_t c = 1; c <= 4; c++)
+      comps.push_back(stopsArr.Get(i + c).As<Napi::Number>().DoubleValue());
+  }
+  CGContextRef ctx = s->ctx;
+  CGContextSaveGState(ctx);
+  // CTLineDraw saves/restores the graphics state internally, so a clip
+  // accumulated through kCGTextClip is popped with it — the classic trap.
+  // Build the outline path by hand instead: every glyph's path, flipped
+  // around its baseline into this surface's y-down space.
+  CGMutablePathRef outline = CGPathCreateMutable();
+  for (const CALLine& L : layout->lines) {
+    CFArrayRef runs = CTLineGetGlyphRuns(L.line);
+    for (CFIndex ri = 0; ri < CFArrayGetCount(runs); ri++) {
+      CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, ri);
+      CFDictionaryRef attrs = CTRunGetAttributes(run);
+      CTFontRef font =
+          (CTFontRef)CFDictionaryGetValue(attrs, kCTFontAttributeName);
+      if (!font) continue;
+      CFIndex count = CTRunGetGlyphCount(run);
+      std::vector<CGGlyph> glyphs((size_t)count);
+      std::vector<CGPoint> positions((size_t)count);
+      CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
+      CTRunGetPositions(run, CFRangeMake(0, 0), positions.data());
+      for (CFIndex g = 0; g < count; g++) {
+        CGAffineTransform t = {1, 0, 0, -1,
+                               x + L.x + positions[(size_t)g].x,
+                               y + L.baseline - positions[(size_t)g].y};
+        CGPathRef gp = CTFontCreatePathForGlyph(font, glyphs[(size_t)g], &t);
+        if (gp) {
+          CGPathAddPath(outline, NULL, gp);
+          CGPathRelease(gp);
+        }
+      }
+    }
+  }
+  CGContextBeginPath(ctx);
+  CGContextAddPath(ctx, outline);
+  CGPathRelease(outline);
+  CGContextClip(ctx);
+  if (!locs.empty()) {
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGGradientRef grad = CGGradientCreateWithColorComponents(
+        cs, comps.data(), locs.data(), locs.size());
+    CGColorSpaceRelease(cs);
+    CGContextDrawLinearGradient(ctx, grad, CGPointMake(gx0, gy0),
+                                CGPointMake(gx1, gy1),
+                                kCGGradientDrawsBeforeStartLocation |
+                                    kCGGradientDrawsAfterEndLocation);
+    CGGradientRelease(grad);
+  }
+  CGContextRestoreGState(ctx);
+  return info.Env().Undefined();
+}
+
+// ctxSetShadow(surface, blur, dx, dy, r, g, b, a) — blur <= 0 clears.
+static Napi::Value CtxSetShadow(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  double blur = info[1].As<Napi::Number>().DoubleValue();
+  if (blur <= 0) {
+    CGContextSetShadowWithColor(s->ctx, CGSizeMake(0, 0), 0, NULL);
+    return info.Env().Undefined();
+  }
+  double dx = info[2].As<Napi::Number>().DoubleValue();
+  double dy = info[3].As<Napi::Number>().DoubleValue();
+  CGColorRef color = CGColorCreateSRGB(
+      info[4].As<Napi::Number>().DoubleValue(),
+      info[5].As<Napi::Number>().DoubleValue(),
+      info[6].As<Napi::Number>().DoubleValue(),
+      info[7].As<Napi::Number>().DoubleValue());
+  // the base CTM is y-flipped, so a downward canvas offset is a negative
+  // CG one
+  CGContextSetShadowWithColor(s->ctx, CGSizeMake(dx, -dy), blur, color);
+  CGColorRelease(color);
   return info.Env().Undefined();
 }
 
@@ -1624,6 +1861,17 @@ static Napi::Value PostKeyEvent(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+
+// invalidateWindowShadow(win) — a transparent window's shadow is computed
+// by AppKit from the content's opaque shape; repaints do not recompute it
+// automatically, so a popup presented after its map keeps whatever shape
+// AppKit guessed first (a full-frame dark square). Call after presenting.
+static Napi::Value InvalidateWindowShadow(const Napi::CallbackInfo& info) {
+  NSWindow* win = BDeref<NSWindow*>(info[0]);
+  [win invalidateShadow];
+  return info.Env().Undefined();
+}
+
 // ---------------------------------------------------------------------------
 // registration (called from addon.mm's Init)
 // ---------------------------------------------------------------------------
@@ -1638,6 +1886,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("getWindowFrame", GetWindowFrame);
   BFN("setWindowMinMax", SetWindowMinMax);
   BFN("destroyWindow2", DestroyWindow2);
+  BFN("invalidateWindowShadow", InvalidateWindowShadow);
   BFN("activateApp", ActivateApp);
   BFN("setBackendEventCallback", SetBackendEventCallback);
   BFN("pump2", Pump2);
@@ -1648,6 +1897,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("ctxTranslate", CtxTranslate);
   BFN("ctxScale", CtxScale);
   BFN("ctxRotate", CtxRotate);
+  BFN("ctxTransform", CtxTransform);
   BFN("ctxBeginPath", CtxBeginPath);
   BFN("ctxMoveTo", CtxMoveTo);
   BFN("ctxLineTo", CtxLineTo);
@@ -1681,6 +1931,12 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("matchFont", MatchFont);
   BFN("fontMetrics", FontMetrics);
   BFN("fontHasGlyph", FontHasGlyph);
+  BFN("fontFromData", FontFromData);
+  BFN("cgFontWithSize", CgFontWithSize);
+  BFN("fontByPostScriptName", FontByPostScriptName);
+  BFN("fontApplyVariations", FontApplyVariations);
+  BFN("drawLayoutGradient", DrawLayoutGradient);
+  BFN("ctxSetShadow", CtxSetShadow);
   BFN("listFonts", ListFonts);
   BFN("loadFontData", LoadFontData);
   BFN("createLayout", CreateLayout);

@@ -856,9 +856,13 @@ static Napi::Value SnapshotWindow(const Napi::CallbackInfo& info) {
   // true WindowServer output, including geometryFlipped, masks, and shadows.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  bool withShadow = info.Length() > 2 && info[2].ToBoolean().Value();
   CGImageRef img = CGWindowListCreateImage(
       CGRectNull, kCGWindowListOptionIncludingWindow, (CGWindowID)win.windowNumber,
-      (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution));
+      withShadow
+          ? (CGWindowImageOption)kCGWindowImageBestResolution
+          : (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming |
+                                  kCGWindowImageBestResolution));
 #pragma clang diagnostic pop
   if (!img) return Napi::Boolean::New(env, false);
 

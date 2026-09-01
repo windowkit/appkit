@@ -748,6 +748,28 @@ static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o) {
     it.keyEquivalentModifierMask =
         (NSUInteger)BNumOr(o, "modifiers", NSEventModifierFlagCommand);
   }
+  // Icons, the serialisable pair from the dbusmenu vocabulary. `iconName`
+  // is read in the platform's own icon theme — SF Symbols — which renders
+  // as a template and follows the menu's appearance for free; a name the
+  // symbol catalogue does not know simply misses (a freedesktop name on
+  // its way to a Linux panel does the same in reverse). `iconData` is
+  // literal pixels (PNG bytes on the bus) and is the fallback.
+  NSString* iconName = BStrOr(o, "iconName", @"");
+  NSImage* icon = nil;
+  if (iconName.length) {
+    icon = [NSImage imageWithSystemSymbolName:iconName
+                     accessibilityDescription:nil];
+  }
+  if (!icon && o.Has("iconData")) {
+    Napi::Value v = o.Get("iconData");
+    if (v.IsBuffer()) {
+      Napi::Buffer<uint8_t> buf = v.As<Napi::Buffer<uint8_t>>();
+      NSData* bytes = [NSData dataWithBytes:buf.Data() length:buf.Length()];
+      icon = [[NSImage alloc] initWithData:bytes];
+      if (icon) icon.size = NSMakeSize(16, 16);
+    }
+  }
+  if (icon) it.image = icon;
   bool hasChildren = false;
   if (o.Has("items")) {
     Napi::Value v = o.Get("items");
@@ -822,6 +844,7 @@ static Napi::Object MenuInfo(Napi::Env env, NSMenu* menu) {
     io.Set("hidden", (bool)it.hidden);
     io.Set("separator", (bool)it.separatorItem);
     io.Set("checked", it.state == NSControlStateValueOn);
+    io.Set("hasImage", it.image != nil);
     io.Set("key", [it.keyEquivalent UTF8String]);
     if (it.submenu) io.Set("submenu", MenuInfo(env, it.submenu));
     arr.Set((uint32_t)i, io);

@@ -583,6 +583,166 @@ static Napi::Value SurfaceSize(const Napi::CallbackInfo& info) {
 }
 
 // ---------------------------------------------------------------------------
+// the macOS main menu — the global-menu adapter's native half. The JS side
+// owns the item model (react-x11's dbusmenu snapshot machinery, stable ids
+// via IdAllocator); this side turns one spec into an NSMenu tree and fires
+// a backend event with the item's id on activation, delivered through the
+// same callback every other event takes. Menu tracking is one of AppKit's
+// modal loops, and those already call into JS here (live resize does), so
+// activation needs no extra plumbing.
+// ---------------------------------------------------------------------------
+
+static NSString* BStrOr(Napi::Object o, const char* k, NSString* d);
+
+@interface CALMenuTarget : NSObject {
+ @public
+  napi_env env_;
+}
+- (void)activate:(NSMenuItem*)sender;
+@end
+@implementation CALMenuTarget
+- (void)activate:(NSMenuItem*)sender {
+  Napi::Env env(env_);
+  Napi::HandleScope scope(env);
+  Napi::Object ev = Napi::Object::New(env);
+  ev.Set("type", "menu-activate");
+  ev.Set("id", (double)sender.tag);
+  EmitToJS(env, ev);
+}
+@end
+
+static CALMenuTarget* gMenuTarget = nil;
+
+static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items);
+
+static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o) {
+  if (BBoolOr(o, "separator", false)) return [NSMenuItem separatorItem];
+  NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:BStrOr(o, "title", @"")
+                                              action:nil
+                                       keyEquivalent:@""];
+  it.tag = (NSInteger)BNumOr(o, "id", 0);
+  it.enabled = BBoolOr(o, "enabled", true);
+  it.hidden = BBoolOr(o, "hidden", false);
+  it.state = BBoolOr(o, "checked", false) ? NSControlStateValueOn
+                                          : NSControlStateValueOff;
+  NSString* key = BStrOr(o, "key", @"");
+  if (key.length) {
+    it.keyEquivalent = key;
+    it.keyEquivalentModifierMask =
+        (NSUInteger)BNumOr(o, "modifiers", NSEventModifierFlagCommand);
+  }
+  bool hasChildren = false;
+  if (o.Has("items")) {
+    Napi::Value v = o.Get("items");
+    if (v.IsArray() && v.As<Napi::Array>().Length() > 0) {
+      NSMenu* sub = BuildMenuFrom(env, v.As<Napi::Array>());
+      sub.title = it.title;
+      it.submenu = sub;
+      hasChildren = true;
+    }
+  }
+  if (!hasChildren) {
+    it.target = gMenuTarget;
+    it.action = @selector(activate:);
+  }
+  return it;
+}
+
+static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items) {
+  NSMenu* m = [[NSMenu alloc] initWithTitle:@""];
+  // we own enabled/hidden; AppKit's validation would grey everything whose
+  // target it cannot interrogate
+  m.autoenablesItems = NO;
+  for (uint32_t i = 0; i < items.Length(); i++) {
+    Napi::Value v = items.Get(i);
+    if (!v.IsObject()) continue;
+    [m addItem:BuildMenuItem(env, v.As<Napi::Object>())];
+  }
+  return m;
+}
+
+// setMainMenu(spec) — spec: [{title, items: [...]}, ...]. Entry 0 is the
+// app menu (macOS shows the process name for its title regardless).
+static Napi::Value SetMainMenuFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  if (!gMenuTarget) gMenuTarget = [CALMenuTarget new];
+  gMenuTarget->env_ = env;
+  Napi::Array spec = info[0].As<Napi::Array>();
+  NSMenu* main = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+  main.autoenablesItems = NO;
+  for (uint32_t i = 0; i < spec.Length(); i++) {
+    Napi::Value v = spec.Get(i);
+    if (!v.IsObject()) continue;
+    Napi::Object m = v.As<Napi::Object>();
+    NSString* title = BStrOr(m, "title", @"");
+    NSMenuItem* holder = [[NSMenuItem alloc] initWithTitle:title
+                                                    action:nil
+                                             keyEquivalent:@""];
+    Napi::Value items = m.Get("items");
+    NSMenu* sub = items.IsArray()
+                      ? BuildMenuFrom(env, items.As<Napi::Array>())
+                      : [[NSMenu alloc] initWithTitle:title];
+    sub.autoenablesItems = NO;
+    sub.title = title;
+    holder.submenu = sub;
+    [main addItem:holder];
+  }
+  [NSApp setMainMenu:main];
+  return env.Undefined();
+}
+
+static Napi::Object MenuInfo(Napi::Env env, NSMenu* menu) {
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("title", [menu.title UTF8String]);
+  Napi::Array arr = Napi::Array::New(env, menu.numberOfItems);
+  for (NSInteger i = 0; i < menu.numberOfItems; i++) {
+    NSMenuItem* it = [menu itemAtIndex:i];
+    Napi::Object io = Napi::Object::New(env);
+    io.Set("title", [it.title UTF8String]);
+    io.Set("id", (double)it.tag);
+    io.Set("enabled", (bool)it.enabled);
+    io.Set("hidden", (bool)it.hidden);
+    io.Set("separator", (bool)it.separatorItem);
+    io.Set("checked", it.state == NSControlStateValueOn);
+    io.Set("key", [it.keyEquivalent UTF8String]);
+    if (it.submenu) io.Set("submenu", MenuInfo(env, it.submenu));
+    arr.Set((uint32_t)i, io);
+  }
+  out.Set("items", arr);
+  return out;
+}
+
+// mainMenuInfo() — the installed menu bar as data, for tests.
+static Napi::Value MainMenuInfoFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSMenu* main = [NSApp mainMenu];
+  if (!main) return env.Null();
+  return MenuInfo(env, main);
+}
+
+// activateMenuItem([i, j, ...]) — walk the installed bar by index and fire
+// the leaf's action, the way tracking would. For tests.
+static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array path = info[0].As<Napi::Array>();
+  NSMenu* menu = [NSApp mainMenu];
+  if (!menu) return Napi::Boolean::New(env, false);
+  for (uint32_t d = 0; d + 1 < path.Length(); d++) {
+    NSInteger i = (NSInteger)path.Get(d).As<Napi::Number>().Int64Value();
+    if (i < 0 || i >= menu.numberOfItems) return Napi::Boolean::New(env, false);
+    menu = [menu itemAtIndex:i].submenu;
+    if (!menu) return Napi::Boolean::New(env, false);
+  }
+  NSInteger leaf = (NSInteger)
+      path.Get(path.Length() - 1).As<Napi::Number>().Int64Value();
+  if (leaf < 0 || leaf >= menu.numberOfItems)
+    return Napi::Boolean::New(env, false);
+  [menu performActionForItemAtIndex:leaf];
+  return Napi::Boolean::New(env, true);
+}
+
+// ---------------------------------------------------------------------------
 // native control bezels — NSCell/NSControl rendered offscreen (the WebKit/
 // Gecko form-control technique), measured and drawn in one vocabulary so the
 // JS side can cache by parameters. Everything is in points; the surface's
@@ -2136,6 +2296,9 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("pasteboardReadText", PbReadTextFn);
   BFN("pasteboardClear", PbClearFn);
   BFN("pasteboardChangeCount", PbChangeCountFn);
+  BFN("setMainMenu", SetMainMenuFn);
+  BFN("mainMenuInfo", MainMenuInfoFn);
+  BFN("activateMenuItem", ActivateMenuItemFn);
   BFN("measureControl", MeasureControl);
   BFN("drawControlIntoSurface", DrawControlIntoSurface);
   BFN("listScreens", ListScreens);

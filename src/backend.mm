@@ -1,4 +1,4 @@
-// node-calayers backend.mm — the surface the react-x11 Cocoa backend consumes.
+// @windowkit/appkit backend.mm — the surface the react-x11 Cocoa backend consumes.
 //
 // Everything here is mechanism, no policy: windows with delegates and
 // per-window event routing, an enriched event pump, CoreGraphics bitmap

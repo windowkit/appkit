@@ -1,4 +1,4 @@
-// node-calayers: retained-mode CALayer / CoreText backend for Node.js (POC)
+// @windowkit/appkit: retained-mode CALayer / CoreText backend for Node.js
 //
 // Design: node's main thread IS the process main thread on macOS, so we can own
 // NSApplication from JS. We never call [NSApp run]; instead JS drives an event

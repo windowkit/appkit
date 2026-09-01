@@ -12,7 +12,7 @@ const ca = require('..');
 const { app, Window, Layer, TextLayer, GradientLayer, ShapeLayer, transaction, withoutAnimations } = ca;
 
 const W = 800, H = 640;
-const win = new Window({ width: W, height: H, title: 'node-calayers — Core Animation from Node.js' });
+const win = new Window({ width: W, height: H, title: '@windowkit/appkit — Core Animation from Node.js' });
 const root = win.root;
 
 // Build the initial tree without implicit animations (so it doesn't fade in).
@@ -32,7 +32,7 @@ withoutAnimations(() => {
   const title = new TextLayer();
   title
     .set({ frame: [32, 22, W - 64, 34], contentsScale: win.scale })
-    .text({ string: 'node-calayers — CALayer scene graph from JavaScript',
+    .text({ string: '@windowkit/appkit — CALayer scene graph from JavaScript',
             fontName: 'HelveticaNeue-Bold', fontSize: 22, color: [1, 1, 1, 1] });
   root.add(title);
 

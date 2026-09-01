@@ -1,0 +1,94 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+
+  # The macOS prebuilds bundled into the tarball: darwin-arm64 built
+  # natively (macos-latest is Apple Silicon), darwin-x64 cross-compiled on
+  # the same runner — the addon is Node-API and macOS links addons with
+  # `-undefined dynamic_lookup`, so no x86_64 Node is needed, only the
+  # toolchain. binding.gyp pins MACOSX_DEPLOYMENT_TARGET=11.0, so both
+  # slices cover macOS 11+, and the addon links nothing but system
+  # frameworks, so one Node-API binary per arch covers every supported Node.
+  prebuild-macos:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: npm install --build-from-source
+      - name: Package the binaries as prebuilds (native arm64 + cross x64)
+        run: |
+          test "$(node -p process.arch)" = arm64
+          mkdir -p prebuilds/darwin-arm64 prebuilds/darwin-x64
+          cp build/Release/calayers.node prebuilds/darwin-arm64/
+          npx node-gyp rebuild --arch=x64
+          cp build/Release/calayers.node prebuilds/darwin-x64/
+          strip -x prebuilds/darwin-arm64/calayers.node prebuilds/darwin-x64/calayers.node
+          rm -rf build
+          node -e "require('./index.js')"
+          test "$(lipo -archs prebuilds/darwin-arm64/calayers.node)" = arm64
+          test "$(lipo -archs prebuilds/darwin-x64/calayers.node)" = x86_64
+          for f in prebuilds/darwin-arm64/calayers.node prebuilds/darwin-x64/calayers.node; do
+            if otool -L "$f" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
+              echo "prebuild links a non-system library — not portable"; exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-darwin
+          path: prebuilds/
+          if-no-files-found: error
+
+  # Publishes to npm via OIDC trusted publishing: no token secret anywhere.
+  # npm's registry trusts this exact repo + workflow file (configured in the
+  # package's Trusted Publisher settings on npmjs.com) and mints short-lived
+  # credentials from the id-token below. Requires npm >= 11.5.1. The tarball
+  # carries the prebuilds assembled above, so `npm install @windowkit/appkit`
+  # needs no Xcode toolchain on macOS 11+, Apple Silicon or Intel.
+  publish:
+    needs: [release-please, prebuild-macos]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.x
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-*
+          path: prebuilds/
+          merge-multiple: true
+      - name: Check every prebuild is in place
+        run: |
+          ls -laR prebuilds
+          test -f prebuilds/darwin-arm64/calayers.node
+          test -f prebuilds/darwin-x64/calayers.node
+      # install scripts are skipped on a scoped install here; the tarball
+      # ships the binaries and we do not want a source build on the runner
+      - run: npm publish --ignore-scripts

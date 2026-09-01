@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Build the addon and load it. AppKit needs a window server, which a
+  # hosted runner has (macOS runners run a real WindowServer session), so
+  # this both compiles and confirms the module initialises — creating a
+  # layer, laying out a line of CoreText, making an offscreen surface.
+  build-test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 22, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm install
+      - name: Load the addon and touch each subsystem
+        run: |
+          node -e "
+            const m = require('.');
+            const n = m.native ?? m;
+            const s = n.createSurface(64, 48, 2);
+            n.ctxSetFillColor(s, 1, 0, 0, 1);
+            n.ctxFillRect(s, 0, 0, 64, 48);
+            const px = n.ctxGetImageData(s, 10, 10, 1, 1);
+            if (px[0] !== 255) { console.error('paint check failed', [...px.slice(0,4)]); process.exit(1); }
+            const io = n.createSurfaceIOSurface(32, 32, 2, true);
+            if (!(io.iosurfaceId > 0)) { console.error('iosurface id'); process.exit(1); }
+            console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
+          "
+
+  # Same steps the release workflow uses to produce the prebuilt binaries
+  # bundled into the npm tarball — run on every change so a broken pipeline
+  # is discovered now, not at release time.
+  prebuild:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: npm install --build-from-source
+      - name: Package the binaries as prebuilds (native arm64 + cross x64)
+        run: |
+          test "$(node -p process.arch)" = arm64   # the native build below is host-arch
+          mkdir -p prebuilds/darwin-arm64 prebuilds/darwin-x64
+          cp build/Release/calayers.node prebuilds/darwin-arm64/
+          npx node-gyp rebuild --arch=x64
+          cp build/Release/calayers.node prebuilds/darwin-x64/
+          strip -x prebuilds/darwin-arm64/calayers.node prebuilds/darwin-x64/calayers.node   # -x: keep the exported symbols
+          rm -rf build
+          node -e "require('./index.js')"    # loads via the arm64 prebuild
+          # the x64 slice cannot be load-tested on this arm64 runner; hold it
+          # to the static checks instead
+          test "$(lipo -archs prebuilds/darwin-arm64/calayers.node)" = arm64
+          test "$(lipo -archs prebuilds/darwin-x64/calayers.node)" = x86_64
+          # A prebuild that pulled in a Node library or a Homebrew/XQuartz
+          # dylib would only load on the machine that built it. The addon
+          # links nothing but system frameworks and libSystem/libc++.
+          for f in prebuilds/darwin-arm64/calayers.node prebuilds/darwin-x64/calayers.node; do
+            otool -L "$f"
+            if otool -L "$f" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
+              echo "prebuild links a non-system library — not portable"; exit 1
+            fi
+          done
+          ls -la prebuilds/darwin-arm64 prebuilds/darwin-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-darwin
+          path: prebuilds/
+          if-no-files-found: error

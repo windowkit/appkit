@@ -1,6 +1,8 @@
-# node-calayers
+# @windowkit/appkit
 
-POC of a **retained-mode Core Animation (CALayer) + CoreText drawing backend for Node.js**.
+A **retained-mode AppKit backend for Node.js**: Core Animation (CALayer)
+layer trees, CoreText layout and drawing, IOSurface presentation, NSMenu and
+native control bezels. It is the macOS half of [react-x11][react-x11].
 Instead of immediate-mode draw calls, you build a persistent tree of layers, mutate their
 properties, and let the macOS WindowServer composite on the GPU — with implicit animations
 and correct retina handling for free.
@@ -55,7 +57,7 @@ screen-recording permission for the process's own windows).
 ## API sketch
 
 ```js
-const ca = require('node-calayers');
+const ca = require('@windowkit/appkit');
 const { app, Window, Layer, TextLayer, GradientLayer, ShapeLayer,
         transaction, withoutAnimations } = ca;
 
@@ -162,7 +164,7 @@ the real pump — used by the demo's self-test (`CAL_CLICKS="x,y;x,y" npm run de
 
 The shape of a host config on top of this:
 
-| Reconciler op        | node-calayers                                            |
+| Reconciler op        | @windowkit/appkit                                        |
 | -------------------- | -------------------------------------------------------- |
 | `createInstance`     | `new Layer()` / `new TextLayer()` / ... per element type |
 | `appendChild`        | `parent.add(child)`                                      |

@@ -1,10 +1,39 @@
 'use strict';
 
 if (process.platform !== 'darwin') {
-  throw new Error('node-calayers is macOS-only (Core Animation backend)');
+  throw new Error('@windowkit/appkit is macOS-only (Core Animation backend)');
 }
 
-const native = require('./build/Release/calayers.node');
+const fs = require('fs');
+const path = require('path');
+
+// A local build wins (dev iteration), then the prebuilt binary bundled in
+// the npm tarball for this platform/arch (see scripts/install.js — the
+// package works even when install scripts are disabled), then a clear error.
+function loadNative() {
+  const candidates = [
+    'build/Release/calayers.node',
+    'build/Debug/calayers.node',
+    `prebuilds/${process.platform}-${process.arch}/calayers.node`,
+  ];
+  const errors = [];
+  for (const rel of candidates) {
+    const abs = path.join(__dirname, rel);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      return require(abs);
+    } catch (e) {
+      errors.push(`  ${rel}: ${e.message}`);
+    }
+  }
+  throw new Error(
+    `@windowkit/appkit: no loadable native binary for ${process.platform}-${process.arch}\n` +
+      (errors.length ? `tried:\n${errors.join('\n')}\n` : '') +
+      'rebuild with: npm rebuild @windowkit/appkit --build-from-source (needs the Xcode command-line tools)',
+  );
+}
+
+const native = loadNative();
 
 // name -> wrapper, so native hitTest results map back to JS objects
 const layersByName = new Map();

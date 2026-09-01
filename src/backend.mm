@@ -1162,6 +1162,63 @@ static Napi::Value FontHasGlyph(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(info.Env(), ok);
 }
 
+// listFonts({ family? , limit? }) -> [{ postScriptName, familyName,
+// styleName, path }]. With a family: that family's faces, in CoreText's
+// matching order. Without: every installed face (bounded by limit).
+static Napi::Value ListFonts(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Object o = info.Length() > 0 && info[0].IsObject()
+                       ? info[0].As<Napi::Object>()
+                       : Napi::Object::New(env);
+  long limit = (long)BNumOr(o, "limit", 400);
+  NSString* family = o.Has("family") && o.Get("family").IsString()
+                         ? BToNSString(o.Get("family"))
+                         : nil;
+  CFArrayRef matches = NULL;
+  if (family && family.length > 0) {
+    CTFontDescriptorRef d = CTFontDescriptorCreateWithAttributes(
+        (__bridge CFDictionaryRef)
+            @{(__bridge id)kCTFontFamilyNameAttribute : family});
+    matches = CTFontDescriptorCreateMatchingFontDescriptors(d, NULL);
+    CFRelease(d);
+  } else {
+    CTFontCollectionRef all = CTFontCollectionCreateFromAvailableFonts(NULL);
+    matches = CTFontCollectionCreateMatchingFontDescriptors(all);
+    CFRelease(all);
+  }
+  Napi::Array out = Napi::Array::New(env);
+  if (!matches) return out;
+  CFIndex count = CFArrayGetCount(matches);
+  uint32_t written = 0;
+  for (CFIndex i = 0; i < count && written < (uint32_t)limit; i++) {
+    CTFontDescriptorRef d =
+        (CTFontDescriptorRef)CFArrayGetValueAtIndex(matches, i);
+    Napi::Object row = Napi::Object::New(env);
+    CFStringRef ps = (CFStringRef)CTFontDescriptorCopyAttribute(
+        d, kCTFontNameAttribute);
+    CFStringRef fam = (CFStringRef)CTFontDescriptorCopyAttribute(
+        d, kCTFontFamilyNameAttribute);
+    CFStringRef styleName = (CFStringRef)CTFontDescriptorCopyAttribute(
+        d, kCTFontStyleNameAttribute);
+    CFURLRef url =
+        (CFURLRef)CTFontDescriptorCopyAttribute(d, kCTFontURLAttribute);
+    if (ps) row.Set("postScriptName", [(__bridge NSString*)ps UTF8String]);
+    if (fam) row.Set("familyName", [(__bridge NSString*)fam UTF8String]);
+    if (styleName) row.Set("styleName", [(__bridge NSString*)styleName UTF8String]);
+    if (url) {
+      NSString* path = ((__bridge NSURL*)url).path;
+      if (path) row.Set("path", path.UTF8String);
+    }
+    if (ps) CFRelease(ps);
+    if (fam) CFRelease(fam);
+    if (styleName) CFRelease(styleName);
+    if (url) CFRelease(url);
+    out.Set(written++, row);
+  }
+  CFRelease(matches);
+  return out;
+}
+
 // loadFontData(buffer) -> registers the font with CoreText, returns the
 // PostScript name (for app-supplied font files — react-x11's loadFont()).
 static Napi::Value LoadFontData(const Napi::CallbackInfo& info) {
@@ -1303,7 +1360,7 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       CGFloat ascent = 0, descent = 0, leading = 0;
       double lw = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
       double natural = ascent + descent + leading;
-      double advance = lineHeight > 0 ? lineHeight : natural;
+      double advance = natural * (lineHeight > 0 ? lineHeight : 1);
       CALLine L;
       L.line = line;
       L.width = lw;
@@ -1624,6 +1681,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("matchFont", MatchFont);
   BFN("fontMetrics", FontMetrics);
   BFN("fontHasGlyph", FontHasGlyph);
+  BFN("listFonts", ListFonts);
   BFN("loadFontData", LoadFontData);
   BFN("createLayout", CreateLayout);
   BFN("drawLayout", DrawLayout);

@@ -1120,16 +1120,19 @@ static Napi::Value CtxRoundRect(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxArc(const Napi::CallbackInfo& info) {
-  // arc(surface, x, y, r, a0, a1, anticlockwise). The base CTM is y-flipped,
-  // so CG's notion of clockwise inverts: pass the flag through directly and
-  // the on-screen result matches canvas.
+  // arc(surface, x, y, r, a0, a1, anticlockwise). Angles live in user
+  // space, where canvas's y-down "clockwise" sweep is the INCREASING-angle
+  // direction — which is what CG calls counterclockwise (clockwise = 0).
+  // The flag therefore maps straight across, not inverted: getting this
+  // backwards leaves full circles (donuts) looking right and every partial
+  // arc sweeping the long way round — the raster-gate gauges caught it.
   CGContextAddArc(SurfaceFrom(info[0])->ctx,
                   info[1].As<Napi::Number>().DoubleValue(),
                   info[2].As<Napi::Number>().DoubleValue(),
                   info[3].As<Napi::Number>().DoubleValue(),
                   info[4].As<Napi::Number>().DoubleValue(),
                   info[5].As<Napi::Number>().DoubleValue(),
-                  info[6].ToBoolean().Value() ? 0 : 1);
+                  info[6].ToBoolean().Value() ? 1 : 0);
   return info.Env().Undefined();
 }
 static Napi::Value CtxEllipse(const Napi::CallbackInfo& info) {

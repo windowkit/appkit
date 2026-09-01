@@ -1567,6 +1567,7 @@ struct CALLine {
   double x = 0, y = 0, width = 0, height = 0, baseline = 0, ascent = 0,
          descent = 0;
   long start = 0, end = 0;  // UTF-16 units
+  bool hardBreak = false;   // the line ends with a newline it owns
   std::vector<CALRun> runs;
 };
 
@@ -1684,6 +1685,11 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       L.baseline = y + ascent;
       L.start = start;
       L.end = lineEnd;
+      if (lineEnd > start) {
+        unichar last = [[as string] characterAtIndex:(NSUInteger)(lineEnd - 1)];
+        L.hardBreak =
+            last == '\n' || last == '\r' || last == 0x2028 || last == 0x2029;
+      }
       if (bounded && flush > 0) {
         L.x = CTLineGetPenOffsetForFlush(line, flush, maxWidth);
       }
@@ -1893,10 +1899,19 @@ static Napi::Value LayoutIndexAt(const Napi::CallbackInfo& info) {
   CFIndex idx =
       CTLineGetStringIndexForPosition(pick->line, CGPointMake(x - pick->x, 0));
   if (idx == kCFNotFound) idx = pick->end;
+  // Trailing-newline aware, ntk's contract: a hit at or past the right edge
+  // of a hard-wrapped line answers the end of its VISIBLE content. The index
+  // after the newline is the next line's start, and a caret sent there has
+  // visually not moved — vertical arrow movement then sticks on the
+  // boundary instead of climbing.
+  if (pick->hardBreak && idx >= pick->end) idx = pick->end - 1;
   return Napi::Number::New(info.Env(), (double)idx);
 }
 
-// layoutCaret(layoutHandle, utf16Index) -> { x, y, height }
+// layoutCaret(layoutHandle, utf16Index) -> { x, y, height, line }
+// `line` is the line INDEX — the field ntk's caretPosition contract carries
+// and vertical caret movement steps by (lines[pos.line + delta]); without
+// it an arrow-down in a textarea indexes lines[NaN].
 static Napi::Value LayoutCaret(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CALLayout* layout = LayoutFrom(info[0]);
@@ -1906,20 +1921,24 @@ static Napi::Value LayoutCaret(const Napi::CallbackInfo& info) {
     r.Set("x", 0);
     r.Set("y", 0);
     r.Set("height", 0);
+    r.Set("line", 0);
     return r;
   }
-  const CALLine* pick = &layout->lines.back();
-  for (const CALLine& L : layout->lines) {
+  size_t li = layout->lines.size() - 1;
+  for (size_t i = 0; i < layout->lines.size(); i++) {
+    const CALLine& L = layout->lines[i];
     // an index at a line's end belongs to that line, not the next one's start
-    if (idx < L.end || (idx == L.end && &L == &layout->lines.back())) {
-      pick = &L;
+    if (idx < L.end || (idx == L.end && i == layout->lines.size() - 1)) {
+      li = i;
       break;
     }
   }
+  const CALLine* pick = &layout->lines[li];
   double x = CTLineGetOffsetForStringIndex(pick->line, idx, NULL);
   r.Set("x", pick->x + x);
   r.Set("y", pick->y);
   r.Set("height", pick->height);
+  r.Set("line", (double)li);
   return r;
 }
 

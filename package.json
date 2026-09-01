@@ -1,0 +1,19 @@
+{
+  "name": "node-calayers",
+  "version": "0.1.0",
+  "description": "POC: retained-mode Core Animation (CALayer) + CoreText drawing backend for Node.js",
+  "main": "index.js",
+  "os": [
+    "darwin"
+  ],
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "demo": "node demo/demo.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.3.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.0.0"
+  }
+}

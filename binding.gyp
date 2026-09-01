@@ -18,7 +18,8 @@
           "-framework QuartzCore",
           "-framework CoreText",
           "-framework CoreGraphics",
-          "-framework ImageIO"
+          "-framework ImageIO",
+          "-framework IOSurface"
         ]
       }
     }

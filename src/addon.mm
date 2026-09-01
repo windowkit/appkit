@@ -8,6 +8,7 @@
 
 #include <napi.h>
 #import <Cocoa/Cocoa.h>
+#import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreText/CoreText.h>
 #import <ImageIO/ImageIO.h>
@@ -845,6 +846,30 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
   return r;
 }
 
+// setLayerContentsIOSurface(layer, iosurfaceId) — the receiving end of an
+// IOSurface render target (x11-dri's appleCreateTarget): the id is process-
+// global, so the GPU addon and this one never share a pointer. The layer
+// retains the surface; our lookup reference is dropped immediately.
+static Napi::Value SetLayerContentsIOSurface(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALayer* L = Deref<CALayer*>(info[0]);
+  uint32_t sid = info[1].As<Napi::Number>().Uint32Value();
+  IOSurfaceRef surface = IOSurfaceLookup(sid);
+  if (!surface) {
+    Napi::Error::New(env, "IOSurfaceLookup: no surface with that id")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  // its own transaction, actions off: a present is a buffer flip, and the
+  // implicit action for `contents` would turn it into a crossfade
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  L.contents = (__bridge id)surface;
+  [CATransaction commit];
+  CFRelease(surface);
+  return env.Undefined();
+}
+
 static Napi::Value AppearanceIsDark(const Napi::CallbackInfo& info) {
   EnsureApp();
   NSAppearanceName n = [NSApp.effectiveAppearance
@@ -930,6 +955,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   FN("measureText", MeasureText);
   FN("createTextImage", CreateTextImage);
   FN("setContentsImage", SetContentsImage);
+  FN("setLayerContentsIOSurface", SetLayerContentsIOSurface);
   FN("drawControl", DrawControl);
   FN("appearanceIsDark", AppearanceIsDark);
 #undef FN

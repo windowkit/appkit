@@ -3,9 +3,10 @@
 // Everything here is mechanism, no policy: windows with delegates and
 // per-window event routing, an enriched event pump, CoreGraphics bitmap
 // surfaces with a canvas-shaped drawing API, a CoreText layout engine
-// (measure + draw + caret/hit geometry), pasteboard text, screen lists and
-// cursors. The retained-layer API stays in addon.mm; this file is what a
-// renderer paints and listens through.
+// (measure + draw + caret/hit geometry) with glyph-level natives beside it
+// (ids, advances, fallback faces, glyph-run drawing), pasteboard text,
+// screen lists and cursors. The retained-layer API stays in addon.mm; this
+// file is what a renderer paints and listens through.
 //
 // Coordinate rule, stated once: every point that crosses this boundary is
 // TOP-LEFT origin. Window frames and screen rects are top-left in global
@@ -1703,6 +1704,268 @@ static Napi::Value FontHasGlyph(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(info.Env(), ok);
 }
 
+// --- glyph-level natives ---------------------------------------------------
+//
+// createLayout/drawLayout shape text at the line level. A renderer that
+// positions glyphs itself — a terminal grid, a tabular column — needs the
+// glyph, its advance, a face that covers what the base face does not, and
+// a way to draw a run of ids at positions of its own choosing without a
+// typesetter in the middle (ctxDrawGlyphs, beside drawLayout below).
+// Shaping — ligatures, kerning, bidi — stays the typesetter's job; a grid
+// renderer bypasses it on purpose.
+
+// A font handle is an External over an NSFont (matchFont) or a CTFont
+// (cgFontWithSize and friends); the two are toll-free bridged, so one
+// accessor serves both.
+static CTFontRef BFontFrom(Napi::Value v) {
+  return (CTFontRef)v.As<Napi::External<void>>().Data();
+}
+
+static bool BCheckFontArg(const Napi::CallbackInfo& info, const char* fn) {
+  if (info[0].IsExternal()) return true;
+  Napi::TypeError::New(info.Env(), std::string(fn) + ": expected a font handle")
+      .ThrowAsJavaScriptException();
+  return false;
+}
+
+// One code point -> its UTF-16 form. False for a surrogate or an
+// out-of-range value.
+static bool BUtf16ForCodepoint(uint32_t cp, unichar out[2], CFIndex* len) {
+  if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+  if (cp < 0x10000) {
+    out[0] = (unichar)cp;
+    *len = 1;
+    return true;
+  }
+  cp -= 0x10000;
+  out[0] = (unichar)(0xD800 + (cp >> 10));
+  out[1] = (unichar)(0xDC00 + (cp & 0x3FF));
+  *len = 2;
+  return true;
+}
+
+// A code point argument: a number, or a string read for its first code
+// point. False when there is none.
+static bool BCodepointArg(Napi::Value v, uint32_t* cp) {
+  if (v.IsNumber()) {
+    double d = v.As<Napi::Number>().DoubleValue();
+    if (!(d >= 0 && d <= 0x10FFFF)) return false;  // NaN fails too
+    *cp = (uint32_t)d;
+    return true;
+  }
+  if (v.IsString()) {
+    std::u16string s = v.As<Napi::String>().Utf16Value();
+    if (s.empty()) return false;
+    uint32_t hi = s[0];
+    if (hi >= 0xD800 && hi <= 0xDBFF && s.size() > 1 && s[1] >= 0xDC00 &&
+        s[1] <= 0xDFFF) {
+      *cp = 0x10000 + ((hi - 0xD800) << 10) + ((uint32_t)s[1] - 0xDC00);
+    } else {
+      *cp = hi;
+    }
+    return true;
+  }
+  return false;
+}
+
+// The glyph a face maps one code point to, 0 when it does not: glyph 0 is
+// .notdef in every sfnt and what CTFontGetGlyphsForCharacters answers for
+// an unmapped character. A non-BMP character is sparse — its glyph sits in
+// the high surrogate's slot and the low surrogate's slot is 0 by design,
+// which is not a failure.
+static CGGlyph BGlyphForCodepoint(CTFontRef font, uint32_t cp) {
+  unichar buf[2];
+  CFIndex len = 0;
+  if (!BUtf16ForCodepoint(cp, buf, &len)) return 0;
+  CGGlyph glyphs[2] = {0, 0};
+  CTFontGetGlyphsForCharacters(font, buf, glyphs, len);
+  return glyphs[0];
+}
+
+// Glyph ids for a run. A Uint16Array is used in place (CGGlyph is a
+// uint16); any other array of numbers is copied into `store`.
+static const CGGlyph* BGlyphsArg(Napi::Value v, std::vector<CGGlyph>* store,
+                                 size_t* count) {
+  if (v.IsTypedArray() &&
+      v.As<Napi::TypedArray>().TypedArrayType() == napi_uint16_array) {
+    Napi::Uint16Array a = v.As<Napi::Uint16Array>();
+    *count = a.ElementLength();
+    return a.Data();
+  }
+  store->clear();
+  size_t n = v.IsTypedArray() ? v.As<Napi::TypedArray>().ElementLength()
+             : v.IsArray()    ? v.As<Napi::Array>().Length()
+                              : 0;
+  if (n > 0) {
+    Napi::Object o = v.As<Napi::Object>();
+    store->reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+      Napi::Value e = o.Get(i);
+      store->push_back(
+          e.IsNumber() ? (CGGlyph)e.As<Napi::Number>().Uint32Value() : 0);
+    }
+  }
+  *count = store->size();
+  return store->data();
+}
+
+// Glyph origins for a run, x0,y0,x1,y1,… in canvas space, converted into
+// the frame CTFontDrawGlyphs reads: its positions are in TEXT space — the
+// text matrix applies to them, not only to the outlines (the trap WebKit's
+// fillVectorWithHorizontalGlyphPositions documents) — and the text matrix
+// here is the y-flip, so each origin's y is negated on the way in. A
+// Float64Array is read directly; any other array of numbers is accepted.
+static void BGlyphOriginsArg(Napi::Value v, std::vector<CGPoint>* out) {
+  out->clear();
+  if (v.IsTypedArray() &&
+      v.As<Napi::TypedArray>().TypedArrayType() == napi_float64_array) {
+    Napi::Float64Array a = v.As<Napi::Float64Array>();
+    const double* d = a.Data();
+    size_t n = a.ElementLength() / 2;
+    out->reserve(n);
+    for (size_t i = 0; i < n; i++)
+      out->push_back(CGPointMake(d[2 * i], -d[2 * i + 1]));
+    return;
+  }
+  size_t n = v.IsTypedArray() ? v.As<Napi::TypedArray>().ElementLength()
+             : v.IsArray()    ? v.As<Napi::Array>().Length()
+                              : 0;
+  if (n < 2) return;
+  Napi::Object o = v.As<Napi::Object>();
+  out->reserve(n / 2);
+  for (uint32_t i = 0; i + 1 < n; i += 2) {
+    Napi::Value x = o.Get(i), y = o.Get(i + 1);
+    out->push_back(
+        CGPointMake(x.IsNumber() ? x.As<Napi::Number>().DoubleValue() : 0,
+                    -(y.IsNumber() ? y.As<Napi::Number>().DoubleValue() : 0)));
+  }
+}
+
+// fontGlyphForCodepoint(font, codepoint) -> glyph id | null
+// The answer fontHasGlyph throws away. null when the face does not map the
+// code point — the caller wants "not covered" as a branch (pick a fallback
+// face), not glyph 0 discovered on screen. `codepoint` is a number; a
+// string is read for its first code point.
+static Napi::Value FontGlyphForCodepoint(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!BCheckFontArg(info, "fontGlyphForCodepoint")) return env.Undefined();
+  uint32_t cp = 0;
+  if (!BCodepointArg(info[1], &cp)) return env.Null();
+  CGGlyph g = BGlyphForCodepoint(BFontFrom(info[0]), cp);
+  if (g == 0) return env.Null();
+  return Napi::Number::New(env, (double)g);
+}
+
+// fontGlyphAdvances(font, glyphs: Uint16Array) -> Float64Array
+// Horizontal advances, in points at the handle's size — what a monospace
+// grid reads its cell width from (the advance of "0").
+static Napi::Value FontGlyphAdvances(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!BCheckFontArg(info, "fontGlyphAdvances")) return env.Undefined();
+  std::vector<CGGlyph> store;
+  size_t count = 0;
+  const CGGlyph* glyphs = BGlyphsArg(info[1], &store, &count);
+  Napi::Float64Array out = Napi::Float64Array::New(env, count);
+  if (count == 0) return out;
+  std::vector<CGSize> advances(count);
+  CTFontGetAdvancesForGlyphs(BFontFrom(info[0]), kCTFontOrientationHorizontal,
+                             glyphs, advances.data(), (CFIndex)count);
+  for (size_t i = 0; i < count; i++) out[i] = advances[i].width;
+  return out;
+}
+
+// Code points a cmap rarely lists and the typesetter never draws: C0/C1
+// controls and Unicode's default ignorables (soft hyphen, joiners, bidi
+// controls, variation selectors, tags). Coverage checks skip them.
+static bool BIgnorableForCoverage(uint32_t cp) {
+  if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) return true;
+  switch (cp >> 16) {
+    case 0x00:
+      return cp == 0x00AD || cp == 0x034F || cp == 0x061C ||
+             (cp >= 0x115F && cp <= 0x1160) ||
+             (cp >= 0x17B4 && cp <= 0x17B5) ||
+             (cp >= 0x180B && cp <= 0x180F) ||
+             (cp >= 0x200B && cp <= 0x200F) ||
+             (cp >= 0x202A && cp <= 0x202E) ||
+             (cp >= 0x2060 && cp <= 0x206F) || cp == 0x3164 ||
+             (cp >= 0xFE00 && cp <= 0xFE0F) || cp == 0xFEFF ||
+             cp == 0xFFA0 || (cp >= 0xFFF0 && cp <= 0xFFF8);
+    case 0x01:
+      return (cp >= 0x1BCA0 && cp <= 0x1BCA3) ||
+             (cp >= 0x1D173 && cp <= 0x1D17A);
+    case 0x0E:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Does the face's cmap map every code point of `s` that would be drawn?
+static bool BFontCovers(CTFontRef font, NSString* s) {
+  NSUInteger n = s.length;
+  if (n == 0) return true;
+  std::vector<unichar> chars(n);
+  [s getCharacters:chars.data() range:NSMakeRange(0, n)];
+  std::vector<CGGlyph> glyphs(n, 0);
+  CTFontGetGlyphsForCharacters(font, chars.data(), glyphs.data(), (CFIndex)n);
+  for (NSUInteger i = 0; i < n; i++) {
+    uint32_t cp = chars[i];
+    bool pair = cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n &&
+                chars[i + 1] >= 0xDC00 && chars[i + 1] <= 0xDFFF;
+    if (pair) cp = 0x10000 + ((cp - 0xD800) << 10) + (chars[i + 1] - 0xDC00);
+    if (glyphs[i] == 0 && !BIgnorableForCoverage(cp)) return false;
+    if (pair) i++;  // the low surrogate's slot is 0 by design
+  }
+  return true;
+}
+
+// fontFallbackFor(font, text) -> font handle | null
+// CTFontCreateForString over the font's cascade list: the face CoreText
+// would substitute for `text`, at the same size — box drawing in a font
+// that has none, CJK, emoji. Answers the handle itself when the face
+// already covers the text (`fallback === font` reads as "no substitution
+// needed") and null when nothing covers it. `text` may also be a code
+// point number.
+static Napi::Value FontFallbackFor(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!BCheckFontArg(info, "fontFallbackFor")) return env.Undefined();
+  CTFontRef font = BFontFrom(info[0]);
+  NSString* text = nil;
+  if (info[1].IsString()) {
+    text = BToNSString(info[1]);
+  } else {
+    uint32_t cp = 0;
+    unichar buf[2];
+    CFIndex len = 0;
+    if (BCodepointArg(info[1], &cp) && BUtf16ForCodepoint(cp, buf, &len))
+      text = [NSString stringWithCharacters:buf length:(NSUInteger)len];
+  }
+  if (!text) return env.Null();
+  if (text.length == 0) return info[0];
+  CTFontRef sub = CTFontCreateForString(font, (__bridge CFStringRef)text,
+                                        CFRangeMake(0, (CFIndex)text.length));
+  if (!sub) return env.Null();
+  if (CFEqual(sub, font)) {
+    // CoreText hands the font itself back both when it covers the text
+    // and when nothing in the cascade does; the cmap tells the two apart.
+    CFRelease(sub);
+    return BFontCovers(font, text) ? info[0] : env.Null();
+  }
+  // LastResort is CoreText's own "nothing covers it": a box with the
+  // block's name in it. The caller asked for that as a branch, not a glyph.
+  CFStringRef ps = CTFontCopyPostScriptName(sub);
+  bool lastResort =
+      ps && CFStringCompare(ps, CFSTR("LastResort"), 0) == kCFCompareEqualTo;
+  if (ps) CFRelease(ps);
+  if (lastResort) {
+    CFRelease(sub);
+    return env.Null();
+  }
+  return Napi::External<void>::New(env, (void*)sub, [](Napi::Env, void* d) {
+    CFRelease(d);
+  });
+}
+
 // --- direct font handles (custom faces that bypass registry matching) -----
 
 static double CssWeightOfCTFont(CTFontRef ct) {
@@ -2148,6 +2411,46 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// ctxDrawGlyphs(surface, runs) — CTFontDrawGlyphs per run, no typesetter
+// in the middle.
+//   runs: [{ font, glyphs: Uint16Array, positions: Float64Array x0,y0,… }]
+// Positions are canvas space (y down), one baseline origin per glyph; a
+// run draws min(glyphs, positions) of them. Honours the surface CTM and
+// clip like every other ctx verb and paints with the current fill colour,
+// so one call covers every run of one colour — the batch a terminal
+// renderer produces (one call per foreground colour per frame). The base
+// CTM is y-flipped for canvas semantics and glyph outlines are y-up, so
+// the text matrix flips them back, as in drawLayout; the positions ride
+// through that same matrix, hence the y negation in BGlyphOriginsArg.
+static Napi::Value CtxDrawGlyphs(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (!info[1].IsArray()) return info.Env().Undefined();
+  Napi::Array runs = info[1].As<Napi::Array>();
+  CGContextRef ctx = s->ctx;
+  CGContextSaveGState(ctx);
+  CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1, -1));
+  CGContextSetTextDrawingMode(ctx, kCGTextFill);
+  std::vector<CGGlyph> glyphStore;
+  std::vector<CGPoint> positionStore;
+  for (uint32_t i = 0; i < runs.Length(); i++) {
+    Napi::Value rv = runs.Get(i);
+    if (!rv.IsObject()) continue;
+    Napi::Object run = rv.As<Napi::Object>();
+    Napi::Value fv = run.Get("font");
+    if (!fv.IsExternal()) continue;
+    size_t nGlyphs = 0;
+    const CGGlyph* glyphs =
+        BGlyphsArg(run.Get("glyphs"), &glyphStore, &nGlyphs);
+    BGlyphOriginsArg(run.Get("positions"), &positionStore);
+    size_t count = std::min(nGlyphs, positionStore.size());
+    if (count == 0) continue;
+    CTFontDrawGlyphs(BFontFrom(fv), glyphs, positionStore.data(),
+                     (CFIndex)count, ctx);
+  }
+  CGContextRestoreGState(ctx);
+  return info.Env().Undefined();
+}
+
 // drawLayoutGradient(surface, layoutHandle, x, y, x0, y0, x1, y1,
 //                    stops [offset,r,g,b,a,...])
 // The glyph outlines become the clip and a linear gradient fills through
@@ -2484,6 +2787,9 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("matchFont", MatchFont);
   BFN("fontMetrics", FontMetrics);
   BFN("fontHasGlyph", FontHasGlyph);
+  BFN("fontGlyphForCodepoint", FontGlyphForCodepoint);
+  BFN("fontGlyphAdvances", FontGlyphAdvances);
+  BFN("fontFallbackFor", FontFallbackFor);
   BFN("fontFromData", FontFromData);
   BFN("cgFontWithSize", CgFontWithSize);
   BFN("fontByPostScriptName", FontByPostScriptName);
@@ -2494,6 +2800,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("loadFontData", LoadFontData);
   BFN("createLayout", CreateLayout);
   BFN("drawLayout", DrawLayout);
+  BFN("ctxDrawGlyphs", CtxDrawGlyphs);
   BFN("layoutIndexAt", LayoutIndexAt);
   BFN("layoutCaret", LayoutCaret);
   BFN("pasteboardWriteText", PbWriteTextFn);

@@ -9,7 +9,8 @@ jobs:
   # Build the addon and load it. AppKit needs a window server, which a
   # hosted runner has (macOS runners run a real WindowServer session), so
   # this both compiles and confirms the module initialises — creating a
-  # layer, laying out a line of CoreText, making an offscreen surface.
+  # layer, laying out a line of CoreText, making an offscreen surface,
+  # drawing a glyph run and checking it against the typesetter's output.
   build-test:
     runs-on: macos-latest
     strategy:
@@ -34,6 +35,18 @@ jobs:
             if (px[0] !== 255) { console.error('paint check failed', [...px.slice(0,4)]); process.exit(1); }
             const io = n.createSurfaceIOSurface(32, 32, 2, true);
             if (!(io.iosurfaceId > 0)) { console.error('iosurface id'); process.exit(1); }
+            // glyph-level text: code point -> glyph id -> advance -> a run drawn
+            // without a typesetter, pixel-identical to drawLayout of the same text
+            const font = n.matchFont({ families: ['Menlo'], size: 13 });
+            const ids = new Uint16Array([...'Hi'].map((c) => n.fontGlyphForCodepoint(font, c.codePointAt(0))));
+            const adv = n.fontGlyphAdvances(font, ids);
+            if (!(ids[0] > 0 && ids[1] > 0 && adv.length === 2 && adv[0] > 0)) { console.error('glyph lookup failed', [...ids], [...adv]); process.exit(1); }
+            if (n.fontGlyphForCodepoint(font, 0x1F600) !== null || !n.fontFallbackFor(font, 0x1F600) || n.fontFallbackFor(font, 'H') !== font) { console.error('fallback face check failed'); process.exit(1); }
+            const paint = (draw) => { const g = n.createSurface(64, 48, 1); n.ctxSetFillColor(g, 1, 1, 1, 1); n.ctxFillRect(g, 0, 0, 64, 48); n.ctxSetFillColor(g, 0, 0, 0, 1); draw(g); return n.ctxGetImageData(g, 0, 0, 64, 48); };
+            const layout = n.createLayout({ spans: [{ text: 'Hi', font }] });
+            const viaLayout = paint((g) => n.drawLayout(g, layout.handle, 4, 30 - layout.lines[0].baseline));
+            const viaGlyphs = paint((g) => n.ctxDrawGlyphs(g, [{ font, glyphs: ids, positions: new Float64Array([4, 30, 4 + adv[0], 30]) }]));
+            if (!viaGlyphs.some((v) => v !== 255) || viaGlyphs.some((v, i) => v !== viaLayout[i])) { console.error('ctxDrawGlyphs does not match drawLayout'); process.exit(1); }
             console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
           "
 

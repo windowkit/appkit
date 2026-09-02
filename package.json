@@ -32,6 +32,7 @@
     "node": ">=18"
   },
   "files": [
+    "LICENSE",
     "index.js",
     "binding.gyp",
     "src/",

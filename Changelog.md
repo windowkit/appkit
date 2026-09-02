@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/windowkit/appkit/compare/v0.2.0...v0.3.0) (2026-09-02)
+
+
+### Features
+
+* fontShapeText and fontWithSize: a shaped line read back as glyph runs, and a face at another size ([84ea297](https://github.com/windowkit/appkit/commit/84ea297b6fc6213896a3b2f5bfef500ced40b7b0))
+* fontShapeText and fontWithSize: a shaped line read back as glyph runs, and a face at another size ([bab51ae](https://github.com/windowkit/appkit/commit/bab51aed1a604d2dc9838b9f9d8b6e572f448958))
+
 ## [0.2.0](https://github.com/windowkit/appkit/compare/v0.1.0...v0.2.0) (2026-09-02)
 
 

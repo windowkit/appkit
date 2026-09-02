@@ -1,6 +1,6 @@
 {
   "name": "@windowkit/appkit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Retained-mode AppKit backend for Node.js: Core Animation (CALayer) layer trees, CoreText layout and drawing, IOSurface presentation, NSMenu, and native control bezels — the macOS half of react-x11.",
   "author": "Andrey Sidorov <andrey.sidorov@gmail.com>",
   "license": "MIT",

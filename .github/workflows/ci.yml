@@ -34,6 +34,24 @@ jobs:
             if (px[0] !== 255) { console.error('paint check failed', [...px.slice(0,4)]); process.exit(1); }
             const io = n.createSurfaceIOSurface(32, 32, 2, true);
             if (!(io.iosurfaceId > 0)) { console.error('iosurface id'); process.exit(1); }
+            // the glyph-level text natives: a lookup, an advance, a fallback
+            // face, a shaped line, and a run drawn where it was asked for
+            const f = n.matchFont({ families: ['Menlo'], size: 20, weight: 400, italic: false });
+            const g = n.fontGlyphForCodepoint(f, 0x48);
+            if (!(g > 0)) { console.error('glyph lookup', g); process.exit(1); }
+            if (n.fontGlyphForCodepoint(f, 0x1f600) !== null) { console.error('uncovered code point is not null'); process.exit(1); }
+            if (!(n.fontGlyphAdvances(f, Uint16Array.from([g]))[0] > 0)) { console.error('glyph advance'); process.exit(1); }
+            if (!n.fontFallbackFor(f, String.fromCodePoint(0x1f600))) { console.error('fallback face'); process.exit(1); }
+            if (n.fontShapeText(f, 'Hi').runs[0].glyphs.length !== 2) { console.error('shape'); process.exit(1); }
+            const t = n.createSurface(32, 32, 1);
+            n.ctxSetFillColor(t, 0, 0, 0, 1);
+            n.ctxFillRect(t, 0, 0, 32, 32);
+            n.ctxSetFillColor(t, 1, 0, 0, 1);
+            n.ctxDrawGlyphs(t, [{ font: f, glyphs: Uint16Array.from([g]), positions: Float64Array.from([4, 24]) }]);
+            const cap = n.ctxGetImageData(t, 0, 4, 32, 21);   // the H: between the cap line and the baseline
+            const below = n.ctxGetImageData(t, 0, 25, 32, 7); // nothing under the baseline
+            const red = (px) => { let c = 0; for (let i = 0; i < px.length; i += 4) if (px[i] > 128) c++; return c; };
+            if (!(red(cap) > 20) || red(below) !== 0) { console.error('glyph draw', red(cap), red(below)); process.exit(1); }
             console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
           "
 

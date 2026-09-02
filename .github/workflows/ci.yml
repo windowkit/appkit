@@ -42,6 +42,14 @@ jobs:
             const adv = n.fontGlyphAdvances(font, ids);
             if (!(ids[0] > 0 && ids[1] > 0 && adv.length === 2 && adv[0] > 0)) { console.error('glyph lookup failed', [...ids], [...adv]); process.exit(1); }
             if (n.fontGlyphForCodepoint(font, 0x1F600) !== null || !n.fontFallbackFor(font, 0x1F600) || n.fontFallbackFor(font, 'H') !== font) { console.error('fallback face check failed'); process.exit(1); }
+            // a shaped line reads back as the ids the cmap gave, a substituted face carries its own ids,
+            // and a face at another size is the same face
+            const shaped = n.fontShapeText(font, 'Hi');
+            if (shaped.runs.length !== 1 || shaped.runs[0].font !== null || [...shaped.runs[0].glyphs].join() !== [...ids].join() || Math.abs(shaped.width - adv[0] - adv[1]) > 1e-6) { console.error('fontShapeText', shaped); process.exit(1); }
+            const sub = n.fontShapeText(font, String.fromCodePoint(0x1F600)).runs[0];
+            if (!sub || !sub.font || n.fontGlyphForCodepoint(sub.font, 0x1F600) !== sub.glyphs[0]) { console.error('fontShapeText substitution'); process.exit(1); }
+            const big = n.fontWithSize(font, 26);
+            if (n.fontMetrics(big).size !== 26 || n.fontMetrics(big).postScriptName !== n.fontMetrics(font).postScriptName || Math.abs(n.fontGlyphAdvances(big, ids)[0] - 2 * adv[0]) > 1e-6) { console.error('fontWithSize'); process.exit(1); }
             const paint = (draw) => { const g = n.createSurface(64, 48, 1); n.ctxSetFillColor(g, 1, 1, 1, 1); n.ctxFillRect(g, 0, 0, 64, 48); n.ctxSetFillColor(g, 0, 0, 0, 1); draw(g); return n.ctxGetImageData(g, 0, 0, 64, 48); };
             const layout = n.createLayout({ spans: [{ text: 'Hi', font }] });
             const viaLayout = paint((g) => n.drawLayout(g, layout.handle, 4, 30 - layout.lines[0].baseline));

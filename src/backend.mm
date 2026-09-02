@@ -1966,6 +1966,106 @@ static Napi::Value FontFallbackFor(const Napi::CallbackInfo& info) {
   });
 }
 
+// fontWithSize(font, size) -> font handle | null
+// The same face at another size (CTFontCreateCopyWithAttributes). A matched
+// family re-resolves per size through matchFont; a face that arrived by
+// substitution — fontFallbackFor's answer, a fontShapeText run's font — has
+// no family to re-match by, and asking the cascade again at the new size is
+// a different question with a possibly different answer. This is how such a
+// face answers metrics and advances at every size, as itself.
+static Napi::Value FontWithSize(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!BCheckFontArg(info, "fontWithSize")) return env.Undefined();
+  double size = info[1].IsNumber() ? info[1].As<Napi::Number>().DoubleValue() : 0;
+  if (!(size > 0)) {
+    Napi::TypeError::New(env, "fontWithSize: expected a size > 0")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  CTFontRef sized = CTFontCreateCopyWithAttributes(BFontFrom(info[0]),
+                                                   (CGFloat)size, NULL, NULL);
+  if (!sized) return env.Null();
+  return Napi::External<void>::New(env, (void*)sized, [](Napi::Env, void* d) {
+    CFRelease(d);
+  });
+}
+
+// fontShapeText(font, text)
+//   -> { width, runs: [{ font: handle | null, glyphs: Uint16Array,
+//                        positions: Float64Array x0,y0,x1,y1,…,
+//                        advances: Float64Array }] }
+// One CTLine over `text` in this font, read back run by run: glyph ids,
+// each glyph's origin relative to the line origin in CoreText's text space
+// (y up), and its advance. A run's `font` is null when it is the font asked
+// for, and a new handle when CoreText substituted a face for characters
+// this one lacks — the ids in that run are the substitute's, and drawing
+// them with the base font would draw its glyphs at those indices instead.
+// Runs come in visual order, so a right-to-left cluster reads back left to
+// right. The typesetter's whole answer for a cluster — a base with its
+// marks positioned, an emoji sequence joined, a variation selector honoured
+// — as ids a caller can hand to ctxDrawGlyphs beside the ids it looked up
+// itself; nothing here decides where a cluster goes.
+static Napi::Value FontShapeText(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!BCheckFontArg(info, "fontShapeText")) return env.Undefined();
+  CTFontRef font = BFontFrom(info[0]);
+  NSString* text = info[1].IsString() ? BToNSString(info[1]) : @"";
+  Napi::Object out = Napi::Object::New(env);
+  Napi::Array runsOut = Napi::Array::New(env);
+  double width = 0;
+  if (text.length > 0) {
+    NSDictionary* attrs =
+        @{(__bridge id)kCTFontAttributeName : (__bridge id)font};
+    NSAttributedString* as =
+        [[NSAttributedString alloc] initWithString:text attributes:attrs];
+    CTLineRef line =
+        CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+    width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+    CFArrayRef runs = CTLineGetGlyphRuns(line);
+    uint32_t written = 0;
+    for (CFIndex ri = 0; ri < CFArrayGetCount(runs); ri++) {
+      CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, ri);
+      CFIndex count = CTRunGetGlyphCount(run);
+      if (count <= 0) continue;
+      std::vector<CGGlyph> glyphs((size_t)count);
+      std::vector<CGPoint> positions((size_t)count);
+      std::vector<CGSize> advances((size_t)count);
+      CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
+      CTRunGetPositions(run, CFRangeMake(0, 0), positions.data());
+      CTRunGetAdvances(run, CFRangeMake(0, 0), advances.data());
+      CFDictionaryRef rattrs = CTRunGetAttributes(run);
+      CTFontRef rfont =
+          (CTFontRef)CFDictionaryGetValue(rattrs, kCTFontAttributeName);
+      Napi::Object ro = Napi::Object::New(env);
+      if (rfont && !CFEqual(rfont, font)) {
+        CFRetain(rfont);
+        ro.Set("font", Napi::External<void>::New(
+                           env, (void*)rfont,
+                           [](Napi::Env, void* d) { CFRelease(d); }));
+      } else {
+        ro.Set("font", env.Null());
+      }
+      Napi::Uint16Array g = Napi::Uint16Array::New(env, (size_t)count);
+      Napi::Float64Array p = Napi::Float64Array::New(env, (size_t)count * 2);
+      Napi::Float64Array a = Napi::Float64Array::New(env, (size_t)count);
+      for (size_t i = 0; i < (size_t)count; i++) {
+        g[i] = glyphs[i];
+        p[i * 2] = positions[i].x;
+        p[i * 2 + 1] = positions[i].y;
+        a[i] = advances[i].width;
+      }
+      ro.Set("glyphs", g);
+      ro.Set("positions", p);
+      ro.Set("advances", a);
+      runsOut.Set(written++, ro);
+    }
+    CFRelease(line);
+  }
+  out.Set("width", width);
+  out.Set("runs", runsOut);
+  return out;
+}
+
 // --- direct font handles (custom faces that bypass registry matching) -----
 
 static double CssWeightOfCTFont(CTFontRef ct) {
@@ -2790,6 +2890,8 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("fontGlyphForCodepoint", FontGlyphForCodepoint);
   BFN("fontGlyphAdvances", FontGlyphAdvances);
   BFN("fontFallbackFor", FontFallbackFor);
+  BFN("fontWithSize", FontWithSize);
+  BFN("fontShapeText", FontShapeText);
   BFN("fontFromData", FontFromData);
   BFN("cgFontWithSize", CgFontWithSize);
   BFN("fontByPostScriptName", FontByPostScriptName);

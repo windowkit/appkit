@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/windowkit/appkit/compare/v0.3.0...v0.4.0) (2026-09-03)
+
+
+### Features
+
+* surface memory accounting and releaseSurface, listScreens fps, window-occlusion events ([a64c672](https://github.com/windowkit/appkit/commit/a64c672aaa24e58dc4db1be5e20aa90b2db166b9))
+* surfaces account their bytes to V8 and take releaseSurface; listScreens reports fps; window-occlusion events ([64d899f](https://github.com/windowkit/appkit/commit/64d899f8756cab2d73f68dca66bc697863f9af70))
+
 ## [0.3.0](https://github.com/windowkit/appkit/compare/v0.2.0...v0.3.0) (2026-09-02)
 
 

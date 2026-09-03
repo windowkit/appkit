@@ -111,6 +111,10 @@ static void EmitToJS(Napi::Env env, Napi::Object ev) {
 }
 @end
 
+static bool WindowOnGlass(NSWindow* win) {
+  return (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
+}
+
 static Napi::Object WindowEvent(Napi::Env env, NSWindow* win,
                                 const char* type) {
   Napi::Object ev = Napi::Object::New(env);
@@ -159,6 +163,18 @@ static void EmitWindowGeometry(Napi::Env env, NSWindow* win, const char* type,
   Napi::Env env(env_);
   Napi::HandleScope scope(env);
   EmitToJS(env, WindowEvent(env, (NSWindow*)n.object, "window-blur"));
+}
+// A window entirely behind another application's window is still visible
+// by isVisible's measure and still costs every frame its tree produces.
+// AppKit knows the difference; `visible: false` here means no pixel of the
+// window is on glass, so a renderer can hold its frames until one is.
+- (void)windowDidChangeOcclusionState:(NSNotification*)n {
+  NSWindow* win = n.object;
+  Napi::Env env(env_);
+  Napi::HandleScope scope(env);
+  Napi::Object ev = WindowEvent(env, win, "window-occlusion");
+  ev.Set("visible", WindowOnGlass(win));
+  EmitToJS(env, ev);
 }
 - (void)windowDidChangeBackingProperties:(NSNotification*)n {
   NSWindow* win = n.object;
@@ -363,7 +379,7 @@ static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-// -> { x, y, width, height, scale, visible, key } — content rect, top-left
+// -> { x, y, width, height, scale, visible, occluded, key } — content rect, top-left
 // global coordinates, points.
 static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -376,6 +392,8 @@ static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
   r.Set("height", content.size.height);
   r.Set("scale", win.backingScaleFactor);
   r.Set("visible", (bool)win.isVisible);
+  // visible but with no pixel on glass: fully behind another app's window
+  r.Set("occluded", win.isVisible && !WindowOnGlass(win));
   r.Set("key", (bool)win.isKeyWindow);
   return r;
 }
@@ -536,16 +554,81 @@ static Napi::Value Pump2(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 struct CALSurface {
-  CGContextRef ctx = nullptr;
+  CGContextRef ctx = nullptr;  // nullptr once released
   size_t width = 0, height = 0;  // pixels
   double scale = 1;
   // when the bitmap lives in an IOSurface (zero-copy presentation), the
   // surface owns a reference and the layer scans out of the same memory
   IOSurfaceRef iosurface = nullptr;
+  // bytes of bitmap this handle keeps alive, reported to V8 as external
+  // memory: a handle is a few dozen bytes of heap to the collector, the
+  // 10MB behind it is invisible, and a live resize retiring two of them a
+  // tick piles up RSS until the heap happens to grow into a collection
+  int64_t bytes = 0;
 };
 
+// Free the bitmap now and hand the bytes back to V8's account. The struct
+// outlives its bitmap: the External's finalizer deletes it, and ctx == nullptr
+// marks it released to every verb in between.
+static void SurfaceFree(Napi::Env env, CALSurface* s) {
+  if (!s->ctx) return;
+  CGContextRelease(s->ctx);
+  s->ctx = nullptr;
+  if (s->iosurface) {
+    CFRelease(s->iosurface);
+    s->iosurface = nullptr;
+  }
+  if (s->bytes) {
+    Napi::MemoryManagement::AdjustExternalMemory(env, -s->bytes);
+    s->bytes = 0;
+  }
+}
+
+static void SurfaceFinalize(Napi::Env env, void* d) {
+  auto* s = (CALSurface*)d;
+  SurfaceFree(env, s);
+  delete s;
+}
+
+static Napi::Value WrapSurface(Napi::Env env, CALSurface* s, int64_t bytes) {
+  s->bytes = bytes;
+  if (bytes) Napi::MemoryManagement::AdjustExternalMemory(env, bytes);
+  return Napi::External<void>::New(env, s, SurfaceFinalize);
+}
+
+// The surface behind a handle, or nullptr with a JS error pending when the
+// handle was released: a use after releaseSurface is an error, not a crash.
+// Callers return on nullptr.
 static CALSurface* SurfaceFrom(Napi::Value v) {
-  return (CALSurface*)v.As<Napi::External<void>>().Data();
+  if (!v.IsExternal()) {
+    Napi::TypeError::New(v.Env(), "expected a surface handle")
+        .ThrowAsJavaScriptException();
+    return nullptr;
+  }
+  auto* s = (CALSurface*)v.As<Napi::External<void>>().Data();
+  if (!s->ctx) {
+    Napi::Error::New(v.Env(), "surface was released")
+        .ThrowAsJavaScriptException();
+    return nullptr;
+  }
+  return s;
+}
+
+// For the fire-and-forget drawing verbs: the context to draw into, or a
+// scratch bitmap when the surface is released (the error is already
+// pending; the stroke lands nowhere anyone looks).
+static CGContextRef CtxOf(Napi::Value v) {
+  CALSurface* s = SurfaceFrom(v);
+  if (s) return s->ctx;
+  static CGContextRef scratch = nullptr;
+  if (!scratch) {
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    scratch = CGBitmapContextCreate(
+        NULL, 1, 1, 8, 0, cs,
+        kCGImageAlphaPremultipliedFirst | (CGBitmapInfo)kCGBitmapByteOrder32Host);
+    CGColorSpaceRelease(cs);
+  }
+  return scratch;
 }
 
 // createSurface(widthPx, heightPx, scale) — top-left origin, y down (the
@@ -571,11 +654,7 @@ static Napi::Value CreateSurface(const Napi::CallbackInfo& info) {
   CGContextScaleCTM(ctx, 1, -1);
   CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
   auto* s = new CALSurface{ctx, w, h, scale};
-  return Napi::External<void>::New(env, s, [](Napi::Env, void* d) {
-    auto* s = (CALSurface*)d;
-    CGContextRelease(s->ctx);
-    delete s;
-  });
+  return WrapSurface(env, s, (int64_t)(CGBitmapContextGetBytesPerRow(ctx) * h));
 }
 
 // createSurfaceIOSurface(widthPx, heightPx, scale)
@@ -633,12 +712,7 @@ static Napi::Value CreateSurfaceIOSurface(const Napi::CallbackInfo& info) {
   CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
   auto* s = new CALSurface{ctx, w, h, scale, ios};
   Napi::Object out = Napi::Object::New(env);
-  out.Set("handle", Napi::External<void>::New(env, s, [](Napi::Env, void* d) {
-            auto* p = (CALSurface*)d;
-            CGContextRelease(p->ctx);
-            if (p->iosurface) CFRelease(p->iosurface);
-            delete p;
-          }));
+  out.Set("handle", WrapSurface(env, s, (int64_t)IOSurfaceGetAllocSize(ios)));
   out.Set("iosurfaceId", (double)IOSurfaceGetID(ios));
   return out;
 }
@@ -676,15 +750,26 @@ static Napi::Value SurfaceFromIOSurfaceID(const Napi::CallbackInfo& info) {
   CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
   auto* s = new CALSurface{ctx, w, h, scale, ios};
   Napi::Object out = Napi::Object::New(env);
-  out.Set("handle", Napi::External<void>::New(env, s, [](Napi::Env, void* d) {
-            auto* p = (CALSurface*)d;
-            CGContextRelease(p->ctx);
-            if (p->iosurface) CFRelease(p->iosurface);
-            delete p;
-          }));
+  out.Set("handle", WrapSurface(env, s, (int64_t)IOSurfaceGetAllocSize(ios)));
   out.Set("width", (double)w);
   out.Set("height", (double)h);
   return out;
+}
+
+// releaseSurface(handle) — free the bitmap now, not when V8 gets around to
+// the handle. A swapchain retires a pair per resize tick, 20MB at
+// 900x700@2x; released on the flip that retires them, they never pile up.
+// The finalizer stays as the safety net. Idempotent; every other verb on a
+// released handle throws.
+static Napi::Value ReleaseSurface(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsExternal()) {
+    Napi::TypeError::New(env, "releaseSurface: expected a surface handle")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  SurfaceFree(env, (CALSurface*)info[0].As<Napi::External<void>>().Data());
+  return env.Undefined();
 }
 
 // CPU access bracketing for an IOSurface-backed surface: lock before the
@@ -692,11 +777,13 @@ static Napi::Value SurfaceFromIOSurfaceID(const Napi::CallbackInfo& info) {
 // on a plain surface, so callers need not care which kind they hold.
 static Napi::Value SurfaceLock(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   if (s->iosurface) IOSurfaceLock(s->iosurface, 0, NULL);
   return info.Env().Undefined();
 }
 static Napi::Value SurfaceUnlock(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   if (s->iosurface) IOSurfaceUnlock(s->iosurface, 0, NULL);
   return info.Env().Undefined();
 }
@@ -707,7 +794,9 @@ static Napi::Value SurfaceUnlock(const Napi::CallbackInfo& info) {
 static Napi::Value CopySurfaceRegion(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CALSurface* src = SurfaceFrom(info[0]);
+  if (!src) return info.Env().Undefined();
   CALSurface* dst = SurfaceFrom(info[1]);
+  if (!dst) return info.Env().Undefined();
   if (src->width != dst->width || src->height != dst->height) {
     Napi::Error::New(env, "copySurfaceRegion: size mismatch")
         .ThrowAsJavaScriptException();
@@ -749,6 +838,7 @@ static Napi::Value CopySurfaceRegion(const Napi::CallbackInfo& info) {
 
 static Napi::Value SurfaceSize(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   Napi::Object r = Napi::Object::New(info.Env());
   r.Set("width", (double)s->width);
   r.Set("height", (double)s->height);
@@ -1071,6 +1161,7 @@ static Napi::Value DrawControlIntoSurface(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   Napi::Object o = info[1].As<Napi::Object>();
   BezelControl c = BuildBezel(env, o);
   if (env.IsExceptionPending()) return env.Undefined();
@@ -1110,27 +1201,27 @@ static Napi::Value DrawControlIntoSurface(const Napi::CallbackInfo& info) {
 // --- drawing verbs. All take the surface handle first. ---------------------
 
 static Napi::Value CtxSave(const Napi::CallbackInfo& info) {
-  CGContextSaveGState(SurfaceFrom(info[0])->ctx);
+  CGContextSaveGState(CtxOf(info[0]));
   return info.Env().Undefined();
 }
 static Napi::Value CtxRestore(const Napi::CallbackInfo& info) {
-  CGContextRestoreGState(SurfaceFrom(info[0])->ctx);
+  CGContextRestoreGState(CtxOf(info[0]));
   return info.Env().Undefined();
 }
 static Napi::Value CtxTranslate(const Napi::CallbackInfo& info) {
-  CGContextTranslateCTM(SurfaceFrom(info[0])->ctx,
+  CGContextTranslateCTM(CtxOf(info[0]),
                         info[1].As<Napi::Number>().DoubleValue(),
                         info[2].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
 static Napi::Value CtxScale(const Napi::CallbackInfo& info) {
-  CGContextScaleCTM(SurfaceFrom(info[0])->ctx,
+  CGContextScaleCTM(CtxOf(info[0]),
                     info[1].As<Napi::Number>().DoubleValue(),
                     info[2].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
 static Napi::Value CtxTransform(const Napi::CallbackInfo& info) {
-  CGContextConcatCTM(SurfaceFrom(info[0])->ctx,
+  CGContextConcatCTM(CtxOf(info[0]),
                      CGAffineTransformMake(
                          info[1].As<Napi::Number>().DoubleValue(),
                          info[2].As<Napi::Number>().DoubleValue(),
@@ -1142,22 +1233,23 @@ static Napi::Value CtxTransform(const Napi::CallbackInfo& info) {
 }
 
 static Napi::Value CtxRotate(const Napi::CallbackInfo& info) {
-  CGContextRotateCTM(SurfaceFrom(info[0])->ctx,
+  CGContextRotateCTM(CtxOf(info[0]),
                      info[1].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
 static Napi::Value CtxBeginPath(const Napi::CallbackInfo& info) {
-  CGContextBeginPath(SurfaceFrom(info[0])->ctx);
+  CGContextBeginPath(CtxOf(info[0]));
   return info.Env().Undefined();
 }
 static Napi::Value CtxMoveTo(const Napi::CallbackInfo& info) {
-  CGContextMoveToPoint(SurfaceFrom(info[0])->ctx,
+  CGContextMoveToPoint(CtxOf(info[0]),
                        info[1].As<Napi::Number>().DoubleValue(),
                        info[2].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
 static Napi::Value CtxLineTo(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   double x = info[1].As<Napi::Number>().DoubleValue();
   double y = info[2].As<Napi::Number>().DoubleValue();
   if (CGContextIsPathEmpty(s->ctx)) CGContextMoveToPoint(s->ctx, x, y);
@@ -1165,7 +1257,7 @@ static Napi::Value CtxLineTo(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxRect(const Napi::CallbackInfo& info) {
-  CGContextAddRect(SurfaceFrom(info[0])->ctx,
+  CGContextAddRect(CtxOf(info[0]),
                    CGRectMake(info[1].As<Napi::Number>().DoubleValue(),
                               info[2].As<Napi::Number>().DoubleValue(),
                               info[3].As<Napi::Number>().DoubleValue(),
@@ -1176,6 +1268,7 @@ static Napi::Value CtxRect(const Napi::CallbackInfo& info) {
 // top-left/top-right/bottom-right/bottom-left, already clamped by JS.
 static Napi::Value CtxRoundRect(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   double x = info[1].As<Napi::Number>().DoubleValue();
   double y = info[2].As<Napi::Number>().DoubleValue();
   double w = info[3].As<Napi::Number>().DoubleValue();
@@ -1206,7 +1299,7 @@ static Napi::Value CtxArc(const Napi::CallbackInfo& info) {
   // The flag therefore maps straight across, not inverted: getting this
   // backwards leaves full circles (donuts) looking right and every partial
   // arc sweeping the long way round — the raster-gate gauges caught it.
-  CGContextAddArc(SurfaceFrom(info[0])->ctx,
+  CGContextAddArc(CtxOf(info[0]),
                   info[1].As<Napi::Number>().DoubleValue(),
                   info[2].As<Napi::Number>().DoubleValue(),
                   info[3].As<Napi::Number>().DoubleValue(),
@@ -1217,7 +1310,7 @@ static Napi::Value CtxArc(const Napi::CallbackInfo& info) {
 }
 static Napi::Value CtxEllipse(const Napi::CallbackInfo& info) {
   CGContextAddEllipseInRect(
-      SurfaceFrom(info[0])->ctx,
+      CtxOf(info[0]),
       CGRectMake(info[1].As<Napi::Number>().DoubleValue() -
                      info[3].As<Napi::Number>().DoubleValue(),
                  info[2].As<Napi::Number>().DoubleValue() -
@@ -1227,7 +1320,7 @@ static Napi::Value CtxEllipse(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxCurveTo(const Napi::CallbackInfo& info) {
-  CGContextAddCurveToPoint(SurfaceFrom(info[0])->ctx,
+  CGContextAddCurveToPoint(CtxOf(info[0]),
                            info[1].As<Napi::Number>().DoubleValue(),
                            info[2].As<Napi::Number>().DoubleValue(),
                            info[3].As<Napi::Number>().DoubleValue(),
@@ -1237,7 +1330,7 @@ static Napi::Value CtxCurveTo(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxQuadTo(const Napi::CallbackInfo& info) {
-  CGContextAddQuadCurveToPoint(SurfaceFrom(info[0])->ctx,
+  CGContextAddQuadCurveToPoint(CtxOf(info[0]),
                                info[1].As<Napi::Number>().DoubleValue(),
                                info[2].As<Napi::Number>().DoubleValue(),
                                info[3].As<Napi::Number>().DoubleValue(),
@@ -1245,12 +1338,12 @@ static Napi::Value CtxQuadTo(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxClosePath(const Napi::CallbackInfo& info) {
-  CGContextClosePath(SurfaceFrom(info[0])->ctx);
+  CGContextClosePath(CtxOf(info[0]));
   return info.Env().Undefined();
 }
 
 static Napi::Value CtxSetFillColor(const Napi::CallbackInfo& info) {
-  CGContextSetRGBFillColor(SurfaceFrom(info[0])->ctx,
+  CGContextSetRGBFillColor(CtxOf(info[0]),
                            info[1].As<Napi::Number>().DoubleValue(),
                            info[2].As<Napi::Number>().DoubleValue(),
                            info[3].As<Napi::Number>().DoubleValue(),
@@ -1258,7 +1351,7 @@ static Napi::Value CtxSetFillColor(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxSetStrokeColor(const Napi::CallbackInfo& info) {
-  CGContextSetRGBStrokeColor(SurfaceFrom(info[0])->ctx,
+  CGContextSetRGBStrokeColor(CtxOf(info[0]),
                              info[1].As<Napi::Number>().DoubleValue(),
                              info[2].As<Napi::Number>().DoubleValue(),
                              info[3].As<Napi::Number>().DoubleValue(),
@@ -1266,18 +1359,18 @@ static Napi::Value CtxSetStrokeColor(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxSetLineWidth(const Napi::CallbackInfo& info) {
-  CGContextSetLineWidth(SurfaceFrom(info[0])->ctx,
+  CGContextSetLineWidth(CtxOf(info[0]),
                         info[1].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
 static Napi::Value CtxSetGlobalAlpha(const Napi::CallbackInfo& info) {
-  CGContextSetAlpha(SurfaceFrom(info[0])->ctx,
+  CGContextSetAlpha(CtxOf(info[0]),
                     info[1].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
 static Napi::Value CtxSetLineCap(const Napi::CallbackInfo& info) {
   std::string cap = info[1].As<Napi::String>().Utf8Value();
-  CGContextSetLineCap(SurfaceFrom(info[0])->ctx,
+  CGContextSetLineCap(CtxOf(info[0]),
                       cap == "round"    ? kCGLineCapRound
                       : cap == "square" ? kCGLineCapSquare
                                         : kCGLineCapButt);
@@ -1285,7 +1378,7 @@ static Napi::Value CtxSetLineCap(const Napi::CallbackInfo& info) {
 }
 static Napi::Value CtxSetLineJoin(const Napi::CallbackInfo& info) {
   std::string join = info[1].As<Napi::String>().Utf8Value();
-  CGContextSetLineJoin(SurfaceFrom(info[0])->ctx,
+  CGContextSetLineJoin(CtxOf(info[0]),
                        join == "round"   ? kCGLineJoinRound
                        : join == "bevel" ? kCGLineJoinBevel
                                          : kCGLineJoinMiter);
@@ -1293,6 +1386,7 @@ static Napi::Value CtxSetLineJoin(const Napi::CallbackInfo& info) {
 }
 static Napi::Value CtxSetLineDash(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   Napi::Array a = info[1].As<Napi::Array>();
   double offset =
       info.Length() > 2 ? info[2].As<Napi::Number>().DoubleValue() : 0;
@@ -1317,6 +1411,7 @@ static void KeepPathAround(CGContextRef ctx, void (^op)(void)) {
 
 static Napi::Value CtxFill(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   bool evenOdd = info.Length() > 1 && info[1].ToBoolean().Value();
   KeepPathAround(s->ctx, ^{
     if (evenOdd) CGContextEOFillPath(s->ctx);
@@ -1326,17 +1421,19 @@ static Napi::Value CtxFill(const Napi::CallbackInfo& info) {
 }
 static Napi::Value CtxStroke(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   KeepPathAround(s->ctx, ^{ CGContextStrokePath(s->ctx); });
   return info.Env().Undefined();
 }
 static Napi::Value CtxClip(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   KeepPathAround(s->ctx, ^{ CGContextClip(s->ctx); });
   return info.Env().Undefined();
 }
 
 static Napi::Value CtxFillRect(const Napi::CallbackInfo& info) {
-  CGContextFillRect(SurfaceFrom(info[0])->ctx,
+  CGContextFillRect(CtxOf(info[0]),
                     CGRectMake(info[1].As<Napi::Number>().DoubleValue(),
                                info[2].As<Napi::Number>().DoubleValue(),
                                info[3].As<Napi::Number>().DoubleValue(),
@@ -1344,7 +1441,7 @@ static Napi::Value CtxFillRect(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxStrokeRect(const Napi::CallbackInfo& info) {
-  CGContextStrokeRect(SurfaceFrom(info[0])->ctx,
+  CGContextStrokeRect(CtxOf(info[0]),
                       CGRectMake(info[1].As<Napi::Number>().DoubleValue(),
                                  info[2].As<Napi::Number>().DoubleValue(),
                                  info[3].As<Napi::Number>().DoubleValue(),
@@ -1352,7 +1449,7 @@ static Napi::Value CtxStrokeRect(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 static Napi::Value CtxClearRect(const Napi::CallbackInfo& info) {
-  CGContextClearRect(SurfaceFrom(info[0])->ctx,
+  CGContextClearRect(CtxOf(info[0]),
                      CGRectMake(info[1].As<Napi::Number>().DoubleValue(),
                                 info[2].As<Napi::Number>().DoubleValue(),
                                 info[3].As<Napi::Number>().DoubleValue(),
@@ -1362,6 +1459,7 @@ static Napi::Value CtxClearRect(const Napi::CallbackInfo& info) {
 // fillRects(surface, flat [x,y,w,h,...]) — one call for a batch of fills.
 static Napi::Value CtxFillRects(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   Napi::Array a = info[1].As<Napi::Array>();
   std::vector<CGRect> rects;
   for (uint32_t i = 0; i + 3 < a.Length(); i += 4) {
@@ -1378,6 +1476,7 @@ static Napi::Value CtxFillRects(const Napi::CallbackInfo& info) {
 //                    mode: 0 = fill current path, 1 = fill rect args follow)
 static Napi::Value CtxFillLinearGradient(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   double x0 = info[1].As<Napi::Number>().DoubleValue();
   double y0 = info[2].As<Napi::Number>().DoubleValue();
   double x1 = info[3].As<Napi::Number>().DoubleValue();
@@ -1418,7 +1517,9 @@ static Napi::Value CtxFillLinearGradient(const Napi::CallbackInfo& info) {
 // drawSurface(dst, src, sx, sy, sw, sh, dx, dy, dw, dh)
 static Napi::Value CtxDrawSurface(const Napi::CallbackInfo& info) {
   CALSurface* dst = SurfaceFrom(info[0]);
+  if (!dst) return info.Env().Undefined();
   CALSurface* src = SurfaceFrom(info[1]);
+  if (!src) return info.Env().Undefined();
   double sx = info[2].As<Napi::Number>().DoubleValue();
   double sy = info[3].As<Napi::Number>().DoubleValue();
   double sw = info[4].As<Napi::Number>().DoubleValue();
@@ -1454,6 +1555,7 @@ static Napi::Value CtxDrawSurface(const Napi::CallbackInfo& info) {
 // directly, transform- and clip-free, per the canvas contract.
 static Napi::Value CtxPutImageData(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   Napi::Buffer<uint8_t> buf = info[1].As<Napi::Buffer<uint8_t>>();
   long w = info[2].As<Napi::Number>().Int64Value();
   long h = info[3].As<Napi::Number>().Int64Value();
@@ -1486,6 +1588,7 @@ static Napi::Value CtxPutImageData(const Napi::CallbackInfo& info) {
 static Napi::Value CtxGetImageData(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   long x = info[1].As<Napi::Number>().Int64Value();
   long y = info[2].As<Napi::Number>().Int64Value();
   long w = info[3].As<Napi::Number>().Int64Value();
@@ -1523,6 +1626,7 @@ static Napi::Value CtxGetImageData(const Napi::CallbackInfo& info) {
 // CGBitmapContextCreateImage is copy-on-write, so this is cheap per frame.
 static Napi::Value SurfaceToLayer(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   CALayer* L = BDeref<CALayer*>(info[1]);
   CGImageRef img = CGBitmapContextCreateImage(s->ctx);
   [CATransaction begin];
@@ -1541,6 +1645,7 @@ static Napi::Value SurfaceToLayer(const Napi::CallbackInfo& info) {
 // whatever sat above the viewport). Returns whether anything moved.
 static Napi::Value ScrollSurface(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   long x = info[1].As<Napi::Number>().Int64Value();
   long y = info[2].As<Napi::Number>().Int64Value();
   long w = info[3].As<Napi::Number>().Int64Value();
@@ -2494,6 +2599,7 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
 // drawLayout(surface, layoutHandle, x, y) — honours the surface CTM and clip.
 static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   CALLayout* layout = LayoutFrom(info[1]);
   double x = info[2].As<Napi::Number>().DoubleValue();
   double y = info[3].As<Napi::Number>().DoubleValue();
@@ -2524,6 +2630,7 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
 // through that same matrix, hence the y negation in BGlyphOriginsArg.
 static Napi::Value CtxDrawGlyphs(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   if (!info[1].IsArray()) return info.Env().Undefined();
   Napi::Array runs = info[1].As<Napi::Array>();
   CGContextRef ctx = s->ctx;
@@ -2557,6 +2664,7 @@ static Napi::Value CtxDrawGlyphs(const Napi::CallbackInfo& info) {
 // them — gradient text ink, canvas-style.
 static Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   CALLayout* layout = LayoutFrom(info[1]);
   double x = info[2].As<Napi::Number>().DoubleValue();
   double y = info[3].As<Napi::Number>().DoubleValue();
@@ -2626,6 +2734,7 @@ static Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
 // ctxSetShadow(surface, blur, dx, dy, r, g, b, a) — blur <= 0 clears.
 static Napi::Value CtxSetShadow(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
   double blur = info[1].As<Napi::Number>().DoubleValue();
   if (blur <= 0) {
     CGContextSetShadowWithColor(s->ctx, CGSizeMake(0, 0), 0, NULL);
@@ -2757,6 +2866,12 @@ static Napi::Value ListScreens(const Napi::CallbackInfo& info) {
     work.Set("height", v.size.height);
     o.Set("visible", work);
     o.Set("scale", s.backingScaleFactor);
+    // the panel's own refresh rate, so a renderer paces frames on the
+    // display's period instead of assuming 60Hz on a 120Hz ProMotion
+    // panel; 0 where the OS cannot say (before macOS 12)
+    double fps = 0;
+    if (@available(macOS 12.0, *)) fps = (double)s.maximumFramesPerSecond;
+    o.Set("fps", fps);
     o.Set("primary", i == 0);
     out.Set((uint32_t)i, o);
   }
@@ -2844,6 +2959,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("createSurface", CreateSurface);
   BFN("createSurfaceIOSurface", CreateSurfaceIOSurface);
   BFN("surfaceFromIOSurfaceID", SurfaceFromIOSurfaceID);
+  BFN("releaseSurface", ReleaseSurface);
   BFN("surfaceLock", SurfaceLock);
   BFN("surfaceUnlock", SurfaceUnlock);
   BFN("copySurfaceRegion", CopySurfaceRegion);

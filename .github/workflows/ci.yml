@@ -55,6 +55,23 @@ jobs:
             const viaLayout = paint((g) => n.drawLayout(g, layout.handle, 4, 30 - layout.lines[0].baseline));
             const viaGlyphs = paint((g) => n.ctxDrawGlyphs(g, [{ font, glyphs: ids, positions: new Float64Array([4, 30, 4 + adv[0], 30]) }]));
             if (!viaGlyphs.some((v) => v !== 255) || viaGlyphs.some((v, i) => v !== viaLayout[i])) { console.error('ctxDrawGlyphs does not match drawLayout'); process.exit(1); }
+            // drag and drop: the hosting view answers a drag the way AppKit asks it — enter/over/drop through
+            // the real NSDraggingDestination methods, the answer set from inside the callback for that event,
+            // the payload read per item during the drop, and the OS's MIME table for the type names
+            const dw = n.createWindow2({ width: 200, height: 150, title: 'dnd' });
+            n.registerDropTypes(dw, ['public.utf8-plain-text']);
+            const dndSeen = [];
+            n.setBackendEventCallback((ev) => {
+              if (!ev.type.startsWith('drag-')) return;
+              dndSeen.push(ev.type);
+              if (ev.type === 'drag-enter' || ev.type === 'drag-over') n.setDropResponse(dw, { accept: ev.types.includes('public.utf8-plain-text'), operation: 'copy' });
+              if (ev.type === 'drag-perform') dndSeen.push(n.dragItemString(0, 'public.utf8-plain-text'));
+            });
+            const dndItems = [{ 'public.utf8-plain-text': 'hello' }];
+            const dndAnswers = [n.postDragEvent(dw, 'enter', { x: 10, y: 10, items: dndItems }), n.postDragEvent(dw, 'over', { x: 12, y: 12, items: dndItems }), n.postDragEvent(dw, 'drop', { x: 12, y: 12, items: dndItems }), n.postDragEvent(dw, 'enter', { x: 1, y: 1, items: [{ 'public.png': Buffer.alloc(4) }] })];
+            n.setBackendEventCallback(null);
+            n.destroyWindow2(dw);
+            if (dndAnswers.join() !== 'copy,copy,true,none' || dndSeen.join() !== 'drag-enter,drag-over,drag-perform,hello,drag-enter' || n.pasteboardTypeForMIME('image/png') !== 'public.png') { console.error('drag and drop', dndAnswers, dndSeen); process.exit(1); }
             // privacy (TCC) authorizations: every kind answers one of the four statuses without
             // prompting, automation only answers for a running target, and a bad shape is a TypeError
             const statuses = new Set(['authorized', 'denied', 'restricted', 'notDetermined']);
@@ -84,24 +101,47 @@ jobs:
               if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
             }
             // the response path, with synthesized responses: what arrives before a listener exists is held
-            // and replayed, in order, at the first pump2 with one; what arrives after reaches it on its own
+            // and replayed, in order, at the first pump2 with one; what arrives after reaches it on its own.
+            // A timer alone could run in the same timers phase as a long pump below, before the poll phase
+            // that hands the responses over, so the checks wait for an immediate (poll runs in between).
             const got = [];
+            let notifDone = false;
             n.postNotificationResponse({ identifier: 'held-1', actionId: 'open', categoryId: 'download', userInfo: { a: [1, null, 'x'] } });
             n.postNotificationResponse({ identifier: 'held-2', dismissed: true });
-            setTimeout(() => {
-              n.setBackendEventCallback((ev) => got.push(ev));
+            setTimeout(() => setImmediate(() => {
+              n.setBackendEventCallback((ev) => { if (ev.type.startsWith('notification-')) got.push(ev); });
               if (got.length) { console.error('delivered with no listener', got); process.exit(1); }
               n.initApp(); n.pump2();
               const [a, d] = got;
               if (got.length !== 2 || a.type !== 'notification-action' || a.identifier !== 'held-1' || a.actionId !== 'open' || a.categoryId !== 'download' || JSON.stringify(a.userInfo) !== '{\"a\":[1,null,\"x\"]}') { console.error('held action', got); process.exit(1); }
               if (d.type !== 'notification-dismissed' || d.identifier !== 'held-2' || d.reason !== 'dismissed' || d.categoryId !== null || 'userInfo' in d || 'actionId' in d) { console.error('held dismissal', got); process.exit(1); }
               n.postNotificationResponse({ identifier: 'live' });
-              setTimeout(() => {
+              const until = Date.now() + 2000;
+              const live = () => setTimeout(() => setImmediate(() => {
+                if (got.length < 3 && Date.now() < until) return live();
                 if (got.length !== 3 || got[2].identifier !== 'live' || got[2].actionId !== 'default') { console.error('live response', got); process.exit(1); }
                 n.setBackendEventCallback(null);
-                console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
-              }, 50);
-            }, 50);
+                notifDone = true;
+              }), 10);
+              live();
+            }), 50);
+            // file panels: the OS type database behind the filters, then a real NSOpenPanel
+            // as a sheet on one of our windows, cancelled from JS, answering null through the pump
+            if (n.contentTypeFor({ extension: 'png' }) !== 'public.png' || n.contentTypeFor({ mime: 'application/json' }) !== 'public.json' || n.contentTypeFor({ extension: 'nobody-declared-this' }) === null) { console.error('contentTypeFor'); process.exit(1); }
+            const win = n.createWindow2({ width: 200, height: 120, title: 'panel' });
+            n.showWindow(win, false);
+            let answer = 'pending';
+            const panel = n.openPanel({ window: win, message: 'ci', allowedContentTypes: ['public.png'] }, (r) => { answer = r; });
+            const pump = setInterval(() => n.pump2(), 16);
+            setTimeout(() => { if (!n.cancelPanel(panel)) { console.error('cancelPanel: no sheet pending'); process.exit(1); } }, 1000);
+            setTimeout(() => {
+              clearInterval(pump);
+              if (answer !== null || n.cancelPanel(panel)) { console.error('sheet did not answer null on cancel:', answer); process.exit(1); }
+              n.destroyWindow2(win);
+              if (!notifDone) { console.error('the notification response checks did not finish'); process.exit(1); }
+              console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
+              process.exit(0);
+            }, 4000);
           "
 
   # Same steps the release workflow uses to produce the prebuilt binaries

@@ -1263,14 +1263,6 @@ static Napi::Value CreateStatusItem(const Napi::CallbackInfo& info) {
     // Visibility is the renderer's to decide: assert it at creation.
     item.visible = BBoolOr(o, "visible", true);
     ApplyStatusItemProps(item, o);
-    // AppKit finishes establishing the bar's window on its first pass
-    // through the event loop; until then a mouse event posted into it is
-    // dropped. One peek (nothing dequeued, nothing dispatched) settles it,
-    // so a clickStatusItem right after creation lands.
-    [NSApp nextEventMatchingMask:0
-                       untilDate:[NSDate distantPast]
-                          inMode:NSDefaultRunLoopMode
-                         dequeue:NO];
     handle = BWrapRetained(env, item);
     target->handle_ = Napi::Reference<Napi::Value>::New(handle, 1);
   }
@@ -1376,6 +1368,28 @@ static Napi::Value ActivateStatusItemMenuItem(const Napi::CallbackInfo& info) {
                             ActivateInMenu(item.menu, info[1].As<Napi::Array>()));
 }
 
+// Two things have to happen before a mouse event posted into an item's
+// window is delivered rather than dropped: AppKit's first pass through
+// nextEventMatchingMask: (whatever it sets up there, an event queued
+// before it is lost), and the status bar server's reply that places the
+// window and orders it in — on a hosted CI VM the latter takes longer
+// than one pass. The test hooks take at least one pass here and then wait
+// for the window to be on glass, for at most `timeout` seconds; nothing
+// is dequeued or dispatched.
+static bool WaitForStatusWindow(NSWindow* win, NSTimeInterval timeout) {
+  NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  NSDate* until = [NSDate distantPast];
+  while (true) {
+    [NSApp nextEventMatchingMask:0
+                       untilDate:until
+                          inMode:NSDefaultRunLoopMode
+                         dequeue:NO];
+    if (win.isVisible && WindowOnGlass(win)) return true;
+    if (deadline.timeIntervalSinceNow <= 0) return false;
+    until = [NSDate dateWithTimeIntervalSinceNow:0.01];
+  }
+}
+
 // clickStatusItem(item, 'left' | 'right' | 'middle') — for tests: a real
 // press-and-release posted into the item's own window, so the button's
 // tracking and sendActionOn: path (or the pump's middle-click path) is
@@ -1393,6 +1407,7 @@ static Napi::Value ClickStatusItem(const Napi::CallbackInfo& info) {
   NSStatusBarButton* btn = item.button;
   NSWindow* win = btn.window;
   if (!win) return Napi::Boolean::New(env, false);
+  WaitForStatusWindow(win, 2.0);
   RememberStatusWindow(win, item);
   NSEventType down = NSEventTypeLeftMouseDown, up = NSEventTypeLeftMouseUp;
   if (kind == "right") {
@@ -1436,6 +1451,7 @@ static Napi::Value SnapshotStatusItem(const Napi::CallbackInfo& info) {
   NSStatusItem* item = StatusItemFrom(info[0]);
   NSWindow* win = item ? item.button.window : nil;
   if (!win || !info[1].IsString()) return Napi::Boolean::New(env, false);
+  WaitForStatusWindow(win, 2.0);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
   CGImageRef img = CGWindowListCreateImage(

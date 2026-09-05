@@ -73,6 +73,11 @@ static void BEnsureApp() {
   @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    // A react-x11 window has no tab semantics. Left on, AppKit persists
+    // "show tab bar" per process name (under bun the key lives in the `bun`
+    // defaults domain) and grows a 28pt bar into the titlebar of every
+    // window we create (windowkit/appkit#12).
+    NSWindow.allowsAutomaticWindowTabbing = NO;
     [NSApp finishLaunching];
   }
   inited = true;
@@ -84,6 +89,18 @@ static void BEnsureApp() {
 static CGFloat PrimaryScreenTop() {
   NSScreen* primary = NSScreen.screens.firstObject;
   return primary ? NSMaxY(primary.frame) : 0;
+}
+
+// The content view's rect in screen coordinates, Cocoa (bottom-left) space.
+// The renderer draws into the content view, so this — not the rect the style
+// mask implies — is what getWindowFrame and the geometry events report. The
+// two differ while the titlebar holds an accessory (a tab bar, most often):
+// the accessory takes its height out of the content view without moving the
+// window frame, and no windowDidResize fires for it (windowkit/appkit#12).
+static NSRect ContentViewScreenRect(NSWindow* win) {
+  NSView* cv = win.contentView;
+  if (!cv) return [win contentRectForFrameRect:win.frame];
+  return [win convertRectToScreen:[cv convertRect:cv.bounds toView:nil]];
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +145,7 @@ static void EmitWindowGeometry(Napi::Env env, NSWindow* win, const char* type,
   if (!HasBackendCb()) return;
   Napi::HandleScope scope(env);
   Napi::Object ev = WindowEvent(env, win, type);
-  NSRect content = [win contentRectForFrameRect:win.frame];
+  NSRect content = ContentViewScreenRect(win);
   ev.Set("width", content.size.width);
   ev.Set("height", content.size.height);
   ev.Set("x", content.origin.x);
@@ -285,6 +302,9 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     }
     win.releasedWhenClosed = NO;
     win.acceptsMouseMovedEvents = YES;
+    // Never a tab bar, whatever an earlier process left in the defaults
+    // domain (see BEnsureApp).
+    win.tabbingMode = NSWindowTabbingModeDisallowed;
     if (o.Has("title") && o.Get("title").IsString())
       win.title = BToNSString(o.Get("title"));
     if (o.Has("level") && o.Get("level").IsString()) {
@@ -363,7 +383,7 @@ static Napi::Value SetWindowTitle(const Napi::CallbackInfo& info) {
 // x/y are the content's top-left in global top-left coordinates, points.
 static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
   NSWindow* win = BDeref<NSWindow*>(info[0]);
-  NSRect content = [win contentRectForFrameRect:win.frame];
+  NSRect content = ContentViewScreenRect(win);
   double topY = PrimaryScreenTop() - (content.origin.y + content.size.height);
   double x = info[1].IsNumber() ? info[1].As<Napi::Number>().DoubleValue()
                                 : content.origin.x;
@@ -384,7 +404,7 @@ static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
 static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   NSWindow* win = BDeref<NSWindow*>(info[0]);
-  NSRect content = [win contentRectForFrameRect:win.frame];
+  NSRect content = ContentViewScreenRect(win);
   Napi::Object r = Napi::Object::New(env);
   r.Set("x", content.origin.x);
   r.Set("y", PrimaryScreenTop() - (content.origin.y + content.size.height));

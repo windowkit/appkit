@@ -100,6 +100,8 @@ static void EnsureApp() {
   @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    // No window tabbing: see BEnsureApp in backend.mm (windowkit/appkit#12).
+    NSWindow.allowsAutomaticWindowTabbing = NO;
     [NSApp finishLaunching];
   }
   gAppInited = true;
@@ -127,6 +129,7 @@ static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     win.releasedWhenClosed = NO;
+    win.tabbingMode = NSWindowTabbingModeDisallowed;
     win.title = title;
     win.acceptsMouseMovedEvents = YES;
 

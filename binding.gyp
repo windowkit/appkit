@@ -19,7 +19,8 @@
           "-framework CoreText",
           "-framework CoreGraphics",
           "-framework ImageIO",
-          "-framework IOSurface"
+          "-framework IOSurface",
+          "-framework UniformTypeIdentifiers"
         ]
       }
     }

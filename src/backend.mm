@@ -576,8 +576,13 @@ static Napi::Value SetWindowMinMax(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+static void CancelPanelSheetsOn(NSWindow* win);
+
 static Napi::Value DestroyWindow2(const Napi::CallbackInfo& info) {
   NSWindow* win = BDeref<NSWindow*>(info[0]);
+  // A sheet whose owner goes away ends without telling its completion
+  // handler; answer it as a cancel first so no callback is left waiting.
+  CancelPanelSheetsOn(win);
   win.delegate = nil;
   objc_setAssociatedObject(win, &kDelegateKey, nil,
                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1302,6 +1307,228 @@ static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, false);
   [menu performActionForItemAtIndex:leaf];
   return Napi::Boolean::New(env, true);
+}
+
+// ---------------------------------------------------------------------------
+// file panels — NSOpenPanel / NSSavePanel, the real thing rather than an
+// osascript process: owned by our NSApplication, a sheet on the window that
+// asked, a cancel that reads as a cancel. Two presentations: with a window
+// handle the panel is a sheet (beginSheetModalForWindow:), the pump keeps
+// running and the answer arrives through the completion handler on a later
+// tick; with no window it is app-modal (runModal), which parks this thread
+// in AppKit's modal loop until the panel is dismissed, so the callback runs
+// before the call returns. Both end in cb(result), null meaning cancel.
+// Filters are UTType identifiers — extension/MIME resolution is the
+// renderer's policy; contentTypeFor() asks the OS's own type database on its
+// behalf so nothing is dropped the way AppleScript's `of type` dropped MIME.
+// ---------------------------------------------------------------------------
+
+// What a presented panel owes JS: the callback and the env to call it with.
+// Hung on the panel itself so cancelPanel can tell an open panel from one
+// that has already answered.
+@interface CALPanelPending : NSObject {
+ @public
+  napi_env env_;
+  Napi::FunctionReference cb_;
+  bool open_;  // NSOpenPanel answers paths[], NSSavePanel answers a path
+}
+@end
+@implementation CALPanelPending
+@end
+
+static char kPanelPendingKey;
+
+static Napi::Value PanelResult(Napi::Env env, NSSavePanel* panel, bool open,
+                               NSModalResponse r) {
+  if (r != NSModalResponseOK) return env.Null();
+  if (open) {
+    NSArray<NSURL*>* urls = ((NSOpenPanel*)panel).URLs;
+    Napi::Array a = Napi::Array::New(env, urls.count);
+    for (NSUInteger i = 0; i < urls.count; i++)
+      a.Set((uint32_t)i, Napi::String::New(env, urls[i].path.UTF8String));
+    return a;
+  }
+  NSURL* u = panel.URL;
+  return u ? Napi::Value(Napi::String::New(env, u.path.UTF8String))
+           : Napi::Value(env.Null());
+}
+
+// The one place a panel answers. The pending record comes off first, so a
+// second answer (or a cancelPanel from inside the callback) finds nothing.
+static void FinishPanel(NSSavePanel* panel, NSModalResponse r) {
+  CALPanelPending* p = objc_getAssociatedObject(panel, &kPanelPendingKey);
+  if (!p) return;
+  objc_setAssociatedObject(panel, &kPanelPendingKey, nil,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  Napi::Env env(p->env_);
+  Napi::HandleScope scope(env);
+  Napi::Value result = PanelResult(env, panel, p->open_, r);
+  Napi::FunctionReference cb = std::move(p->cb_);
+  cb.Call({result});
+}
+
+// A path, or a file: URL for callers that already hold one.
+static NSURL* PanelURLArg(Napi::Value v) {
+  if (!v.IsString()) return nil;
+  NSString* s = BToNSString(v);
+  if ([s hasPrefix:@"file:"]) return [NSURL URLWithString:s];
+  return s.length ? [NSURL fileURLWithPath:s] : nil;
+}
+
+// The spec keys both panels share.
+static void ConfigurePanel(NSSavePanel* panel, Napi::Object o) {
+  if (o.Has("title") && o.Get("title").IsString())
+    panel.title = BToNSString(o.Get("title"));
+  if (o.Has("message") && o.Get("message").IsString())
+    panel.message = BToNSString(o.Get("message"));
+  if (o.Has("prompt") && o.Get("prompt").IsString())
+    panel.prompt = BToNSString(o.Get("prompt"));
+  if (o.Has("directoryURL")) {
+    NSURL* u = PanelURLArg(o.Get("directoryURL"));
+    if (u) panel.directoryURL = u;
+  }
+  if (o.Has("canCreateDirectories"))
+    panel.canCreateDirectories =
+        BBoolOr(o, "canCreateDirectories", panel.canCreateDirectories);
+  if (o.Has("allowedContentTypes") && o.Get("allowedContentTypes").IsArray()) {
+    Napi::Array ids = o.Get("allowedContentTypes").As<Napi::Array>();
+    NSMutableArray<UTType*>* types = [NSMutableArray array];
+    for (uint32_t i = 0; i < ids.Length(); i++) {
+      Napi::Value v = ids.Get(i);
+      if (!v.IsString()) continue;
+      UTType* t = [UTType typeWithIdentifier:BToNSString(v)];
+      if (t) [types addObject:t];
+    }
+    // A list the OS recognises nothing of is no filter at all, the same as
+    // passing none: a panel that admits nothing helps nobody.
+    if (types.count) panel.allowedContentTypes = types;
+  }
+}
+
+// openPanel(spec, cb) / savePanel(spec, cb) -> panel handle
+//   spec: { window?,               // handle: sheet on it; absent: app-modal
+//           title?, message?, prompt?,          // prompt = confirm button label
+//           directoryURL?,                      // path or file: URL, where it opens
+//           allowedContentTypes?: [UTType id],  // absent/empty: any
+//           canCreateDirectories?,
+//           directory?, multiple?,              // open: folders not files; several
+//           nameFieldStringValue? }             // save: the proposed name
+//   cb(paths | null) for open, cb(path | null) for save; null is cancel.
+static Napi::Value PresentPanel(const Napi::CallbackInfo& info, bool open) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsObject() || !info[1].IsFunction()) {
+    Napi::TypeError::New(env, open ? "openPanel(spec, cb): spec object and callback required"
+                                   : "savePanel(spec, cb): spec object and callback required")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object o = info[0].As<Napi::Object>();
+  NSWindow* owner = nil;
+  if (o.Has("window")) {
+    Napi::Value w = o.Get("window");
+    if (w.IsExternal()) {
+      owner = BDeref<NSWindow*>(w);
+    } else if (!w.IsNull() && !w.IsUndefined()) {
+      Napi::TypeError::New(env, "window must be a window handle")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  }
+  BEnsureApp();
+
+  NSSavePanel* panel;
+  if (open) {
+    NSOpenPanel* op = [NSOpenPanel openPanel];
+    bool dirs = BBoolOr(o, "directory", false);
+    op.canChooseDirectories = dirs;
+    op.canChooseFiles = !dirs;
+    op.allowsMultipleSelection = BBoolOr(o, "multiple", false);
+    panel = op;
+  } else {
+    panel = [NSSavePanel savePanel];
+    if (o.Has("nameFieldStringValue") &&
+        o.Get("nameFieldStringValue").IsString())
+      panel.nameFieldStringValue = BToNSString(o.Get("nameFieldStringValue"));
+  }
+  ConfigurePanel(panel, o);
+
+  CALPanelPending* p = [CALPanelPending new];
+  p->env_ = (napi_env)env;
+  p->cb_ = Napi::Persistent(info[1].As<Napi::Function>());
+  p->open_ = open;
+  objc_setAssociatedObject(panel, &kPanelPendingKey, p,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  Napi::Value handle = BWrapRetained(env, panel);
+
+  if (owner) {
+    [panel beginSheetModalForWindow:owner
+                  completionHandler:^(NSModalResponse r) {
+                    FinishPanel(panel, r);
+                  }];
+  } else {
+    NSModalResponse r = [panel runModal];
+    FinishPanel(panel, r);
+  }
+  return handle;
+}
+
+static Napi::Value OpenPanelFn(const Napi::CallbackInfo& info) {
+  return PresentPanel(info, true);
+}
+
+static Napi::Value SavePanelFn(const Napi::CallbackInfo& info) {
+  return PresentPanel(info, false);
+}
+
+// cancelPanel(panel) -> bool — dismiss a sheet that is still up; its
+// callback then gets null. False when the panel has already answered.
+// (An app-modal panel cannot be reached from here: the thread that would
+// call this is inside runModal.)
+static Napi::Value CancelPanelFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsExternal()) {
+    Napi::TypeError::New(env, "cancelPanel: panel handle required")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  NSSavePanel* panel = BDeref<NSSavePanel*>(info[0]);
+  if (!objc_getAssociatedObject(panel, &kPanelPendingKey))
+    return Napi::Boolean::New(env, false);
+  [panel cancel:nil];
+  return Napi::Boolean::New(env, true);
+}
+
+// Every panel sheet still up on `win`, answered null. Called before the
+// window is torn down.
+static void CancelPanelSheetsOn(NSWindow* win) {
+  for (NSWindow* sheet in [win.sheets copy]) {
+    if (objc_getAssociatedObject(sheet, &kPanelPendingKey))
+      [(NSSavePanel*)sheet cancel:nil];
+  }
+}
+
+// contentTypeFor({ extension } | { mime }) -> UTType identifier, or null.
+// The OS's own database: 'png' -> 'public.png', 'application/json' ->
+// 'public.json'; an extension nothing has declared still yields a dynamic
+// type ('dyn.…') that matches exactly that extension in a panel.
+static Napi::Value ContentTypeForFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsObject()) {
+    Napi::TypeError::New(env, "contentTypeFor({ extension } | { mime })")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object o = info[0].As<Napi::Object>();
+  UTType* t = nil;
+  if (o.Has("extension") && o.Get("extension").IsString()) {
+    NSString* ext = BToNSString(o.Get("extension"));
+    if ([ext hasPrefix:@"."]) ext = [ext substringFromIndex:1];
+    if (ext.length) t = [UTType typeWithFilenameExtension:ext];
+  } else if (o.Has("mime") && o.Get("mime").IsString()) {
+    t = [UTType typeWithMIMEType:BToNSString(o.Get("mime"))];
+  }
+  return t ? Napi::Value(Napi::String::New(env, t.identifier.UTF8String))
+           : Napi::Value(env.Null());
 }
 
 // ---------------------------------------------------------------------------
@@ -4023,6 +4250,10 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("setMainMenu", SetMainMenuFn);
   BFN("mainMenuInfo", MainMenuInfoFn);
   BFN("activateMenuItem", ActivateMenuItemFn);
+  BFN("openPanel", OpenPanelFn);
+  BFN("savePanel", SavePanelFn);
+  BFN("cancelPanel", CancelPanelFn);
+  BFN("contentTypeFor", ContentTypeForFn);
   BFN("measureControl", MeasureControl);
   BFN("drawControlIntoSurface", DrawControlIntoSurface);
   BFN("listScreens", ListScreens);

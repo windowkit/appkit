@@ -198,6 +198,97 @@ and `('quit')` build the corresponding Apple Event and dispatch it through
 `NSAppleEventManager` as if it had just arrived — how `npm test` exercises the
 delegate without a bundle.
 
+## Drag and drop
+
+The backend surface's windows (`native.createWindow2`) take drops and begin
+drags through the hosting view — `NSDraggingDestination` and
+`NSDraggingSource` — with every phase reported through the backend event
+callback, the window's number attached, like every other window event.
+Mechanism only: the renderer keeps the policy (what to accept, what a drop
+means). Type names cross the boundary as pasteboard types — UTIs such as
+`public.utf8-plain-text`, `public.file-url`, `public.png` — and mapping a MIME
+vocabulary onto them is the renderer's job; `pasteboardTypeForMIME(mime)` and
+`pasteboardTypeInfo(uti)` read the OS's own table for it (a MIME type no
+declared type claims gets a `dyn.*` identifier that every process computes
+alike).
+
+```js
+const { native } = require('@windowkit/appkit');
+const win = native.createWindow2({ width: 640, height: 480, title: 'drop here' });
+
+// destination: register, then answer AppKit's questions from inside the callback
+native.registerDropTypes(win, ['public.file-url', 'public.utf8-plain-text']);
+native.setBackendEventCallback((ev) => {
+  switch (ev.type) {
+    case 'drag-enter':   // { windowNumber, x, y, gx, gy, types, itemCount, sourceMask,
+    case 'drag-over':    //   operations, local, sourceWindowNumber?, sequence }
+      native.setDropResponse(win, { accept: ev.types.includes('public.file-url'),
+                                    operation: 'copy' });
+      break;
+    case 'drag-exit':    // may carry no position: a drag cancelled mid-air
+      break;
+    case 'drag-perform': // the drop — read the payload now
+      for (let i = 0; i < ev.itemCount; i++)
+        console.log(native.dragItemString(i, 'public.file-url'));
+      break;
+    case 'drag-session-began':  // source side: x/y in global top-left coordinates
+    case 'drag-session-moved':
+    case 'drag-session-ended':  // + { operation: 'copy' | 'move' | ... | 'none', dropped }
+      break;
+  }
+});
+
+// source: from a press, once the renderer's own threshold says it is a drag
+native.beginDrag(win, {
+  x: press.x, y: press.y,                                           // content coords
+  items: [{ 'public.utf8-plain-text': 'hello', 'public.png': null }],  // one item; null = lazy
+  provide: (type, index) => renderPng(),        // asked when a consumer reads the promise
+  operations: ['copy', 'move'],
+  surface: previewSurface, imageX: node.x, imageY: node.y,          // or image: text.render(...)
+});
+```
+
+- **`setDropResponse` answers the question being asked.** The callback runs
+  synchronously inside `draggingEntered:` / `draggingUpdated:`, so a response
+  set during `drag-enter` or `drag-over` is what AppKit gets back for that
+  event. It stays in force for the `drag-over` events that follow until
+  changed, and resets to a refusal when a new drag enters. `{ accept: false }`
+  during `drag-perform` withdraws a drop after a look at the payload.
+  `operation` absent picks copy, move, link, generic, private, delete — the
+  first the source allows.
+- **`types` is the pasteboard's union, promised translations included**: a
+  `public.png` also appears as `public.tiff` and the legacy `Apple PNG
+  pasteboard type`, a file URL as `NSFilenamesPboardType`. `dragItems()` lists
+  the declared types per item; `dragItemData(index, type)` returns a `Buffer`
+  and `dragItemString(index, type)` a string, `null` when the item has no such
+  representation. A Finder drag of three files is three items of one
+  `public.file-url` each. Read during `drag-perform`: the payload is the
+  source's promise, and a source may withdraw it once its session has ended.
+- **`beginDrag` returns at once.** The session is begun from the real
+  mouse-down when the pointer is still down in the window (the event the
+  renderer's threshold logic is reacting to), and runs on AppKit's own
+  tracking from there: the pointer's `mousemove` / `mouseup` stop arriving,
+  and `drag-session-ended` is the release. `items` is one entry per dragging
+  item, each a map of type → string | bytes | `null`, where `null` is a
+  promise answered by `provide(type, index)` when a consumer reads it — so a
+  representation nobody asks for is never built. `operations` is the source's
+  mask (`operationsOutside` for other applications when it differs),
+  `ignoreModifiers` stops Option/Command turning it into copy/link, and
+  `slideBack` (default on) animates a refused drop home. The image is a
+  `surface` handle or a CGImage `image` (the `text.render` / `controls.render`
+  result works whole), placed at `imageX` / `imageY` — centred on the press by
+  default — at its own size unless `imageWidth` / `imageHeight` say otherwise.
+  A drop on one of our own windows arrives through the destination events of
+  that window with `local: true` and the source's `sourceWindowNumber`.
+- **`postDragEvent(win, phase, { x, y, items, operations, local })`** drives
+  the destination methods with a dragging info of the bridge's own over a
+  private pasteboard — what `postMouseEvent` is to clicks. `'enter'` and
+  `'over'` answer the operation the view returned (`'none'` when it refused),
+  `'drop'` runs prepare + perform + conclude and answers whether the drop was
+  taken. The CI smoke test and a renderer's headless tests drive drops this
+  way.
+
+
 ## Privacy authorizations (TCC)
 
 macOS decides per process whether an app may use the camera, microphone,

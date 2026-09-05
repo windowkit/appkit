@@ -160,6 +160,43 @@ vibrancy materials need private API to reproduce; expose real `NSMenu` instead.
 `native.postMouseEvent(win, 'down'|'up'|'move'|'drag', x, y)` synthesizes events through
 the real pump — used by the demo's self-test (`CAL_CLICKS="x,y;x,y" npm run demo`).
 
+## App lifecycle: open-URL, open-file, reopen, quit
+
+The OS talks to the application as a whole through Apple Events: a URL for a scheme
+the bundle registers (`kInternetEventClass/kAEGetURL`), a document handed over by the
+Finder (`kCoreEventClass/kAEOpenDocuments`), a second launch of a running app
+(`kAEReopenApplication`), and Quit from the Dock, the app menu or a logout
+(`kAEQuitApplication`). `native.initApp()` installs an `NSApplicationDelegate` that
+forwards them to the backend event callback and decides nothing itself:
+
+| event              | payload                 | from                                                                                                                                                                                  |
+| ------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-open-urls`    | `{ urls: [string] }`    | `application:openURLs:` — scheme URLs as sent, documents as `file://` URLs                                                                                                            |
+| `app-reopen`       | `{ hasVisibleWindows }` | `applicationShouldHandleReopen:`, answered NO — what a second launch means is the renderer's call                                                                                     |
+| `app-quit-request` | `{}`                    | `applicationShouldTerminate:`, answered Cancel while a callback is installed — the renderer quits (`process.exit`) or vetoes. With no callback the OS default stands and the process ends |
+
+```js
+native.initApp();                 // first: the delegate has to precede finishLaunching
+native.setBackendEventCallback((ev) => {
+  if (ev.type === 'app-open-urls') route(ev.urls);
+  if (ev.type === 'app-reopen' && !ev.hasVisibleWindows) showMainWindow();
+  if (ev.type === 'app-quit-request') process.exit(0);
+});
+setInterval(() => native.pump2(), 16);
+```
+
+Launch Services delivers the launching Apple Event inside `finishLaunching` — that is,
+inside `initApp()`, before any callback exists. Whatever arrives with nobody listening
+is held and replayed, in order, on the first `pump2()` that has a callback, ahead of
+that tick's input. Registering the scheme itself is an install step, not runtime code:
+`CFBundleURLTypes` (and `CFBundleDocumentTypes` for files) in the bundle's
+`Info.plist`.
+
+`native.postAppleEvent('open-url', url)`, `('open-documents', [paths])`, `('reopen')`
+and `('quit')` build the corresponding Apple Event and dispatch it through
+`NSAppleEventManager` as if it had just arrived — how `npm test` exercises the
+delegate without a bundle.
+
 ## Mapping to a React reconciler
 
 The shape of a host config on top of this:

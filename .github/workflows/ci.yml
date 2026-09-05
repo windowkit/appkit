@@ -57,6 +57,10 @@ jobs:
             if (!viaGlyphs.some((v) => v !== 255) || viaGlyphs.some((v, i) => v !== viaLayout[i])) { console.error('ctxDrawGlyphs does not match drawLayout'); process.exit(1); }
             console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
           "
+      # The app delegate, driven by the Apple Events Launch Services would
+      # send (open-URL, open-documents, reopen, quit), dispatched in-process.
+      - name: App lifecycle events through the delegate
+        run: npm test
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

@@ -1,8 +1,9 @@
 # @windowkit/appkit
 
 A **retained-mode AppKit backend for Node.js**: Core Animation (CALayer)
-layer trees, CoreText layout and drawing, IOSurface presentation, NSMenu and
-native control bezels. It is the macOS half of [react-x11][react-x11].
+layer trees, CoreText layout and drawing, IOSurface presentation, NSMenu,
+native control bezels and the privacy (TCC) authorizations. It is the macOS
+half of [react-x11][react-x11].
 Instead of immediate-mode draw calls, you build a persistent tree of layers, mutate their
 properties, and let the macOS WindowServer composite on the GPU — with implicit animations
 and correct retina handling for free.
@@ -196,6 +197,52 @@ that tick's input. Registering the scheme itself is an install step, not runtime
 and `('quit')` build the corresponding Apple Event and dispatch it through
 `NSAppleEventManager` as if it had just arrived — how `npm test` exercises the
 delegate without a bundle.
+
+## Privacy authorizations (TCC)
+
+macOS decides per process whether an app may use the camera, microphone,
+screen, accessibility, input monitoring or location, or send Apple Events to
+another app. The bridge is mechanism only: read the status, raise the system
+prompt where a framework offers one, and deep-link to the Settings pane where
+it does not. Policy — when to ask, what to do with a refusal — stays in the
+renderer.
+
+```js
+const { permissions, native } = require('@windowkit/appkit');
+
+permissions.status('camera');             // 'authorized' | 'denied' | 'restricted' | 'notDetermined'
+await permissions.request('microphone');  // raises the system prompt; resolves to granted (boolean)
+permissions.status('automation', { target: 'com.apple.finder' });  // Apple Events, per target app
+permissions.openSettings('screen-recording');  // System Settings › Privacy & Security › Screen Recording
+
+// the natives underneath, callback-shaped
+native.authorizationStatus(kind, opts?);                          // never prompts
+native.requestAuthorization(kind, opts?, (granted, status) => {}); // once, asynchronously
+native.openPrivacySettings(kind?);                                // no kind: the Privacy pane itself
+```
+
+| kind                     | status                                         | request                                    | notes                                                                                                                                                              |
+| ------------------------ | ---------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `camera`, `microphone`   | `AVCaptureDevice authorizationStatusForMediaType:` | `requestAccessForMediaType:`           | all four statuses; the prompt is in-process and the answer arrives when the user clicks                                                                            |
+| `screen-recording`       | `CGPreflightScreenCaptureAccess`               | `CGRequestScreenCaptureAccess`             | a bool, so never `notDetermined`; the "prompt" is the system's go-to-Settings dialog (shown once) and the request resolves at once. A new grant needs a process restart |
+| `accessibility`          | `AXIsProcessTrusted`                           | `AXIsProcessTrustedWithOptions` + prompt   | a bool, so never `notDetermined`; go-to-Settings dialog, resolves at once, the grant applies live                                                                   |
+| `input-monitoring`       | `IOHIDCheckAccess` (listen)                    | `IOHIDRequestAccess`                       | granted / denied / unknown → `notDetermined`; the request posts the prompt and resolves at once, `notDetermined` while it is still up                              |
+| `automation`             | `AEDeterminePermissionToAutomateTarget`        | the same, asking                           | needs `{ target: bundleId }` of a **running** app, otherwise throws — TCC only answers for a running target. Asking blocks until answered, so it runs off the main thread |
+| `location`               | `CLLocationManager.authorizationStatus`        | `requestWhenInUseAuthorization`            | the answer comes through the delegate on the main run loop, i.e. while `app.run()` is pumping                                                                      |
+
+- A request answers **once, asynchronously** — never inside the call — and
+  holds the event loop open until then, like pending I/O.
+- **Attribution.** A bare `node` process is attributed to its *responsible
+  process* (Terminal, an IDE) or to `node` itself, and prompts with no
+  usage-description strings. A bundled app must carry the keys
+  (`NSCameraUsageDescription`, `NSMicrophoneUsageDescription`,
+  `NSLocationUsageDescription`, `NSAppleEventsUsageDescription`); without
+  them the request never prompts, or TCC ends the process.
+- **Folders** (Desktop, Documents, Downloads) need nothing native: reading the
+  directory *is* the prompt and `EPERM` is the denial. `openSettings` also
+  takes `'files-and-folders'` and `'full-disk-access'` for their panes.
+- `restricted` is MDM or parental controls: the user cannot grant it.
+
 
 ## Mapping to a React reconciler
 

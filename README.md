@@ -160,6 +160,58 @@ vibrancy materials need private API to reproduce; expose real `NSMenu` instead.
 `native.postMouseEvent(win, 'down'|'up'|'move'|'drag', x, y)` synthesizes events through
 the real pump — used by the demo's self-test (`CAL_CLICKS="x,y;x,y" npm run demo`).
 
+## Status item (the menu-bar extra)
+
+`NSStatusItem` is the tray. An item shows an image or a title (or both) in the
+system status bar with a tooltip, and either owns a menu or reports clicks. The
+menu takes the same item spec `setMainMenu` does, so the tray, the app menu bar
+and — through react-x11's dbusmenu adapter — a Linux panel share one authoring
+model; activations arrive as the same `menu-activate` events.
+
+```js
+const { native } = require('@windowkit/appkit');
+native.setBackendEventCallback((ev) => {
+  if (ev.type === 'status-item-click') {      // only without a menu
+    // ev.statusItem === item; ev.kind: 'left' | 'right' | 'middle'
+    // ev.x/y/width/height: the item's screen rect, top-left global — the
+    // anchor for a popup of your own; plus shift/control/option/command
+  }
+  if (ev.type === 'menu-activate') { /* ev.id from the spec below */ }
+});
+
+const item = native.createStatusItem({
+  image: 'bell.badge',       // SF Symbol name — or a surface handle, or PNG bytes
+  title: '3',                // beside the image, or alone
+  tooltip: 'Notifications',
+  length: 'variable',        // 'variable' | 'square' | points
+});
+native.setStatusItemMenu(item, [               // setMainMenu's item vocabulary
+  { id: 1, title: 'Open', iconName: 'macwindow' },
+  { separator: true },
+  { id: 2, title: 'Quit', key: 'q' },
+]);
+native.setStatusItem(item, { title: '', visible: false });   // in-place patch
+native.setStatusItemMenu(item, null);          // back to click events
+native.removeStatusItem(item);
+```
+
+Images are **template** by default (`imageTemplate: false` keeps their colours),
+so a bitmap icon follows the bar's light/dark the way a symbol does; a surface's
+bitmap is taken at the surface's scale, and `imageSize: [w, h]` overrides the
+size in points. With a menu set, a left or right click tracks the menu and no
+click event fires; a middle click is reported either way. The item stays in
+the bar until `removeStatusItem`, whatever happens to the handle, and it is
+visible at creation unless told otherwise — AppKit's own memory of a hidden
+item (user defaults, by creation order) does not carry over.
+
+For tests: `statusItemInfo(item)` returns what the bar shows (title, tooltip,
+visibility, image, length, the menu in `mainMenuInfo`'s shape, the screen
+rect), `activateStatusItemMenuItem(item, [i, j, ...])` fires a menu item by
+index path, `clickStatusItem(item, kind)` posts a real press-and-release into
+the item's window (pump afterwards; declined for left/right while a menu is
+set, since that click would open it), and `snapshotStatusItem(item, file)`
+writes the composited item to a PNG.
+
 ## Mapping to a React reconciler
 
 The shape of a host config on top of this:

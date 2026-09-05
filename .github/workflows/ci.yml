@@ -55,6 +55,23 @@ jobs:
             const viaLayout = paint((g) => n.drawLayout(g, layout.handle, 4, 30 - layout.lines[0].baseline));
             const viaGlyphs = paint((g) => n.ctxDrawGlyphs(g, [{ font, glyphs: ids, positions: new Float64Array([4, 30, 4 + adv[0], 30]) }]));
             if (!viaGlyphs.some((v) => v !== 255) || viaGlyphs.some((v, i) => v !== viaLayout[i])) { console.error('ctxDrawGlyphs does not match drawLayout'); process.exit(1); }
+            // drag and drop: the hosting view answers a drag the way AppKit asks it — enter/over/drop through
+            // the real NSDraggingDestination methods, the answer set from inside the callback for that event,
+            // the payload read per item during the drop, and the OS's MIME table for the type names
+            const dw = n.createWindow2({ width: 200, height: 150, title: 'dnd' });
+            n.registerDropTypes(dw, ['public.utf8-plain-text']);
+            const dndSeen = [];
+            n.setBackendEventCallback((ev) => {
+              if (!ev.type.startsWith('drag-')) return;
+              dndSeen.push(ev.type);
+              if (ev.type === 'drag-enter' || ev.type === 'drag-over') n.setDropResponse(dw, { accept: ev.types.includes('public.utf8-plain-text'), operation: 'copy' });
+              if (ev.type === 'drag-perform') dndSeen.push(n.dragItemString(0, 'public.utf8-plain-text'));
+            });
+            const dndItems = [{ 'public.utf8-plain-text': 'hello' }];
+            const dndAnswers = [n.postDragEvent(dw, 'enter', { x: 10, y: 10, items: dndItems }), n.postDragEvent(dw, 'over', { x: 12, y: 12, items: dndItems }), n.postDragEvent(dw, 'drop', { x: 12, y: 12, items: dndItems }), n.postDragEvent(dw, 'enter', { x: 1, y: 1, items: [{ 'public.png': Buffer.alloc(4) }] })];
+            n.setBackendEventCallback(null);
+            n.destroyWindow2(dw);
+            if (dndAnswers.join() !== 'copy,copy,true,none' || dndSeen.join() !== 'drag-enter,drag-over,drag-perform,hello,drag-enter' || n.pasteboardTypeForMIME('image/png') !== 'public.png') { console.error('drag and drop', dndAnswers, dndSeen); process.exit(1); }
             console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
           "
 

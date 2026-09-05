@@ -85,7 +85,22 @@ jobs:
               let err; try { bad(); } catch (e) { err = e; }
               if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
             }
-            console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
+            // file panels: the OS type database behind the filters, then a real NSOpenPanel
+            // as a sheet on one of our windows, cancelled from JS, answering null through the pump
+            if (n.contentTypeFor({ extension: 'png' }) !== 'public.png' || n.contentTypeFor({ mime: 'application/json' }) !== 'public.json' || n.contentTypeFor({ extension: 'nobody-declared-this' }) === null) { console.error('contentTypeFor'); process.exit(1); }
+            const win = n.createWindow2({ width: 200, height: 120, title: 'panel' });
+            n.showWindow(win, false);
+            let answer = 'pending';
+            const panel = n.openPanel({ window: win, message: 'ci', allowedContentTypes: ['public.png'] }, (r) => { answer = r; });
+            const pump = setInterval(() => n.pump2(), 16);
+            setTimeout(() => { if (!n.cancelPanel(panel)) { console.error('cancelPanel: no sheet pending'); process.exit(1); } }, 1000);
+            setTimeout(() => {
+              clearInterval(pump);
+              if (answer !== null || n.cancelPanel(panel)) { console.error('sheet did not answer null on cancel:', answer); process.exit(1); }
+              n.destroyWindow2(win);
+              console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
+              process.exit(0);
+            }, 4000);
           "
 
   # Same steps the release workflow uses to produce the prebuilt binaries

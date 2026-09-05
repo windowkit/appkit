@@ -161,6 +161,52 @@ vibrancy materials need private API to reproduce; expose real `NSMenu` instead.
 `native.postMouseEvent(win, 'down'|'up'|'move'|'drag', x, y)` synthesizes events through
 the real pump — used by the demo's self-test (`CAL_CLICKS="x,y;x,y" npm run demo`).
 
+## File panels
+
+Open and save dialogs are real `NSOpenPanel` / `NSSavePanel`s owned by this process's
+`NSApplication` — not a separate `osascript` — so they can run as a sheet on the window
+that asked, every filter the OS type database knows gets through, and a cancel is a
+cancel rather than a failed subprocess.
+
+```js
+const { native } = require('@windowkit/appkit');
+
+// With a window handle the panel is a sheet on it: the pump keeps running and the
+// callback fires on a later tick. Without one it is app-modal: the call blocks in
+// AppKit's modal loop until the panel is dismissed, and the callback runs before
+// the call returns.
+native.openPanel({
+  window: win._h,               // omit for app-modal
+  directory: false,             // true: choose folders instead of files
+  multiple: true,
+  message: 'Pick some images',
+  prompt: 'Import',             // the confirm button's label
+  directoryURL: process.env.HOME,
+  allowedContentTypes: ['public.png', native.contentTypeFor({ mime: 'image/jpeg' })],
+}, (paths) => { /* ['/Users/…/a.png', …], or null on cancel */ });
+
+native.savePanel({
+  window: win._h,
+  nameFieldStringValue: 'Untitled.txt',
+  allowedContentTypes: [native.contentTypeFor({ extension: 'txt' })],
+}, (path) => { /* '/Users/…/Untitled.txt', or null on cancel */ });
+```
+
+Both take `title`, `message`, `prompt`, `directoryURL` (a path or `file:` URL),
+`allowedContentTypes` and `canCreateDirectories`; the open panel adds `directory` and
+`multiple`, the save panel `nameFieldStringValue`. Both return a panel handle:
+`native.cancelPanel(handle)` dismisses a sheet that is still up (its callback then gets
+`null`) and reports whether there was one, and `destroyWindow2` answers any sheet still
+attached to the window the same way, so no callback is left waiting.
+
+Filters are UTType identifiers, the shape `NSSavePanel.allowedContentTypes` wants;
+mapping extensions and MIME types onto them is the renderer's policy, and
+`native.contentTypeFor({ extension })` / `({ mime })` does the lookup in the OS's own
+database (`'png'` → `'public.png'`, `'application/json'` → `'public.json'`; an
+extension nobody has declared still gets a dynamic type that matches exactly that
+extension). An absent or empty list means any file, and so does a list the OS
+recognises nothing of.
+
 ## Drag and drop
 
 The backend surface's windows (`native.createWindow2`) take drops and begin

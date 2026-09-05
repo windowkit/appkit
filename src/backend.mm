@@ -580,6 +580,11 @@ static void DispatchEvent2(Napi::Env env, NSEvent* e) {
 static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
   if (info[0].IsFunction()) {
     gBackendCb = Napi::Persistent(info[0].As<Napi::Function>());
+    // A static reference is destructed after the Node environment is gone;
+    // deleting it then is a segfault at exit on Node 18. Replacing or
+    // clearing it (Reset, above and in the move-assign) still frees the old
+    // reference while the environment is alive.
+    gBackendCb.SuppressDestruct();
   } else {
     gBackendCb.Reset();
   }

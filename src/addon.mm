@@ -93,24 +93,11 @@ static Napi::Value WrapRetained(Napi::Env env, id obj) {
 - (void)keyDown:(NSEvent*)event { (void)event; }
 @end
 
-static bool gAppInited = false;
-
-static void EnsureApp() {
-  if (gAppInited) return;
-  @autoreleasepool {
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    // No window tabbing: see BEnsureApp in backend.mm (windowkit/appkit#12).
-    NSWindow.allowsAutomaticWindowTabbing = NO;
-    [NSApp finishLaunching];
-  }
-  gAppInited = true;
-}
-
-static Napi::Value InitApp(const Napi::CallbackInfo& info) {
-  EnsureApp();
-  return info.Env().Undefined();
-}
+// src/backend.mm owns the NSApplication setup (activation policy, no window
+// tabbing, the app delegate that must precede finishLaunching); both faces
+// of the addon share the one call so finishLaunching runs once.
+void BEnsureApp();
+static void EnsureApp() { BEnsureApp(); }
 
 static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -921,8 +908,9 @@ static Napi::Value SnapshotWindow(const Napi::CallbackInfo& info) {
 // module init
 // ---------------------------------------------------------------------------
 
-// src/backend.mm — the react-x11 backend surface (windows with delegates,
-// enriched events, CG surfaces, CoreText layouts, pasteboard, screens).
+// src/backend.mm — the react-x11 backend surface (initApp and the app
+// delegate, windows with delegates, enriched events, CG surfaces, CoreText
+// layouts, pasteboard, screens).
 void InitBackend(Napi::Env env, Napi::Object exports);
 // src/permissions.mm — privacy (TCC) authorizations: status, the system
 // prompt where a framework offers one, the Settings pane otherwise.
@@ -933,7 +921,6 @@ void InitNotifications(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
-  FN("initApp", InitApp);
   FN("pump", Pump);
   FN("setEventCallback", SetEventCallback);
   FN("postMouseEvent", PostMouseEvent);

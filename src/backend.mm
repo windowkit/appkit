@@ -70,9 +70,11 @@ static CGColorRef BMakeColor(Napi::Value v) {
 }
 
 // ---------------------------------------------------------------------------
-// the application: one bootstrap for both files. addon.mm's EnsureApp calls
-// CALEnsureApp, so NSApplication is set up exactly once, whichever entry
-// point (initApp, createWindow, createWindow2, a control bezel) comes first.
+// the application: one bootstrap for both faces of the addon. addon.mm's
+// EnsureApp calls BEnsureApp (not static for that reason), so NSApplication
+// is set up exactly once, whichever entry point (initApp, createWindow,
+// createWindow2, a control bezel) comes first, and the app delegate it
+// dispatches to is in place for finishLaunching.
 //
 // The activation policy has to be decided before finishLaunching: a Regular
 // launch registers a Dock tile, and an agent app that flips to Accessory
@@ -87,37 +89,26 @@ static NSApplicationActivationPolicy gActivationPolicy =
 static bool gAppLaunched = false;
 static NSMenu* gDockMenu = nil;  // applicationDockMenu: answer; setDockMenu
 
-// The one NSApplicationDelegate. Only what the Dock asks for lives here;
-// termination, reopen and open-file routing stay AppKit's defaults until a
-// renderer needs them.
-@interface CALAppDelegate : NSObject <NSApplicationDelegate>
-@end
-@implementation CALAppDelegate
-- (NSMenu*)applicationDockMenu:(NSApplication*)sender {
-  (void)sender;
-  return gDockMenu;
-}
-@end
-static CALAppDelegate* gAppDelegate = nil;  // NSApp.delegate is unretained
+static void BInstallAppDelegate();  // the app lifecycle section, below
 
-void CALEnsureApp() {
+void BEnsureApp() {
   if (gAppLaunched) return;
   @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:gActivationPolicy];
-    if (!gAppDelegate) gAppDelegate = [CALAppDelegate new];
-    NSApp.delegate = gAppDelegate;
     // A react-x11 window has no tab semantics. Left on, AppKit persists
     // "show tab bar" per process name (under bun the key lives in the `bun`
     // defaults domain) and grows a 28pt bar into the titlebar of every
     // window we create (windowkit/appkit#12).
     NSWindow.allowsAutomaticWindowTabbing = NO;
+    // Before finishLaunching, never after: the Apple Event this process was
+    // launched for (a URL, a document) is dispatched inside that call, and
+    // a delegate installed a line later would never hear of it.
+    BInstallAppDelegate();
     [NSApp finishLaunching];
   }
   gAppLaunched = true;
 }
-
-static void BEnsureApp() { CALEnsureApp(); }
 
 // The top of the primary screen, for global coordinate flips. The primary
 // screen is the one whose Cocoa frame origin is (0,0); its top edge is the
@@ -152,6 +143,137 @@ static bool HasBackendCb() { return !gBackendCb.IsEmpty(); }
 static void EmitToJS(Napi::Env env, Napi::Object ev) {
   if (!HasBackendCb()) return;
   gBackendCb.Call({ev});
+}
+
+// ---------------------------------------------------------------------------
+// app lifecycle: what the OS asks the application as a whole
+// ---------------------------------------------------------------------------
+//
+// A URL for a scheme the bundle registers (kInternetEventClass/kAEGetURL),
+// a document handed over by the Finder (kCoreEventClass/kAEOpenDocuments),
+// a second launch of a running app (kAEReopenApplication) and Quit from the
+// Dock, the app menu or a logout (kAEQuitApplication) all reach the process
+// as Apple Events, which AppKit turns into NSApplicationDelegate calls. The
+// delegate forwards them as backend events and decides nothing itself, the
+// same rule windowShouldClose follows:
+//
+//   app-open-urls     { urls: [string] }     scheme URLs as sent, documents
+//                                            as file:// URLs
+//   app-reopen        { hasVisibleWindows }  the Dock tile clicked again
+//   app-quit-request  {}                     terminate: was asked for; the
+//                                            renderer exits or vetoes
+//
+// Two timing facts shape the code. Launch Services delivers the launching
+// event inside finishLaunching, so the delegate goes in before that call
+// (BEnsureApp). And initApp() runs before setBackendEventCallback(), so
+// whatever arrives with nobody listening is held here and replayed on the
+// first pump that has a listener, in arrival order, ahead of that pump's
+// NSEvents. Registering the scheme itself (CFBundleURLTypes) is an
+// Info.plist matter for the app bundle, not runtime code.
+
+enum class AppEventKind { OpenURLs, Reopen, QuitRequest };
+
+struct PendingAppEvent {
+  explicit PendingAppEvent(AppEventKind k) : kind(k) {}
+  AppEventKind kind;
+  std::vector<std::string> urls;   // OpenURLs
+  bool hasVisibleWindows = false;  // Reopen
+};
+static std::vector<PendingAppEvent> gPendingAppEvents;
+
+static Napi::Object AppEventObject(Napi::Env env, const PendingAppEvent& p) {
+  Napi::Object ev = Napi::Object::New(env);
+  switch (p.kind) {
+    case AppEventKind::OpenURLs: {
+      ev.Set("type", "app-open-urls");
+      Napi::Array urls = Napi::Array::New(env, p.urls.size());
+      for (size_t i = 0; i < p.urls.size(); i++)
+        urls.Set((uint32_t)i, p.urls[i]);
+      ev.Set("urls", urls);
+      break;
+    }
+    case AppEventKind::Reopen:
+      ev.Set("type", "app-reopen");
+      ev.Set("hasVisibleWindows", p.hasVisibleWindows);
+      break;
+    case AppEventKind::QuitRequest:
+      ev.Set("type", "app-quit-request");
+      break;
+  }
+  return ev;
+}
+
+// Now if JS is listening, else held for the pump that finds it listening.
+static void EmitAppEvent(PendingAppEvent&& p) {
+  if (!HasBackendCb()) {
+    gPendingAppEvents.push_back(std::move(p));
+    return;
+  }
+  Napi::Env env = gBackendCb.Env();
+  Napi::HandleScope scope(env);
+  EmitToJS(env, AppEventObject(env, p));
+}
+
+static void FlushPendingAppEvents(Napi::Env env) {
+  if (gPendingAppEvents.empty() || !HasBackendCb()) return;
+  // moved out first: a handler may pump, and pumping may hold more
+  std::vector<PendingAppEvent> held = std::move(gPendingAppEvents);
+  gPendingAppEvents.clear();
+  for (const PendingAppEvent& p : held) {
+    Napi::HandleScope scope(env);
+    EmitToJS(env, AppEventObject(env, p));
+  }
+}
+
+@interface CALAppDelegate : NSObject <NSApplicationDelegate>
+@end
+@implementation CALAppDelegate
+// One entry point for both Apple Events since 10.13 (NSApplication.h: every
+// CFBundleURLTypes URL and every document type without an NSDocument class
+// comes here, and application:openFiles: is then never called). No
+// replyToOpenOrPrint: is owed on this path; that is openFiles:' contract.
+- (void)application:(NSApplication*)app openURLs:(NSArray<NSURL*>*)urls {
+  (void)app;
+  PendingAppEvent p(AppEventKind::OpenURLs);
+  for (NSURL* u in urls) {
+    NSString* s = u.absoluteString;
+    if (s) p.urls.push_back(s.UTF8String);
+  }
+  if (!p.urls.empty()) EmitAppEvent(std::move(p));
+}
+- (BOOL)applicationShouldHandleReopen:(NSApplication*)app
+                    hasVisibleWindows:(BOOL)flag {
+  (void)app;
+  PendingAppEvent p(AppEventKind::Reopen);
+  p.hasVisibleWindows = flag;
+  EmitAppEvent(std::move(p));
+  return NO;  // what a second launch means is the renderer's call
+}
+// With nobody listening the OS default stands and the process ends here,
+// as it always has. With a listener the request is theirs to act on, and
+// quitting is a process.exit on their side. Never NSTerminateLater: AppKit
+// would spin its own run loop waiting for the reply, and this process is
+// pumped from JS, not run by AppKit.
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
+  (void)app;
+  if (!HasBackendCb()) return NSTerminateNow;
+  EmitAppEvent(PendingAppEvent(AppEventKind::QuitRequest));
+  return NSTerminateCancel;
+}
+// The Dock tile's menu (right-click or press-and-hold), asked for on every
+// open; the spec behind it comes from setDockMenu in the menu section.
+- (NSMenu*)applicationDockMenu:(NSApplication*)app {
+  (void)app;
+  return gDockMenu;
+}
+@end
+
+// NSApp.delegate is unretained; this is the retain.
+static CALAppDelegate* gAppDelegate = nil;
+
+static void BInstallAppDelegate() {
+  if (!gAppDelegate) gAppDelegate = [CALAppDelegate new];
+  NSApp.delegate = gAppDelegate;
 }
 
 // Window bookkeeping: delegate + view need to reach the JS callback with the
@@ -492,10 +614,99 @@ static Napi::Value DestroyWindow2(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// initApp lives in the app presence section: it takes { activationPolicy }.
+
 static Napi::Value ActivateApp(const Napi::CallbackInfo& info) {
   BEnsureApp();
   [NSApp activateIgnoringOtherApps:YES];
   return info.Env().Undefined();
+}
+
+// postAppleEvent('open-url', 'scheme://…')
+// postAppleEvent('open-documents', ['/path', …])
+// postAppleEvent('reopen')
+// postAppleEvent('quit')
+// The Apple Event Launch Services would send, built here and dispatched
+// through NSAppleEventManager as if it had just been dequeued, so AppKit's
+// own handler and then the app delegate run on it exactly as for a real
+// one. For tests, like postMouseEvent and postKeyEvent. (An AESendMessage
+// to the sending process is short-circuited to this same dispatch by the
+// Apple Event Manager, minus a spurious errAETimeout on kAEOpenDocuments,
+// whose AppKit handler suspends the event to reply later.) No Automation
+// permission is involved: nothing leaves the process.
+static Napi::Value PostAppleEvent(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  if (!info[0].IsString()) {
+    Napi::TypeError::New(env, "postAppleEvent: kind must be a string")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  std::string kind = info[0].As<Napi::String>().Utf8Value();
+  @autoreleasepool {
+    NSAppleEventDescriptor* target =
+        [NSAppleEventDescriptor currentProcessDescriptor];
+    AEEventClass cls;
+    AEEventID id;
+    NSAppleEventDescriptor* direct = nil;
+    if (kind == "open-url") {
+      if (!info[1].IsString()) {
+        Napi::TypeError::New(env, "postAppleEvent('open-url', url): url must be a string")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      cls = kInternetEventClass;
+      id = kAEGetURL;
+      direct = [NSAppleEventDescriptor descriptorWithString:BToNSString(info[1])];
+    } else if (kind == "open-documents") {
+      if (!info[1].IsArray()) {
+        Napi::TypeError::New(env, "postAppleEvent('open-documents', paths): paths must be an array")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      cls = kCoreEventClass;
+      id = kAEOpenDocuments;
+      direct = [NSAppleEventDescriptor listDescriptor];
+      Napi::Array paths = info[1].As<Napi::Array>();
+      for (uint32_t i = 0; i < paths.Length(); i++) {
+        NSURL* url = [NSURL fileURLWithPath:BToNSString(paths.Get(i))];
+        [direct insertDescriptor:[NSAppleEventDescriptor descriptorWithFileURL:url]
+                         atIndex:0];  // 0 appends
+      }
+    } else if (kind == "reopen") {
+      cls = kCoreEventClass;
+      id = kAEReopenApplication;
+    } else if (kind == "quit") {
+      cls = kCoreEventClass;
+      id = kAEQuitApplication;
+    } else {
+      Napi::TypeError::New(env, "postAppleEvent: unknown kind '" + kind + "'")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    NSAppleEventDescriptor* ev =
+        [NSAppleEventDescriptor appleEventWithEventClass:cls
+                                                 eventID:id
+                                        targetDescriptor:target
+                                                returnID:kAutoGenerateReturnID
+                                           transactionID:kAnyTransactionID];
+    if (direct) [ev setParamDescriptor:direct forKeyword:keyDirectObject];
+    AppleEvent reply = {typeNull, NULL};
+    // the refCon reaches raw C handlers only; AppKit's are Objective-C
+    // methods looked up by class and id, but the parameter is non-null
+    static char refCon;
+    OSErr err = [[NSAppleEventManager sharedAppleEventManager]
+        dispatchRawAppleEvent:ev.aeDesc
+                 withRawReply:&reply
+                handlerRefCon:(SRefCon)&refCon];
+    AEDisposeDesc(&reply);
+    if (err != noErr) {
+      Napi::Error::New(env, "postAppleEvent: dispatch failed (" +
+                                std::to_string((int)err) + ")")
+          .ThrowAsJavaScriptException();
+    }
+  }
+  return env.Undefined();
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +830,9 @@ static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
 static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
+  // the launch's URL (or a Dock click) that came before the callback did,
+  // ahead of this tick's input so the renderer hears of it first
+  FlushPendingAppEvents(env);
   @autoreleasepool {
     while (true) {
       NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -1213,7 +1427,7 @@ static const char* PolicyName(NSApplicationActivationPolicy p) {
 static bool ApplyActivationPolicy(NSApplicationActivationPolicy p) {
   if (!gAppLaunched) {
     gActivationPolicy = p;
-    CALEnsureApp();
+    BEnsureApp();
     return true;
   }
   return [NSApp setActivationPolicy:p];
@@ -1234,9 +1448,13 @@ static bool ApplyPolicyOption(Napi::Env env, Napi::Value v) {
   return true;
 }
 
-// initApp({ activationPolicy? }) — set up NSApplication (idempotent). The
-// policy option is honoured on any call: before launch it decides how the
-// app launches, afterwards it switches live.
+// initApp({ activationPolicy? }) — the NSApplication, its activation policy
+// and the app delegate (open-URL / open-file, reopen, quit and Dock-menu
+// routing; see the app lifecycle section). Idempotent; every other entry
+// point calls it implicitly, but a renderer that wants the launching URL
+// calls it first thing and installs its callback next, before the first
+// pump. The policy option is honoured on any call: before launch it decides
+// how the app launches, afterwards it switches live.
 static Napi::Value InitAppFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() > 0 && info[0].IsObject()) {
@@ -4349,6 +4567,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("listScreens", ListScreens);
   BFN("setCursor", SetCursorFn);
   BFN("postKeyEvent", PostKeyEvent);
+  BFN("postAppleEvent", PostAppleEvent);
   BFN("registerDropTypes", RegisterDropTypes);
   BFN("setDropResponse", SetDropResponse);
   BFN("dragItems", DragItems);

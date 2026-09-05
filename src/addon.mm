@@ -93,11 +93,11 @@ static Napi::Value WrapRetained(Napi::Env env, id obj) {
 - (void)keyDown:(NSEvent*)event { (void)event; }
 @end
 
-// NSApplication is set up once, in backend.mm (CALEnsureApp): that is where
-// the activation policy, the app delegate and the no-tabbing default live,
-// and `initApp` is registered from there too.
-void CALEnsureApp();
-static void EnsureApp() { CALEnsureApp(); }
+// src/backend.mm owns the NSApplication setup (activation policy, no window
+// tabbing, the app delegate that must precede finishLaunching); both faces
+// of the addon share the one call so finishLaunching runs once.
+void BEnsureApp();
+static void EnsureApp() { BEnsureApp(); }
 
 static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -909,8 +909,9 @@ static Napi::Value SnapshotWindow(const Napi::CallbackInfo& info) {
 // module init
 // ---------------------------------------------------------------------------
 
-// src/backend.mm — the react-x11 backend surface (windows with delegates,
-// enriched events, CG surfaces, CoreText layouts, pasteboard, screens).
+// src/backend.mm — the react-x11 backend surface (initApp and the app
+// delegate, windows with delegates, enriched events, CG surfaces, CoreText
+// layouts, pasteboard, screens).
 void InitBackend(Napi::Env env, Napi::Object exports);
 // src/permissions.mm — privacy (TCC) authorizations: status, the system
 // prompt where a framework offers one, the Settings pane otherwise.

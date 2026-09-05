@@ -5,8 +5,8 @@
 // surfaces with a canvas-shaped drawing API, a CoreText layout engine
 // (measure + draw + caret/hit geometry) with glyph-level natives beside it
 // (ids, advances, fallback faces, glyph-run drawing), pasteboard text,
-// screen lists and cursors. The retained-layer API stays in addon.mm; this
-// file is what a renderer paints and listens through.
+// drag and drop, screen lists and cursors. The retained-layer API stays in
+// addon.mm; this file is what a renderer paints and listens through.
 //
 // Coordinate rule, stated once: every point that crosses this boundary is
 // TOP-LEFT origin. Window frames and screen rects are top-left in global
@@ -214,6 +214,16 @@ static char kDelegateKey;
 @interface CALBackendView : NSView {
  @public
   NSTrackingArea* tracking_;
+  // drag and drop (its own section below): the env the callbacks run in,
+  // the destination's standing answer, the source's masks and provider,
+  // and the press a session is begun from
+  napi_env env_;
+  bool dropAccept_;
+  NSString* dropOp_;  // nil: the conventional operation for the source's mask
+  NSDragOperation sourceMask_, sourceMaskOutside_;
+  BOOL ignoreModifiers_;
+  NSEvent* lastPress_;
+  id dragProvider_;
 }
 @end
 @implementation CALBackendView
@@ -320,6 +330,7 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     }
 
     CALBackendView* view = [[CALBackendView alloc] initWithFrame:rect];
+    view->env_ = (napi_env)env;
     CALayer* root = [CALayer layer];
     root.geometryFlipped = YES;
     [view setLayer:root];
@@ -480,6 +491,14 @@ static void DispatchEvent2(Napi::Env env, NSEvent* e) {
     default: return;
   }
   if ((mouse || crossing) && !e.window) return;
+  // The press a drag session is begun from (beginDrag): the latest
+  // left-button down or drag in the window, recorded before JS sees it so a
+  // beginDrag from inside this very callback has it.
+  if ((e.type == NSEventTypeLeftMouseDown ||
+       e.type == NSEventTypeLeftMouseDragged) &&
+      [e.window.contentView isKindOfClass:[CALBackendView class]]) {
+    ((CALBackendView*)e.window.contentView)->lastPress_ = e;
+  }
 
   Napi::HandleScope scope(env);
   Napi::Object ev = Napi::Object::New(env);
@@ -3187,6 +3206,725 @@ static Napi::Value InvalidateWindowShadow(const Napi::CallbackInfo& info) {
 }
 
 // ---------------------------------------------------------------------------
+// drag and drop — NSDraggingDestination on the hosting view, NSDraggingSource
+// from it (windowkit/appkit#16). Mechanism only. AppKit asks its questions
+// synchronously — may this drop land, and with which operation? — and the
+// view answers them from a response JS sets during the callback for that
+// very question (the callback runs inside draggingEntered:/draggingUpdated:,
+// so a setDropResponse in a drag-enter handler is the answer to that
+// draggingEntered:). Every phase is reported through the backend callback
+// with the window's number attached, like every other window event. Type
+// names cross this boundary as pasteboard types — UTIs such as
+// public.utf8-plain-text, public.file-url, public.png, and the legacy
+// NSPasteboardType strings AppKit still hands out — and the MIME vocabulary
+// stays the renderer's; pasteboardTypeForMIME is the OS's own table for it.
+// ---------------------------------------------------------------------------
+
+static const struct {
+  const char* name;
+  NSDragOperation op;
+} kDragOps[] = {
+    {"copy", NSDragOperationCopy},       {"link", NSDragOperationLink},
+    {"generic", NSDragOperationGeneric}, {"private", NSDragOperationPrivate},
+    {"move", NSDragOperationMove},       {"delete", NSDragOperationDelete},
+};
+
+static NSDragOperation DragOpFromName(const std::string& name) {
+  for (const auto& d : kDragOps)
+    if (name == d.name) return d.op;
+  return NSDragOperationNone;
+}
+
+static const char* DragOpName(NSDragOperation op) {
+  for (const auto& d : kDragOps)
+    if (op == d.op) return d.name;
+  return op == NSDragOperationNone ? "none" : "generic";
+}
+
+// ['copy', 'move'] or a raw NSDragOperation mask; absent means copy.
+static NSDragOperation DragMaskFrom(Napi::Value v) {
+  if (v.IsNumber()) return (NSDragOperation)v.As<Napi::Number>().Uint32Value();
+  if (!v.IsArray()) return NSDragOperationCopy;
+  Napi::Array a = v.As<Napi::Array>();
+  NSDragOperation mask = NSDragOperationNone;
+  for (uint32_t i = 0; i < a.Length(); i++) {
+    Napi::Value e = a.Get(i);
+    if (e.IsString()) mask |= DragOpFromName(e.As<Napi::String>().Utf8Value());
+  }
+  return mask;
+}
+
+static Napi::Array DragOpsOfMask(Napi::Env env, NSDragOperation mask) {
+  Napi::Array out = Napi::Array::New(env);
+  uint32_t n = 0;
+  for (const auto& d : kDragOps)
+    if (mask & d.op) out.Set(n++, d.name);
+  return out;
+}
+
+// The operation a destination answers when JS accepted without naming one:
+// the conventional order over what the source allows. An explicit
+// `operation` is returned as given, whether or not the source offered it.
+static NSDragOperation DragDefaultOp(NSDragOperation mask) {
+  static const NSDragOperation prefer[] = {
+      NSDragOperationCopy,    NSDragOperationMove,    NSDragOperationLink,
+      NSDragOperationGeneric, NSDragOperationPrivate, NSDragOperationDelete};
+  for (NSDragOperation op : prefer)
+    if (mask & op) return op;
+  return NSDragOperationGeneric;
+}
+
+// The pasteboard of the drag most recently over one of our windows — what
+// dragItems / dragItemData read. AppKit hands each destination method its
+// own NSDraggingInfo and forbids keeping it; the pasteboard underneath is
+// the drag pasteboard, which outlives the call.
+static NSPasteboard* gDragPasteboard = nil;
+// postDragEvent's private pasteboard; released when the next one replaces it.
+static NSPasteboard* gPostedPasteboard = nil;
+
+// The hosting view of a createWindow2 window, or nil with a TypeError
+// pending: these verbs belong to the backend surface, and addon.mm's windows
+// host a CALHostView that has none of this.
+static CALBackendView* BackendViewArg(Napi::Value v, const char* fn) {
+  if (v.IsExternal()) {
+    NSWindow* win = BDeref<NSWindow*>(v);
+    if ([win.contentView isKindOfClass:[CALBackendView class]])
+      return (CALBackendView*)win.contentView;
+  }
+  Napi::TypeError::New(v.Env(),
+                       std::string(fn) + ": expected a createWindow2 window")
+      .ThrowAsJavaScriptException();
+  return nil;
+}
+
+// A JS value onto a pasteboard item: a string as a string (AppKit encodes
+// it for the type — UTF-8 for public.utf8-plain-text, the URL string for
+// public.file-url), bytes as bytes, anything else stringified. null writes
+// nothing.
+static void WritePasteboardValue(NSPasteboardItem* item, NSString* type,
+                                 Napi::Value v) {
+  if (v.IsNull() || v.IsUndefined()) return;
+  if (v.IsString()) {
+    [item setString:BToNSString(v) forType:type];
+    return;
+  }
+  const void* bytes = nullptr;
+  size_t len = 0;
+  if (v.IsBuffer()) {
+    Napi::Buffer<uint8_t> b = v.As<Napi::Buffer<uint8_t>>();
+    bytes = b.Data();
+    len = b.Length();
+  } else if (v.IsTypedArray()) {
+    Napi::TypedArray a = v.As<Napi::TypedArray>();
+    bytes = (const uint8_t*)a.ArrayBuffer().Data() + a.ByteOffset();
+    len = a.ByteLength();
+  } else if (v.IsArrayBuffer()) {
+    Napi::ArrayBuffer a = v.As<Napi::ArrayBuffer>();
+    bytes = a.Data();
+    len = a.ByteLength();
+  } else {
+    [item setString:BToNSString(v.ToString()) forType:type];
+    return;
+  }
+  [item setData:[NSData dataWithBytes:bytes length:len] forType:type];
+}
+
+// The source side's lazy payloads: a representation whose value was null is
+// promised, and AppKit asks for it here — on this thread, inside the pump or
+// the session's own tracking — when a consumer actually reads it. The
+// answer is `provide(type, itemIndex)`'s return value, written like any
+// other.
+@interface CALDragProvider : NSObject <NSPasteboardItemDataProvider> {
+ @public
+  napi_env env_;
+  Napi::FunctionReference fn_;
+  NSArray<NSPasteboardItem*>* items_;
+}
+@end
+@implementation CALDragProvider
+- (void)pasteboard:(NSPasteboard*)pb
+                  item:(NSPasteboardItem*)item
+    provideDataForType:(NSPasteboardType)type {
+  (void)pb;
+  if (fn_.IsEmpty()) return;
+  Napi::Env env(env_);
+  Napi::HandleScope scope(env);
+  NSUInteger idx = [items_ indexOfObjectIdenticalTo:item];
+  Napi::Value v = fn_.Call(
+      {Napi::String::New(env, type.UTF8String),
+       Napi::Number::New(env, idx == NSNotFound ? -1 : (double)idx)});
+  if (env.IsExceptionPending()) return;
+  WritePasteboardValue(item, type, v);
+}
+- (void)pasteboardFinishedWithDataProvider:(NSPasteboard*)pb {
+  (void)pb;
+  fn_.Reset();
+  items_ = nil;
+}
+@end
+
+// items: [{ [type]: string | bytes | null }, ...] — one entry per dragging
+// item, its keys the representations that item offers (react-x11's dragData
+// shape; a drag of three files is three entries of one public.file-url
+// each, which is how Finder reads them). A bare object is one item. null
+// promises the representation through `provide`; without a provider it is
+// dropped.
+static NSArray<NSPasteboardItem*>* BuildPasteboardItems(
+    Napi::Env env, Napi::Value spec, CALDragProvider* provider) {
+  NSMutableArray<NSPasteboardItem*>* items = [NSMutableArray array];
+  Napi::Array arr;
+  if (spec.IsArray()) {
+    arr = spec.As<Napi::Array>();
+  } else {
+    arr = Napi::Array::New(env, 1);
+    arr.Set(0u, spec);
+  }
+  for (uint32_t i = 0; i < arr.Length(); i++) {
+    Napi::Value v = arr.Get(i);
+    if (!v.IsObject()) continue;
+    Napi::Object o = v.As<Napi::Object>();
+    NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
+    NSMutableArray<NSString*>* lazy = [NSMutableArray array];
+    Napi::Array keys = o.GetPropertyNames();
+    for (uint32_t k = 0; k < keys.Length(); k++) {
+      Napi::Value key = keys.Get(k);
+      if (!key.IsString()) continue;
+      NSString* type = BToNSString(key);
+      Napi::Value val = o.Get(key);
+      if (val.IsNull() || val.IsUndefined()) {
+        if (provider) [lazy addObject:type];
+      } else {
+        WritePasteboardValue(item, type, val);
+      }
+    }
+    if (lazy.count) [item setDataProvider:provider forTypes:lazy];
+    [items addObject:item];
+  }
+  return items;
+}
+
+// The drag image, from either bitmap this addon deals in: `surface`, a
+// surface handle (the renderer's own paint, its scale known), or `image`, a
+// CGImage External — or the {image, width, height, scale} object
+// text.render / controls.render answer, taken whole.
+static NSImage* DragImageFrom(Napi::Object o, double* w, double* h) {
+  Napi::Value sv = o.Get("surface");
+  if (sv.IsExternal()) {
+    CALSurface* s = SurfaceFrom(sv);  // a released handle throws, as everywhere
+    if (!s) return nil;
+    double scale = s->scale > 0 ? s->scale : 1;
+    CGImageRef cg = CGBitmapContextCreateImage(s->ctx);
+    if (!cg) return nil;
+    *w = s->width / scale;
+    *h = s->height / scale;
+    NSImage* img = [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(*w, *h)];
+    CGImageRelease(cg);
+    return img;
+  }
+  Napi::Value iv = o.Get("image");
+  double scale = BNumOr(o, "imageScale", 1);
+  if (iv.IsObject() && !iv.IsExternal()) {
+    Napi::Object r = iv.As<Napi::Object>();
+    scale = BNumOr(r, "scale", scale);
+    iv = r.Get("image");
+  }
+  if (!iv.IsExternal()) return nil;
+  CGImageRef cg = (CGImageRef)iv.As<Napi::External<void>>().Data();
+  *w = CGImageGetWidth(cg) / scale;
+  *h = CGImageGetHeight(cg) / scale;
+  return [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(*w, *h)];
+}
+
+// The shared payload of the destination events: where (content view,
+// top-left; and global top-left as gx/gy, like a mouse event), what the
+// pasteboard carries, and what the source allows. `types` is the union over
+// the pasteboard's items; `itemCount` says how many items carry them —
+// a Finder drag of three files is three items of one public.file-url each,
+// read per item through dragItemString. `local` is a drag begun by one of
+// our own windows (beginDrag), whose number then follows.
+static void EmitDragInfo(Napi::Env env, CALBackendView* view,
+                         const char* type, id<NSDraggingInfo> info) {
+  if (!HasBackendCb()) return;
+  Napi::HandleScope scope(env);
+  NSWindow* win = view.window;
+  Napi::Object ev = WindowEvent(env, win, type);
+  if (info) {
+    NSPoint loc = info.draggingLocation;
+    NSPoint p = [view convertPoint:loc fromView:nil];  // the view is flipped
+    ev.Set("x", p.x);
+    ev.Set("y", p.y);
+    NSRect r = [win convertRectToScreen:NSMakeRect(loc.x, loc.y, 0, 0)];
+    ev.Set("gx", r.origin.x);
+    ev.Set("gy", PrimaryScreenTop() - r.origin.y);
+    NSPasteboard* pb = info.draggingPasteboard;
+    Napi::Array types = Napi::Array::New(env);
+    uint32_t n = 0;
+    for (NSString* t in pb.types) types.Set(n++, t.UTF8String);
+    ev.Set("types", types);
+    ev.Set("itemCount", (double)pb.pasteboardItems.count);
+    NSDragOperation mask = info.draggingSourceOperationMask;
+    ev.Set("sourceMask", (double)mask);
+    ev.Set("operations", DragOpsOfMask(env, mask));
+    id src = info.draggingSource;
+    bool local = [src isKindOfClass:[CALBackendView class]];
+    ev.Set("local", local);
+    if (local)
+      ev.Set("sourceWindowNumber",
+             (double)((CALBackendView*)src).window.windowNumber);
+    ev.Set("sequence", (double)info.draggingSequenceNumber);
+  }
+  EmitToJS(env, ev);
+}
+
+// The source side's events: the pointer in global top-left coordinates,
+// and for the end, the operation the destination performed ('none' when
+// nothing took the drop) with `dropped` as its boolean.
+static void EmitDragSession(Napi::Env env, CALBackendView* view,
+                            const char* type, NSPoint screenPoint,
+                            const char* operation) {
+  if (!HasBackendCb()) return;
+  Napi::HandleScope scope(env);
+  Napi::Object ev = WindowEvent(env, view.window, type);
+  ev.Set("x", screenPoint.x);
+  ev.Set("y", PrimaryScreenTop() - screenPoint.y);
+  if (operation) {
+    ev.Set("operation", operation);
+    ev.Set("dropped", strcmp(operation, "none") != 0);
+  }
+  EmitToJS(env, ev);
+}
+
+@interface CALBackendView (DragAndDrop) <NSDraggingSource>
+@end
+@implementation CALBackendView (DragAndDrop)
+
+// --- destination ----------------------------------------------------------
+
+- (NSDragOperation)dropAnswer:(id<NSDraggingInfo>)info {
+  if (!dropAccept_) return NSDragOperationNone;
+  if (dropOp_) return DragOpFromName(dropOp_.UTF8String);
+  return DragDefaultOp(info.draggingSourceOperationMask);
+}
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+  gDragPasteboard = sender.draggingPasteboard;
+  // a yes left over from the previous drag must not answer this one
+  dropAccept_ = false;
+  dropOp_ = nil;
+  EmitDragInfo(Napi::Env(env_), self, "drag-enter", sender);
+  return [self dropAnswer:sender];
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+  gDragPasteboard = sender.draggingPasteboard;
+  EmitDragInfo(Napi::Env(env_), self, "drag-over", sender);
+  return [self dropAnswer:sender];
+}
+- (void)draggingExited:(nullable id<NSDraggingInfo>)sender {
+  EmitDragInfo(Napi::Env(env_), self, "drag-exit", sender);
+}
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
+  (void)sender;
+  return dropAccept_;
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+  gDragPasteboard = sender.draggingPasteboard;
+  EmitDragInfo(Napi::Env(env_), self, "drag-perform", sender);
+  return dropAccept_;  // JS may withdraw it, having looked at the payload
+}
+// One drag-over per pointer position, not a timer's worth.
+- (BOOL)wantsPeriodicDraggingUpdates { return NO; }
+
+// --- source ---------------------------------------------------------------
+
+- (NSDragOperation)draggingSession:(NSDraggingSession*)session
+    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+  (void)session;
+  return context == NSDraggingContextOutsideApplication ? sourceMaskOutside_
+                                                        : sourceMask_;
+}
+- (BOOL)ignoreModifierKeysForDraggingSession:(NSDraggingSession*)session {
+  (void)session;
+  return ignoreModifiers_;
+}
+- (void)draggingSession:(NSDraggingSession*)session
+       willBeginAtPoint:(NSPoint)screenPoint {
+  (void)session;
+  EmitDragSession(Napi::Env(env_), self, "drag-session-began", screenPoint,
+                  nullptr);
+}
+- (void)draggingSession:(NSDraggingSession*)session
+           movedToPoint:(NSPoint)screenPoint {
+  (void)session;
+  EmitDragSession(Napi::Env(env_), self, "drag-session-moved", screenPoint,
+                  nullptr);
+}
+- (void)draggingSession:(NSDraggingSession*)session
+           endedAtPoint:(NSPoint)screenPoint
+              operation:(NSDragOperation)operation {
+  (void)session;
+  EmitDragSession(Napi::Env(env_), self, "drag-session-ended", screenPoint,
+                  DragOpName(operation));
+}
+@end
+
+// registerDropTypes(win, types) — registerForDraggedTypes: on the hosting
+// view; an empty list unregisters. Until this is called a window takes no
+// drops and sees no drag events: AppKit routes a drag only to views
+// registered for a type it carries.
+static Napi::Value RegisterDropTypes(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALBackendView* view = BackendViewArg(info[0], "registerDropTypes");
+  if (!view) return env.Undefined();
+  view->env_ = env;
+  NSMutableArray<NSString*>* types = [NSMutableArray array];
+  if (info[1].IsArray()) {
+    Napi::Array a = info[1].As<Napi::Array>();
+    for (uint32_t i = 0; i < a.Length(); i++)
+      if (a.Get(i).IsString()) [types addObject:BToNSString(a.Get(i))];
+  }
+  [view unregisterDraggedTypes];  // replace, never accumulate
+  if (types.count) [view registerForDraggedTypes:types];
+  return env.Undefined();
+}
+
+// setDropResponse(win, { accept, operation? }) — the view's answer for the
+// drag in flight. Set during a drag-enter or drag-over callback it answers
+// that question; it stays in force for the drag-over events that follow
+// until changed, and resets to a refusal when a new drag enters. Set during
+// drag-perform, `accept: false` withdraws the drop. `operation` is one of
+// copy | move | link | generic | private | delete; absent, the conventional
+// choice among what the source allows.
+static Napi::Value SetDropResponse(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALBackendView* view = BackendViewArg(info[0], "setDropResponse");
+  if (!view) return env.Undefined();
+  Napi::Object o = info[1].IsObject() ? info[1].As<Napi::Object>()
+                                      : Napi::Object::New(env);
+  view->dropAccept_ = BBoolOr(o, "accept", false);
+  NSString* op = BStrOr(o, "operation", nil);
+  view->dropOp_ = op.length ? op : nil;
+  return env.Undefined();
+}
+
+static NSPasteboard* CurrentDragPasteboard() {
+  return gDragPasteboard
+             ?: [NSPasteboard pasteboardWithName:NSPasteboardNameDrag];
+}
+
+// dragItems() -> [{ types: [...] }] — the items of the drag over (or just
+// dropped on) one of our windows, each with the representations it offers.
+// dragItemData(index, type) -> Buffer | null and dragItemString(index,
+// type) -> string | null read one. Read during the drag-perform callback:
+// the payload is the source's promise, and a source is free to withdraw it
+// once its session has ended.
+static Napi::Value DragItems(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Array out = Napi::Array::New(env);
+  uint32_t n = 0;
+  for (NSPasteboardItem* item in CurrentDragPasteboard().pasteboardItems) {
+    Napi::Object o = Napi::Object::New(env);
+    Napi::Array types = Napi::Array::New(env);
+    uint32_t k = 0;
+    for (NSString* t in item.types) types.Set(k++, t.UTF8String);
+    o.Set("types", types);
+    out.Set(n++, o);
+  }
+  return out;
+}
+
+static NSPasteboardItem* DragItemArg(Napi::Value v) {
+  NSArray<NSPasteboardItem*>* items = CurrentDragPasteboard().pasteboardItems;
+  if (!v.IsNumber()) return nil;
+  double i = v.As<Napi::Number>().DoubleValue();
+  if (!(i >= 0 && i < (double)items.count)) return nil;
+  return items[(NSUInteger)i];
+}
+
+static Napi::Value DragItemData(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSPasteboardItem* item = DragItemArg(info[0]);
+  if (!item || !info[1].IsString()) return env.Null();
+  NSData* d = [item dataForType:BToNSString(info[1])];
+  if (!d) return env.Null();
+  return Napi::Buffer<uint8_t>::Copy(env, (const uint8_t*)d.bytes, d.length);
+}
+
+static Napi::Value DragItemString(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSPasteboardItem* item = DragItemArg(info[0]);
+  if (!item || !info[1].IsString()) return env.Null();
+  NSString* s = [item stringForType:BToNSString(info[1])];
+  if (!s) return env.Null();
+  return Napi::String::New(env, s.UTF8String);
+}
+
+// beginDrag(win, { x, y, items, provide?, operations?, operationsOutside?,
+//                  ignoreModifiers?, slideBack?,
+//                  surface | image, imageScale?, imageX?, imageY?,
+//                  imageWidth?, imageHeight? }) -> bool
+// Begin a dragging session from the press in flight. x/y is the press in
+// the window's content coordinates; the session is begun from the real
+// mouse-down (or drag) event when the pointer is still down in this window,
+// which is what a renderer's threshold logic calls from, and from an event
+// synthesised at x/y otherwise. `operations` is what the source allows
+// (['copy'] default), `operationsOutside` the same for other applications
+// when it differs; `ignoreModifiers` stops AppKit turning Option/Command
+// into copy/link; `slideBack` (default true) animates a refused drop home.
+// The image sits at imageX/imageY (content coordinates, top-left), centred
+// on the press by default, at its own size unless imageWidth/imageHeight
+// say otherwise; with no image the drag shows nothing. Returns whether a
+// session began. The session runs on AppKit's own tracking from here; JS
+// hears drag-session-began / -moved / -ended, and the pointer's own
+// mousemove/mouseup do not arrive while it runs — the ended event is the
+// release.
+static Napi::Value BeginDrag(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALBackendView* view = BackendViewArg(info[0], "beginDrag");
+  if (!view) return env.Undefined();
+  if (!info[1].IsObject()) {
+    Napi::TypeError::New(env, "beginDrag: expected an options object")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object o = info[1].As<Napi::Object>();
+  view->env_ = env;
+
+  NSEvent* press = view->lastPress_;
+  if (press && press.window != view.window) press = nil;
+  double x = BNumOr(o, "x", NAN), y = BNumOr(o, "y", NAN);
+  if (std::isnan(x) || std::isnan(y)) {
+    if (!press) {
+      Napi::TypeError::New(env, "beginDrag: x and y are required without a press in flight")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    NSPoint p = [view convertPoint:press.locationInWindow fromView:nil];
+    x = p.x;
+    y = p.y;
+  }
+  if (!press) {
+    NSPoint wp = [view convertPoint:NSMakePoint(x, y) toView:nil];
+    press = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                               location:wp
+                          modifierFlags:0
+                              timestamp:NSProcessInfo.processInfo.systemUptime
+                           windowNumber:view.window.windowNumber
+                                context:nil
+                            eventNumber:0
+                             clickCount:1
+                               pressure:1];
+  }
+
+  CALDragProvider* provider = nil;
+  Napi::Value provide = o.Get("provide");
+  if (provide.IsFunction()) {
+    provider = [[CALDragProvider alloc] init];
+    provider->env_ = env;
+    provider->fn_ = Napi::Persistent(provide.As<Napi::Function>());
+  }
+  NSArray<NSPasteboardItem*>* pbItems =
+      BuildPasteboardItems(env, o.Get("items"), provider);
+  if (provider) provider->items_ = pbItems;
+  if (pbItems.count == 0) {
+    Napi::TypeError::New(env, "beginDrag: items must name at least one item")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  double w = 0, h = 0;
+  NSImage* img = DragImageFrom(o, &w, &h);
+  if (env.IsExceptionPending()) return env.Undefined();
+  if (o.Has("imageWidth")) w = BNumOr(o, "imageWidth", w);
+  if (o.Has("imageHeight")) h = BNumOr(o, "imageHeight", h);
+  double ix = BNumOr(o, "imageX", x - w / 2), iy = BNumOr(o, "imageY", y - h / 2);
+  if (!img) {
+    img = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
+    w = h = 1;
+    ix = x;
+    iy = y;
+  }
+  // the view is flipped, so a top-left frame is what setDraggingFrame: takes
+  NSRect frame = NSMakeRect(ix, iy, w, h);
+  NSMutableArray<NSDraggingItem*>* dragItems = [NSMutableArray array];
+  for (NSPasteboardItem* item in pbItems) {
+    NSDraggingItem* di = [[NSDraggingItem alloc] initWithPasteboardWriter:item];
+    [di setDraggingFrame:frame contents:img];
+    [dragItems addObject:di];
+  }
+
+  view->sourceMask_ = DragMaskFrom(o.Get("operations"));
+  view->sourceMaskOutside_ = o.Has("operationsOutside")
+                                 ? DragMaskFrom(o.Get("operationsOutside"))
+                                 : view->sourceMask_;
+  view->ignoreModifiers_ = BBoolOr(o, "ignoreModifiers", false);
+  view->dragProvider_ = provider;  // alive for as long as the pasteboard may ask
+
+  NSDraggingSession* session = [view beginDraggingSessionWithItems:dragItems
+                                                             event:press
+                                                            source:view];
+  if (!session) return Napi::Boolean::New(env, false);
+  session.animatesToStartingPositionsOnCancelOrFail =
+      BBoolOr(o, "slideBack", true);
+  return Napi::Boolean::New(env, true);
+}
+
+// A dragging info of our own, for postDragEvent: what AppKit would build
+// for a drag from another application, over a private pasteboard.
+@interface CALPostedDragInfo : NSObject <NSDraggingInfo> {
+ @public
+  NSWindow* window_;
+  NSPasteboard* pasteboard_;
+  NSPoint location_;
+  NSDragOperation mask_;
+  id source_;
+  NSInteger sequence_;
+  NSDraggingFormation formation_;
+  BOOL animates_;
+  NSInteger valid_;
+}
+@end
+@implementation CALPostedDragInfo
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-implementations"
+- (NSWindow*)draggingDestinationWindow { return window_; }
+- (NSDragOperation)draggingSourceOperationMask { return mask_; }
+- (NSPoint)draggingLocation { return location_; }
+- (NSPoint)draggedImageLocation { return location_; }
+- (NSImage*)draggedImage { return nil; }
+- (NSPasteboard*)draggingPasteboard { return pasteboard_; }
+- (id)draggingSource { return source_; }
+- (NSInteger)draggingSequenceNumber { return sequence_; }
+- (void)slideDraggedImageTo:(NSPoint)screenPoint { (void)screenPoint; }
+- (NSArray<NSString*>*)namesOfPromisedFilesDroppedAtDestination:(NSURL*)url {
+  (void)url;
+  return nil;
+}
+#pragma clang diagnostic pop
+- (NSDraggingFormation)draggingFormation { return formation_; }
+- (void)setDraggingFormation:(NSDraggingFormation)f { formation_ = f; }
+- (BOOL)animatesToDestination { return animates_; }
+- (void)setAnimatesToDestination:(BOOL)a { animates_ = a; }
+- (NSInteger)numberOfValidItemsForDrop { return valid_; }
+- (void)setNumberOfValidItemsForDrop:(NSInteger)n { valid_ = n; }
+- (void)enumerateDraggingItemsWithOptions:(NSDraggingItemEnumerationOptions)opts
+                                  forView:(NSView*)view
+                                  classes:(NSArray<Class>*)classes
+                            searchOptions:(NSDictionary<NSPasteboardReadingOptionKey, id>*)options
+                               usingBlock:(void (^)(NSDraggingItem*, NSInteger, BOOL*))block {
+  (void)opts;
+  (void)view;
+  (void)classes;
+  (void)options;
+  (void)block;
+}
+- (NSSpringLoadingHighlight)springLoadingHighlight {
+  return NSSpringLoadingHighlightNone;
+}
+- (void)resetSpringLoading {}
+@end
+
+// postDragEvent(win, phase, { x, y, items, operations?, local? })
+// Drive the view's NSDraggingDestination methods with a dragging info of
+// our own, the way AppKit does for a drag from another application — the
+// drag-and-drop counterpart of postMouseEvent, for tests. phase 'enter' and
+// 'over' answer the operation the view returned ('none' when it refused);
+// 'exit' answers nothing; 'drop' runs prepare + perform + conclude as
+// AppKit sequences them and answers whether the drop was taken. x/y are
+// content coordinates, `items` has beginDrag's shape (read on enter, and
+// again on any later phase that names it), `operations` is the pretend
+// source's mask (copy default), and `local: true` names this window's own
+// view as the source.
+static Napi::Value PostDragEvent(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALBackendView* view = BackendViewArg(info[0], "postDragEvent");
+  if (!view) return env.Undefined();
+  view->env_ = env;
+  std::string phase = info[1].IsString() ? info[1].As<Napi::String>().Utf8Value() : "";
+  Napi::Object o = info.Length() > 2 && info[2].IsObject()
+                       ? info[2].As<Napi::Object>()
+                       : Napi::Object::New(env);
+
+  // one pasteboard per drag: a new one on enter, its contents whatever
+  // `items` the latest phase named (a drag's payload is fixed in AppKit,
+  // but a test may want to say it once, at the drop)
+  static NSInteger sequence = 0;
+  if (phase == "enter" || !gPostedPasteboard) {
+    if (gPostedPasteboard) [gPostedPasteboard releaseGlobally];
+    gPostedPasteboard = [NSPasteboard pasteboardWithUniqueName];
+    sequence++;
+  }
+  if (phase == "enter" || o.Has("items")) {
+    [gPostedPasteboard clearContents];
+    [gPostedPasteboard writeObjects:BuildPasteboardItems(env, o.Get("items"), nil)];
+  }
+  CALPostedDragInfo* di = [[CALPostedDragInfo alloc] init];
+  di->window_ = view.window;
+  di->pasteboard_ = gPostedPasteboard;
+  di->location_ = [view convertPoint:NSMakePoint(BNumOr(o, "x", 0), BNumOr(o, "y", 0)) toView:nil];
+  di->mask_ = DragMaskFrom(o.Get("operations"));
+  di->source_ = BBoolOr(o, "local", false) ? view : nil;
+  di->sequence_ = sequence;
+  di->formation_ = NSDraggingFormationDefault;
+  di->valid_ = (NSInteger)gPostedPasteboard.pasteboardItems.count;
+
+  if (phase == "enter")
+    return Napi::String::New(env, DragOpName([view draggingEntered:di]));
+  if (phase == "over")
+    return Napi::String::New(env, DragOpName([view draggingUpdated:di]));
+  if (phase == "exit") {
+    [view draggingExited:di];
+    return env.Undefined();
+  }
+  if (phase == "drop") {
+    bool taken = [view prepareForDragOperation:di] && [view performDragOperation:di];
+    if (taken && [view respondsToSelector:@selector(concludeDragOperation:)])
+      [view concludeDragOperation:di];
+    return Napi::Boolean::New(env, taken);
+  }
+  Napi::TypeError::New(env, "postDragEvent: phase must be enter | over | exit | drop")
+      .ThrowAsJavaScriptException();
+  return env.Undefined();
+}
+
+// pasteboardTypeForMIME(mime) -> UTI — the OS's own MIME <-> UTI table
+// (UniformTypeIdentifiers), so a renderer's transfer vocabulary maps
+// through the table Finder and Mail read rather than a copy kept in JS. A
+// MIME type no declared type claims gets a dynamic identifier (dyn.a…),
+// which is still a working pasteboard type: it encodes the MIME type, so
+// any process asking the same question gets the same string.
+// pasteboardTypeInfo(uti) -> { identifier, mime, extension, description,
+// dynamic, declared } | null reads the table the other way.
+static Napi::Value PasteboardTypeForMIME(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsString()) return env.Null();
+  UTType* t = [UTType typeWithMIMEType:BToNSString(info[0])];
+  if (!t) return env.Null();
+  return Napi::String::New(env, t.identifier.UTF8String);
+}
+
+static Napi::Value PasteboardTypeInfo(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsString()) return env.Null();
+  UTType* t = [UTType typeWithIdentifier:BToNSString(info[0])];
+  if (!t) return env.Null();
+  Napi::Object r = Napi::Object::New(env);
+  r.Set("identifier", t.identifier.UTF8String);
+  r.Set("mime", t.preferredMIMEType
+                    ? Napi::Value(Napi::String::New(env, t.preferredMIMEType.UTF8String))
+                    : Napi::Value(env.Null()));
+  r.Set("extension",
+        t.preferredFilenameExtension
+            ? Napi::Value(Napi::String::New(env, t.preferredFilenameExtension.UTF8String))
+            : Napi::Value(env.Null()));
+  r.Set("description",
+        t.localizedDescription
+            ? Napi::Value(Napi::String::New(env, t.localizedDescription.UTF8String))
+            : Napi::Value(env.Null()));
+  r.Set("dynamic", (bool)t.isDynamic);
+  r.Set("declared", (bool)t.isDeclared);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
 // registration (called from addon.mm's Init)
 // ---------------------------------------------------------------------------
 
@@ -3285,5 +4023,14 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("listScreens", ListScreens);
   BFN("setCursor", SetCursorFn);
   BFN("postKeyEvent", PostKeyEvent);
+  BFN("registerDropTypes", RegisterDropTypes);
+  BFN("setDropResponse", SetDropResponse);
+  BFN("dragItems", DragItems);
+  BFN("dragItemData", DragItemData);
+  BFN("dragItemString", DragItemString);
+  BFN("beginDrag", BeginDrag);
+  BFN("postDragEvent", PostDragEvent);
+  BFN("pasteboardTypeForMIME", PasteboardTypeForMIME);
+  BFN("pasteboardTypeInfo", PasteboardTypeInfo);
 #undef BFN
 }

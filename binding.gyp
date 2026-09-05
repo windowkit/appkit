@@ -20,6 +20,7 @@
           "-framework CoreGraphics",
           "-framework ImageIO",
           "-framework IOSurface",
+          "-framework UniformTypeIdentifiers",
           "-framework AVFoundation",
           "-framework CoreLocation",
           "-framework IOKit",

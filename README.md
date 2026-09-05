@@ -161,6 +161,90 @@ vibrancy materials need private API to reproduce; expose real `NSMenu` instead.
 `native.postMouseEvent(win, 'down'|'up'|'move'|'drag', x, y)` synthesizes events through
 the real pump — used by the demo's self-test (`CAL_CLICKS="x,y;x,y" npm run demo`).
 
+## App lifecycle: open-URL, open-file, reopen, quit
+
+The OS talks to the application as a whole through Apple Events: a URL for a scheme
+the bundle registers (`kInternetEventClass/kAEGetURL`), a document handed over by the
+Finder (`kCoreEventClass/kAEOpenDocuments`), a second launch of a running app
+(`kAEReopenApplication`), and Quit from the Dock, the app menu or a logout
+(`kAEQuitApplication`). `native.initApp()` installs an `NSApplicationDelegate` that
+forwards them to the backend event callback and decides nothing itself:
+
+| event              | payload                 | from                                                                                                                                                                                  |
+| ------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-open-urls`    | `{ urls: [string] }`    | `application:openURLs:` — scheme URLs as sent, documents as `file://` URLs                                                                                                            |
+| `app-reopen`       | `{ hasVisibleWindows }` | `applicationShouldHandleReopen:`, answered NO — what a second launch means is the renderer's call                                                                                     |
+| `app-quit-request` | `{}`                    | `applicationShouldTerminate:`, answered Cancel while a callback is installed — the renderer quits (`process.exit`) or vetoes. With no callback the OS default stands and the process ends |
+
+```js
+native.initApp();                 // first: the delegate has to precede finishLaunching
+native.setBackendEventCallback((ev) => {
+  if (ev.type === 'app-open-urls') route(ev.urls);
+  if (ev.type === 'app-reopen' && !ev.hasVisibleWindows) showMainWindow();
+  if (ev.type === 'app-quit-request') process.exit(0);
+});
+setInterval(() => native.pump2(), 16);
+```
+
+Launch Services delivers the launching Apple Event inside `finishLaunching` — that is,
+inside `initApp()`, before any callback exists. Whatever arrives with nobody listening
+is held and replayed, in order, on the first `pump2()` that has a callback, ahead of
+that tick's input. Registering the scheme itself is an install step, not runtime code:
+`CFBundleURLTypes` (and `CFBundleDocumentTypes` for files) in the bundle's
+`Info.plist`.
+
+`native.postAppleEvent('open-url', url)`, `('open-documents', [paths])`, `('reopen')`
+and `('quit')` build the corresponding Apple Event and dispatch it through
+`NSAppleEventManager` as if it had just arrived — how `npm test` exercises the
+delegate without a bundle.
+
+## File panels
+
+Open and save dialogs are real `NSOpenPanel` / `NSSavePanel`s owned by this process's
+`NSApplication` — not a separate `osascript` — so they can run as a sheet on the window
+that asked, every filter the OS type database knows gets through, and a cancel is a
+cancel rather than a failed subprocess.
+
+```js
+const { native } = require('@windowkit/appkit');
+
+// With a window handle the panel is a sheet on it: the pump keeps running and the
+// callback fires on a later tick. Without one it is app-modal: the call blocks in
+// AppKit's modal loop until the panel is dismissed, and the callback runs before
+// the call returns.
+native.openPanel({
+  window: win._h,               // omit for app-modal
+  directory: false,             // true: choose folders instead of files
+  multiple: true,
+  message: 'Pick some images',
+  prompt: 'Import',             // the confirm button's label
+  directoryURL: process.env.HOME,
+  allowedContentTypes: ['public.png', native.contentTypeFor({ mime: 'image/jpeg' })],
+}, (paths) => { /* ['/Users/…/a.png', …], or null on cancel */ });
+
+native.savePanel({
+  window: win._h,
+  nameFieldStringValue: 'Untitled.txt',
+  allowedContentTypes: [native.contentTypeFor({ extension: 'txt' })],
+}, (path) => { /* '/Users/…/Untitled.txt', or null on cancel */ });
+```
+
+Both take `title`, `message`, `prompt`, `directoryURL` (a path or `file:` URL),
+`allowedContentTypes` and `canCreateDirectories`; the open panel adds `directory` and
+`multiple`, the save panel `nameFieldStringValue`. Both return a panel handle:
+`native.cancelPanel(handle)` dismisses a sheet that is still up (its callback then gets
+`null`) and reports whether there was one, and `destroyWindow2` answers any sheet still
+attached to the window the same way, so no callback is left waiting.
+
+Filters are UTType identifiers, the shape `NSSavePanel.allowedContentTypes` wants;
+mapping extensions and MIME types onto them is the renderer's policy, and
+`native.contentTypeFor({ extension })` / `({ mime })` does the lookup in the OS's own
+database (`'png'` → `'public.png'`, `'application/json'` → `'public.json'`; an
+extension nobody has declared still gets a dynamic type that matches exactly that
+extension). An absent or empty list means any file, and so does a list the OS
+recognises nothing of.
+
+
 ## Drag and drop
 
 The backend surface's windows (`native.createWindow2`) take drops and begin
@@ -250,6 +334,7 @@ native.beginDrag(win, {
   `'drop'` runs prepare + perform + conclude and answers whether the drop was
   taken. The CI smoke test and a renderer's headless tests drive drops this
   way.
+
 
 ## Privacy authorizations (TCC)
 
@@ -346,6 +431,7 @@ index path, `clickStatusItem(item, kind)` posts a real press-and-release into
 the item's window (pump afterwards; declined for left/right while a menu is
 set, since that click would open it), and `snapshotStatusItem(item, file)`
 writes the composited item to a PNG.
+
 
 ## Mapping to a React reconciler
 

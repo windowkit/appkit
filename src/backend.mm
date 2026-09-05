@@ -704,6 +704,8 @@ static Napi::Value PostAppleEvent(const Napi::CallbackInfo& info) {
 // pump2: the enriched event stream
 // ---------------------------------------------------------------------------
 
+static bool StatusWindowEvent(NSEvent* e);
+
 static void DispatchEvent2(Napi::Env env, NSEvent* e) {
   if (!HasBackendCb()) return;
   const char* type = nullptr;
@@ -727,7 +729,7 @@ static void DispatchEvent2(Napi::Env env, NSEvent* e) {
     case NSEventTypeFlagsChanged: type = "flagschanged"; key = true; break;
     default: return;
   }
-  if ((mouse || crossing) && !e.window) return;
+  if ((mouse || crossing) && (!e.window || StatusWindowEvent(e))) return;
   // The press a drag session is begun from (beginDrag): the latest
   // left-button down or drag in the window, recorded before JS sees it so a
   // beginDrag from inside this very callback has it.
@@ -1168,6 +1170,11 @@ static NSString* BStrOr(Napi::Object o, const char* k, NSString* d);
 
 static CALMenuTarget* gMenuTarget = nil;
 
+static void EnsureMenuTarget(Napi::Env env) {
+  if (!gMenuTarget) gMenuTarget = [CALMenuTarget new];
+  gMenuTarget->env_ = env;
+}
+
 static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items);
 
 static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o) {
@@ -1243,8 +1250,7 @@ static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items) {
 static Napi::Value SetMainMenuFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
-  if (!gMenuTarget) gMenuTarget = [CALMenuTarget new];
-  gMenuTarget->env_ = env;
+  EnsureMenuTarget(env);
   Napi::Array spec = info[0].As<Napi::Array>();
   NSMenu* main = [[NSMenu alloc] initWithTitle:@"MainMenu"];
   main.autoenablesItems = NO;
@@ -1299,25 +1305,444 @@ static Napi::Value MainMenuInfoFn(const Napi::CallbackInfo& info) {
   return MenuInfo(env, main);
 }
 
+// Walk a menu tree by index and fire the leaf's action the way tracking
+// would (shared by the main menu and status item test hooks).
+static bool ActivateInMenu(NSMenu* menu, Napi::Array path) {
+  if (!menu || path.Length() == 0) return false;
+  for (uint32_t d = 0; d + 1 < path.Length(); d++) {
+    NSInteger i = (NSInteger)path.Get(d).As<Napi::Number>().Int64Value();
+    if (i < 0 || i >= menu.numberOfItems) return false;
+    menu = [menu itemAtIndex:i].submenu;
+    if (!menu) return false;
+  }
+  NSInteger leaf = (NSInteger)
+      path.Get(path.Length() - 1).As<Napi::Number>().Int64Value();
+  if (leaf < 0 || leaf >= menu.numberOfItems) return false;
+  [menu performActionForItemAtIndex:leaf];
+  return true;
+}
+
 // activateMenuItem([i, j, ...]) — walk the installed bar by index and fire
 // the leaf's action, the way tracking would. For tests.
 static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  Napi::Array path = info[0].As<Napi::Array>();
-  NSMenu* menu = [NSApp mainMenu];
-  if (!menu) return Napi::Boolean::New(env, false);
-  for (uint32_t d = 0; d + 1 < path.Length(); d++) {
-    NSInteger i = (NSInteger)path.Get(d).As<Napi::Number>().Int64Value();
-    if (i < 0 || i >= menu.numberOfItems) return Napi::Boolean::New(env, false);
-    menu = [menu itemAtIndex:i].submenu;
-    if (!menu) return Napi::Boolean::New(env, false);
+  if (!info[0].IsArray()) return Napi::Boolean::New(env, false);
+  return Napi::Boolean::New(
+      env, ActivateInMenu([NSApp mainMenu], info[0].As<Napi::Array>()));
+}
+
+// ---------------------------------------------------------------------------
+// status items — NSStatusItem, the menu-bar extra (the "tray"). The cocoa
+// counterpart of the freedesktop StatusNotifierItem: an icon or a title in
+// the system status bar, a tooltip, and either a menu or clicks. The menu
+// is the same item spec setMainMenu takes, so the tray, the menu bar and a
+// Linux panel share one authoring model; activations arrive as the same
+// `menu-activate` events. Without a menu a click is the renderer's to
+// answer: it arrives as `status-item-click` with the button's screen rect,
+// which is the anchor a custom popup wants.
+//
+// Lifetime is explicit. The handle retains the NSStatusItem, and the item's
+// target keeps the handle alive until removeStatusItem, so an item stays in
+// the bar exactly as long as JS says — AppKit would otherwise drop it the
+// moment the last reference went.
+// ---------------------------------------------------------------------------
+
+@interface CALStatusItemTarget : NSObject {
+ @public
+  napi_env env_;
+  // the JS handle: events carry this very object, so `ev.statusItem ===
+  // item` holds and a renderer can key a Map on it
+  Napi::Reference<Napi::Value> handle_;
+  NSStatusItem* __weak item_;
+}
+- (void)click:(id)sender;
+@end
+
+static char kStatusTargetKey;
+static NSMapTable<NSNumber*, NSStatusItem*>* gStatusWindows = nil;  // number -> item (weak)
+
+static CALStatusItemTarget* StatusTargetOf(NSStatusItem* item) {
+  return objc_getAssociatedObject(item, &kStatusTargetKey);
+}
+
+// The status bar hosts each item in a window of its own. Its raw mouse
+// events are noise to a renderer (a foreign windowNumber with no tree
+// behind it); remember the windows so the pump can skip them — and so it
+// can answer the one click AppKit's button ignores (below).
+static void RememberStatusWindow(NSWindow* win, NSStatusItem* item) {
+  if (!win) return;
+  if (!gStatusWindows) gStatusWindows = [NSMapTable strongToWeakObjectsMapTable];
+  [gStatusWindows setObject:item forKey:@(win.windowNumber)];
+}
+
+// The button's rect in global top-left coordinates, points.
+static void SetStatusButtonFrame(Napi::Object ev, NSStatusBarButton* btn) {
+  if (!btn.window) return;
+  NSRect r = [btn.window convertRectToScreen:[btn convertRect:btn.bounds
+                                                        toView:nil]];
+  ev.Set("x", r.origin.x);
+  ev.Set("y", PrimaryScreenTop() - (r.origin.y + r.size.height));
+  ev.Set("width", r.size.width);
+  ev.Set("height", r.size.height);
+}
+
+static void EmitStatusItemClick(CALStatusItemTarget* t, const char* kind,
+                                NSEvent* e) {
+  NSStatusItem* item = t->item_;
+  if (!item || !HasBackendCb()) return;
+  Napi::Env env(t->env_);
+  Napi::HandleScope scope(env);
+  Napi::Object ev = Napi::Object::New(env);
+  ev.Set("type", "status-item-click");
+  ev.Set("statusItem", t->handle_.Value());
+  ev.Set("kind", kind);
+  NSEventModifierFlags f = e ? e.modifierFlags : NSEvent.modifierFlags;
+  ev.Set("shift", (bool)(f & NSEventModifierFlagShift));
+  ev.Set("control", (bool)(f & NSEventModifierFlagControl));
+  ev.Set("option", (bool)(f & NSEventModifierFlagOption));
+  ev.Set("command", (bool)(f & NSEventModifierFlagCommand));
+  ev.Set("clickCount", (double)(e ? e.clickCount : 1));
+  SetStatusButtonFrame(ev, item.button);
+  EmitToJS(env, ev);
+}
+
+// Called by the pump for every mouse event that has a window: true when
+// the window is a status item's (the event is then not for JS). NSButton
+// tracks the left button, NSStatusBarButton adds the right; neither looks
+// at the middle one, so a middle mouse-up over the button is answered
+// here — with or without a menu, since AppKit opens the menu for neither.
+static bool StatusWindowEvent(NSEvent* e) {
+  if (!gStatusWindows) return false;
+  NSStatusItem* item = [gStatusWindows objectForKey:@(e.window.windowNumber)];
+  if (!item) return false;
+  if (e.type == NSEventTypeOtherMouseUp && e.buttonNumber == 2) {
+    NSStatusBarButton* btn = item.button;
+    NSRect r = [btn convertRect:btn.bounds toView:nil];
+    CALStatusItemTarget* t = StatusTargetOf(item);
+    if (t && NSPointInRect(e.locationInWindow, r))
+      EmitStatusItemClick(t, "middle", e);
   }
-  NSInteger leaf = (NSInteger)
-      path.Get(path.Length() - 1).As<Napi::Number>().Int64Value();
-  if (leaf < 0 || leaf >= menu.numberOfItems)
-    return Napi::Boolean::New(env, false);
-  [menu performActionForItemAtIndex:leaf];
+  return true;
+}
+
+@implementation CALStatusItemTarget
+- (void)click:(id)sender {
+  (void)sender;
+  // the button sends on left and right mouse-up; the event says which
+  NSEvent* e = NSApp.currentEvent;
+  bool right = e && (e.type == NSEventTypeRightMouseUp ||
+                     e.type == NSEventTypeRightMouseDown);
+  EmitStatusItemClick(self, right ? "right" : "left", e);
+}
+@end
+
+static CGFloat StatusLengthFrom(Napi::Value v, CGFloat d) {
+  if (v.IsNumber()) return v.As<Napi::Number>().DoubleValue();
+  if (v.IsString()) {
+    std::string s = v.As<Napi::String>().Utf8Value();
+    if (s == "square") return NSSquareStatusItemLength;
+    if (s == "variable") return NSVariableStatusItemLength;
+  }
+  return d;
+}
+
+// `image`: an SF Symbol name (a template by nature — it follows the bar's
+// light/dark), a surface handle (its bitmap, at its scale), or encoded
+// image bytes (PNG and friends). Template by default so a bitmap icon
+// adapts the way a symbol does; `imageTemplate: false` keeps its colours.
+// `imageSize: [w, h]` sets the size in points.
+static NSImage* StatusImageFrom(Napi::Object o) {
+  Napi::Value v = o.Get("image");
+  NSImage* img = nil;
+  if (v.IsString()) {
+    img = [NSImage imageWithSystemSymbolName:BToNSString(v)
+                    accessibilityDescription:nil];
+  } else if (v.IsBuffer()) {
+    Napi::Buffer<uint8_t> buf = v.As<Napi::Buffer<uint8_t>>();
+    img = [[NSImage alloc]
+        initWithData:[NSData dataWithBytes:buf.Data() length:buf.Length()]];
+  } else if (v.IsExternal()) {
+    CALSurface* s = SurfaceFrom(v);
+    if (!s) return nil;  // released: the error is pending
+    CGImageRef cg = CGBitmapContextCreateImage(s->ctx);
+    img = [[NSImage alloc]
+        initWithCGImage:cg
+                   size:NSMakeSize(s->width / s->scale, s->height / s->scale)];
+    CGImageRelease(cg);
+  } else {
+    return nil;
+  }
+  if (!img) return nil;
+  if (o.Has("imageSize") && o.Get("imageSize").IsArray()) {
+    Napi::Array sz = o.Get("imageSize").As<Napi::Array>();
+    if (sz.Length() >= 2)
+      img.size = NSMakeSize(sz.Get(0u).As<Napi::Number>().DoubleValue(),
+                            sz.Get(1u).As<Napi::Number>().DoubleValue());
+  }
+  [img setTemplate:BBoolOr(o, "imageTemplate", true)];
+  return img;
+}
+
+// Only the keys present are touched: createStatusItem and setStatusItem
+// share this, so a patch is a create with fewer keys.
+static void ApplyStatusItemProps(NSStatusItem* item, Napi::Object o) {
+  NSStatusBarButton* btn = item.button;
+  if (o.Has("image")) btn.image = StatusImageFrom(o);
+  if (o.Has("title")) btn.title = BStrOr(o, "title", @"");
+  if (o.Has("tooltip")) {
+    NSString* tip = BStrOr(o, "tooltip", @"");
+    btn.toolTip = tip.length ? tip : nil;
+  }
+  if (o.Has("length")) item.length = StatusLengthFrom(o.Get("length"), item.length);
+  if (o.Has("visible")) item.visible = BBoolOr(o, "visible", true);
+  // image alone, title alone, or the image leading the title
+  bool hasImage = btn.image != nil, hasTitle = btn.title.length > 0;
+  btn.imagePosition = hasImage && hasTitle ? NSImageLeft
+                      : hasImage           ? NSImageOnly
+                                           : NSNoImage;
+}
+
+// createStatusItem({ image, title, tooltip, length, visible,
+//                    imageTemplate, imageSize }) -> handle
+// length: 'variable' (default) | 'square' | points.
+static Napi::Value CreateStatusItem(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  Napi::Object o = info.Length() > 0 && info[0].IsObject()
+                       ? info[0].As<Napi::Object>()
+                       : Napi::Object::New(env);
+  NSStatusItem* item;
+  Napi::Value handle;
+  @autoreleasepool {
+    CGFloat len = o.Has("length")
+                      ? StatusLengthFrom(o.Get("length"), NSVariableStatusItemLength)
+                      : NSVariableStatusItemLength;
+    item = [[NSStatusBar systemStatusBar] statusItemWithLength:len];
+    CALStatusItemTarget* target = [CALStatusItemTarget new];
+    target->env_ = (napi_env)env;
+    target->item_ = item;
+    objc_setAssociatedObject(item, &kStatusTargetKey, target,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSStatusBarButton* btn = item.button;
+    btn.target = target;
+    btn.action = @selector(click:);
+    [btn sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
+    RememberStatusWindow(btn.window, item);
+    // AppKit remembers an item's visibility across launches in user defaults
+    // under an autosave name it generates by creation order ("Item-0"), so
+    // an item hidden when the last process ended would come back hidden.
+    // Visibility is the renderer's to decide: assert it at creation.
+    item.visible = BBoolOr(o, "visible", true);
+    ApplyStatusItemProps(item, o);
+    handle = BWrapRetained(env, item);
+    target->handle_ = Napi::Reference<Napi::Value>::New(handle, 1);
+  }
+  return handle;
+}
+
+// The item behind a handle, or nil when it was removed: every verb after
+// removeStatusItem is a no-op, never a crash.
+static NSStatusItem* StatusItemFrom(Napi::Value v) {
+  if (!v.IsExternal()) {
+    Napi::TypeError::New(v.Env(), "expected a status item handle")
+        .ThrowAsJavaScriptException();
+    return nil;
+  }
+  NSStatusItem* item = BDeref<NSStatusItem*>(v);
+  return StatusTargetOf(item) ? item : nil;
+}
+
+// setStatusItem(item, { image, title, tooltip, length, visible, ... })
+static Napi::Value SetStatusItem(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  if (!item || !info[1].IsObject()) return env.Undefined();
+  @autoreleasepool {
+    ApplyStatusItemProps(item, info[1].As<Napi::Object>());
+    RememberStatusWindow(item.button.window, item);
+  }
+  return env.Undefined();
+}
+
+// setStatusItemMenu(item, items | null) — items in setMainMenu's item
+// vocabulary (title, id, enabled, checked, key, iconName, items, ...).
+// With a menu, a click tracks it and the button's action stays silent;
+// null returns the item to click events.
+static Napi::Value SetStatusItemMenu(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  if (!item) return env.Undefined();
+  Napi::Value spec = info.Length() > 1 ? info[1] : env.Null();
+  @autoreleasepool {
+    if (spec.IsArray()) {
+      EnsureMenuTarget(env);
+      item.menu = BuildMenuFrom(env, spec.As<Napi::Array>());
+    } else {
+      item.menu = nil;
+    }
+  }
+  return env.Undefined();
+}
+
+static Napi::Value RemoveStatusItem(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  if (!item) return env.Undefined();
+  @autoreleasepool {
+    CALStatusItemTarget* target = StatusTargetOf(item);
+    item.button.target = nil;
+    item.button.action = nil;
+    item.menu = nil;
+    [[NSStatusBar systemStatusBar] removeStatusItem:item];
+    objc_setAssociatedObject(item, &kStatusTargetKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    target->item_ = nil;
+    target->handle_.Reset();  // the handle may now be collected
+  }
+  return env.Undefined();
+}
+
+// statusItemInfo(item) — the item as data, for tests: what the bar shows,
+// its menu in mainMenuInfo's shape, and the button's screen rect. Null
+// once removed.
+static Napi::Value StatusItemInfo(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  if (!item) return env.Null();
+  NSStatusBarButton* btn = item.button;
+  Napi::Object r = Napi::Object::New(env);
+  r.Set("title", btn.title.UTF8String);
+  r.Set("tooltip", btn.toolTip ? btn.toolTip.UTF8String : "");
+  r.Set("visible", (bool)item.visible);
+  r.Set("hasImage", btn.image != nil);
+  r.Set("imageTemplate", btn.image != nil && [btn.image isTemplate]);
+  if (btn.image) {
+    r.Set("imageWidth", btn.image.size.width);
+    r.Set("imageHeight", btn.image.size.height);
+  }
+  if (item.length == NSVariableStatusItemLength) r.Set("length", "variable");
+  else if (item.length == NSSquareStatusItemLength) r.Set("length", "square");
+  else r.Set("length", item.length);
+  r.Set("menu", item.menu ? MenuInfo(env, item.menu) : env.Null());
+  if (btn.window) r.Set("windowNumber", (double)btn.window.windowNumber);
+  SetStatusButtonFrame(r, btn);
+  return r;
+}
+
+// activateStatusItemMenuItem(item, [i, j, ...]) — for tests; a real click
+// would track the menu in a modal loop nobody can dismiss from a script.
+static Napi::Value ActivateStatusItemMenuItem(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  if (!item || !info[1].IsArray()) return Napi::Boolean::New(env, false);
+  return Napi::Boolean::New(env,
+                            ActivateInMenu(item.menu, info[1].As<Napi::Array>()));
+}
+
+// Two things have to happen before a mouse event posted into an item's
+// window is delivered rather than dropped: AppKit's first pass through
+// nextEventMatchingMask: (whatever it sets up there, an event queued
+// before it is lost), and the status bar server's reply that places the
+// window and orders it in — on a hosted CI VM the latter takes longer
+// than one pass. The test hooks take at least one pass here and then wait
+// for the window to be on glass, for at most `timeout` seconds; nothing
+// is dequeued or dispatched.
+static bool WaitForStatusWindow(NSWindow* win, NSTimeInterval timeout) {
+  NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  NSDate* until = [NSDate distantPast];
+  while (true) {
+    [NSApp nextEventMatchingMask:0
+                       untilDate:until
+                          inMode:NSDefaultRunLoopMode
+                         dequeue:NO];
+    if (win.isVisible && WindowOnGlass(win)) return true;
+    if (deadline.timeIntervalSinceNow <= 0) return false;
+    until = [NSDate dateWithTimeIntervalSinceNow:0.01];
+  }
+}
+
+// clickStatusItem(item, 'left' | 'right' | 'middle') — for tests: a real
+// press-and-release posted into the item's own window, so the button's
+// tracking and sendActionOn: path (or the pump's middle-click path) is
+// what fires. Declines a left or right click while a menu is set: that
+// click would open the menu and never return. Pump afterwards; the event
+// arrives through the backend callback like a user's click.
+static Napi::Value ClickStatusItem(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  if (!item) return Napi::Boolean::New(env, false);
+  std::string kind = info.Length() > 1 && info[1].IsString()
+                         ? info[1].As<Napi::String>().Utf8Value()
+                         : "left";
+  if (item.menu && kind != "middle") return Napi::Boolean::New(env, false);
+  NSStatusBarButton* btn = item.button;
+  NSWindow* win = btn.window;
+  if (!win) return Napi::Boolean::New(env, false);
+  WaitForStatusWindow(win, 2.0);
+  RememberStatusWindow(win, item);
+  NSEventType down = NSEventTypeLeftMouseDown, up = NSEventTypeLeftMouseUp;
+  if (kind == "right") {
+    down = NSEventTypeRightMouseDown; up = NSEventTypeRightMouseUp;
+  } else if (kind == "middle") {
+    down = NSEventTypeOtherMouseDown; up = NSEventTypeOtherMouseUp;
+  }
+  NSRect r = [btn convertRect:btn.bounds toView:nil];
+  NSPoint p = NSMakePoint(NSMidX(r), NSMidY(r));
+  NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+  for (NSEventType t : {down, up}) {
+    NSEvent* e = [NSEvent mouseEventWithType:t
+                                    location:p
+                               modifierFlags:0
+                                   timestamp:now
+                                windowNumber:win.windowNumber
+                                     context:nil
+                                 eventNumber:0
+                                  clickCount:1
+                                    pressure:t == down ? 1 : 0];
+    if (kind == "middle") {
+      // mouseEventWithType: leaves the button number at 0 for the "other"
+      // types; the middle button is number 2, which only the CGEvent
+      // underneath can say
+      CGEventRef cg = CGEventCreateCopy(e.CGEvent);
+      CGEventSetIntegerValueField(cg, kCGMouseEventButtonNumber, 2);
+      NSEvent* e2 = [NSEvent eventWithCGEvent:cg];
+      CFRelease(cg);
+      if (e2) e = e2;
+    }
+    [NSApp postEvent:e atStart:NO];
+  }
   return Napi::Boolean::New(env, true);
+}
+
+// snapshotStatusItem(item, file) — the item's window as the WindowServer
+// composited it, to PNG (our own window: no screen-recording permission
+// needed, unlike `screencapture -l` from another process). For tests.
+static Napi::Value SnapshotStatusItem(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSStatusItem* item = StatusItemFrom(info[0]);
+  NSWindow* win = item ? item.button.window : nil;
+  if (!win || !info[1].IsString()) return Napi::Boolean::New(env, false);
+  WaitForStatusWindow(win, 2.0);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  CGImageRef img = CGWindowListCreateImage(
+      CGRectNull, kCGWindowListOptionIncludingWindow,
+      (CGWindowID)win.windowNumber,
+      (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming |
+                            kCGWindowImageBestResolution));
+#pragma clang diagnostic pop
+  if (!img) return Napi::Boolean::New(env, false);
+  NSURL* url = [NSURL fileURLWithPath:BToNSString(info[1])];
+  CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+      (__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
+  bool ok = false;
+  if (dst) {
+    CGImageDestinationAddImage(dst, img, NULL);
+    ok = CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+  }
+  CGImageRelease(img);
+  return Napi::Boolean::New(env, ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -4261,6 +4686,14 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("setMainMenu", SetMainMenuFn);
   BFN("mainMenuInfo", MainMenuInfoFn);
   BFN("activateMenuItem", ActivateMenuItemFn);
+  BFN("createStatusItem", CreateStatusItem);
+  BFN("setStatusItem", SetStatusItem);
+  BFN("setStatusItemMenu", SetStatusItemMenu);
+  BFN("removeStatusItem", RemoveStatusItem);
+  BFN("statusItemInfo", StatusItemInfo);
+  BFN("activateStatusItemMenuItem", ActivateStatusItemMenuItem);
+  BFN("clickStatusItem", ClickStatusItem);
+  BFN("snapshotStatusItem", SnapshotStatusItem);
   BFN("openPanel", OpenPanelFn);
   BFN("savePanel", SavePanelFn);
   BFN("cancelPanel", CancelPanelFn);

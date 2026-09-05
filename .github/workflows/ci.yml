@@ -55,6 +55,21 @@ jobs:
             const viaLayout = paint((g) => n.drawLayout(g, layout.handle, 4, 30 - layout.lines[0].baseline));
             const viaGlyphs = paint((g) => n.ctxDrawGlyphs(g, [{ font, glyphs: ids, positions: new Float64Array([4, 30, 4 + adv[0], 30]) }]));
             if (!viaGlyphs.some((v) => v !== 255) || viaGlyphs.some((v, i) => v !== viaLayout[i])) { console.error('ctxDrawGlyphs does not match drawLayout'); process.exit(1); }
+            // app presence (#15): badge and policy read back, a dock menu round-trips through the
+            // delegate the Dock calls and its activation arrives tagged menu:'dock', attention ids cancel
+            n.initApp();
+            const infoA = n.appInfo();
+            if (infoA.activationPolicy !== 'regular' || infoA.dockBadge !== null) { console.error('appInfo', infoA); process.exit(1); }
+            n.setDockBadge(3); if (n.appInfo().dockBadge !== '3') { console.error('dock badge'); process.exit(1); }
+            n.setDockBadge(null); if (n.appInfo().dockBadge !== null) { console.error('dock badge clear'); process.exit(1); }
+            let menuEv = null; n.setBackendEventCallback((ev) => { if (ev.type === 'menu-activate') menuEv = ev; });
+            n.setDockMenu([{ id: 7, title: 'Open' }, { separator: true }, { id: 8, title: 'More', items: [{ id: 9, title: 'Deep' }] }]);
+            const dm = n.dockMenuInfo();
+            if (!dm || dm.items.length !== 3 || dm.items[2].submenu.items[0].id !== 9) { console.error('dockMenuInfo', JSON.stringify(dm)); process.exit(1); }
+            if (!n.activateDockMenuItem([2, 0]) || !menuEv || menuEv.id !== 9 || menuEv.menu !== 'dock') { console.error('dock activation', menuEv); process.exit(1); }
+            n.setDockMenu(null); if (n.dockMenuInfo() !== null) { console.error('dock menu clear'); process.exit(1); }
+            const rid = n.requestUserAttention('informational'); if (typeof rid !== 'number') { console.error('attention id', rid); process.exit(1); } n.cancelUserAttention(rid);
+            console.log('setAppName ->', n.setAppName('appkit-ci'), n.appInfo().name);
             console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
           "
 

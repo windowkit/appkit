@@ -93,24 +93,11 @@ static Napi::Value WrapRetained(Napi::Env env, id obj) {
 - (void)keyDown:(NSEvent*)event { (void)event; }
 @end
 
-static bool gAppInited = false;
-
-static void EnsureApp() {
-  if (gAppInited) return;
-  @autoreleasepool {
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    // No window tabbing: see BEnsureApp in backend.mm (windowkit/appkit#12).
-    NSWindow.allowsAutomaticWindowTabbing = NO;
-    [NSApp finishLaunching];
-  }
-  gAppInited = true;
-}
-
-static Napi::Value InitApp(const Napi::CallbackInfo& info) {
-  EnsureApp();
-  return info.Env().Undefined();
-}
+// NSApplication is set up once, in backend.mm (CALEnsureApp): that is where
+// the activation policy, the app delegate and the no-tabbing default live,
+// and `initApp` is registered from there too.
+void CALEnsureApp();
+static void EnsureApp() { CALEnsureApp(); }
 
 static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -927,7 +914,6 @@ void InitBackend(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
-  FN("initApp", InitApp);
   FN("pump", Pump);
   FN("setEventCallback", SetEventCallback);
   FN("postMouseEvent", PostMouseEvent);

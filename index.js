@@ -178,7 +178,24 @@ const controls = {
   isDark: () => native.appearanceIsDark(),
 };
 
+// Privacy (TCC) authorizations. kind: 'camera' | 'microphone' |
+// 'screen-recording' | 'accessibility' | 'input-monitoring' | 'location' |
+// 'automation' (with { target: bundleId }). Status and request never touch
+// policy: the renderer decides when to ask and what to do with a refusal.
+const permissions = {
+  // -> 'authorized' | 'denied' | 'restricted' | 'notDetermined'; never prompts
+  status: (kind, opts) => native.authorizationStatus(kind, opts),
+  // Raises the system prompt where macOS has one; resolves to granted. Screen
+  // recording and accessibility can only be granted in Settings, so their
+  // prompt is the system's go-to-Settings dialog and this resolves at once.
+  request: (kind, opts) =>
+    new Promise((resolve) => native.requestAuthorization(kind, opts, resolve)),
+  // Best-effort deep link to the Privacy pane (or its top level with no kind);
+  // also takes 'files-and-folders' and 'full-disk-access'.
+  openSettings: (kind) => native.openPrivacySettings(kind),
+};
+
 module.exports = {
   app, Window, Layer, TextLayer, GradientLayer, ShapeLayer,
-  transaction, withoutAnimations, text, controls, native,
+  transaction, withoutAnimations, text, controls, permissions, native,
 };

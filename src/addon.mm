@@ -100,6 +100,8 @@ static void EnsureApp() {
   @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    // No window tabbing: see BEnsureApp in backend.mm (windowkit/appkit#12).
+    NSWindow.allowsAutomaticWindowTabbing = NO;
     [NSApp finishLaunching];
   }
   gAppInited = true;
@@ -127,6 +129,7 @@ static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     win.releasedWhenClosed = NO;
+    win.tabbingMode = NSWindowTabbingModeDisallowed;
     win.title = title;
     win.acceptsMouseMovedEvents = YES;
 
@@ -921,6 +924,9 @@ static Napi::Value SnapshotWindow(const Napi::CallbackInfo& info) {
 // src/backend.mm — the react-x11 backend surface (windows with delegates,
 // enriched events, CG surfaces, CoreText layouts, pasteboard, screens).
 void InitBackend(Napi::Env env, Napi::Object exports);
+// src/permissions.mm — privacy (TCC) authorizations: status, the system
+// prompt where a framework offers one, the Settings pane otherwise.
+void InitPermissions(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -960,6 +966,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   FN("appearanceIsDark", AppearanceIsDark);
 #undef FN
   InitBackend(env, exports);
+  InitPermissions(env, exports);
   return exports;
 }
 

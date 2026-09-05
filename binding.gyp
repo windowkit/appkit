@@ -2,7 +2,7 @@
   "targets": [
     {
       "target_name": "calayers",
-      "sources": ["src/addon.mm", "src/backend.mm"],
+      "sources": ["src/addon.mm", "src/backend.mm", "src/permissions.mm"],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
       ],
@@ -19,7 +19,12 @@
           "-framework CoreText",
           "-framework CoreGraphics",
           "-framework ImageIO",
-          "-framework IOSurface"
+          "-framework IOSurface",
+          "-framework UniformTypeIdentifiers",
+          "-framework AVFoundation",
+          "-framework CoreLocation",
+          "-framework IOKit",
+          "-framework ApplicationServices"
         ]
       }
     }

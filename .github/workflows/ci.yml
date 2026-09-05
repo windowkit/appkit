@@ -100,6 +100,28 @@ jobs:
             n.setDockMenu(null); if (n.dockMenuInfo() !== null) { console.error('dock menu clear'); process.exit(1); }
             const rid = n.requestUserAttention('informational'); if (typeof rid !== 'number') { console.error('attention id', rid); process.exit(1); } n.cancelUserAttention(rid);
             console.log('setAppName ->', n.setAppName('appkit-ci'), n.appInfo().name);
+            // the menu-bar extra: an item with a symbol and a title; its menu in setMainMenu's vocabulary,
+            // fired by index path; without a menu, real clicks posted into its window come back as events
+            // carrying the same handle; an in-place patch; removal
+            const trayEvents = [];
+            n.setBackendEventCallback((ev) => trayEvents.push(ev));
+            const tray = n.createStatusItem({ image: 'star.fill', title: 'CI', tooltip: 'tray' });
+            let ti = n.statusItemInfo(tray);
+            if (!(ti.title === 'CI' && ti.tooltip === 'tray' && ti.hasImage && ti.imageTemplate && ti.visible && ti.length === 'variable')) { console.error('createStatusItem', ti); process.exit(1); }
+            n.setStatusItemMenu(tray, [{ id: 7, title: 'Seven' }, { separator: true }, { id: 8, title: 'More', items: [{ id: 9, title: 'Nine' }] }]);
+            ti = n.statusItemInfo(tray);
+            if (!(ti.menu && ti.menu.items.length === 3 && ti.menu.items[1].separator && n.activateStatusItemMenuItem(tray, [2, 0]) && trayEvents.length === 1 && trayEvents[0].type === 'menu-activate' && trayEvents[0].id === 9)) { console.error('setStatusItemMenu', ti.menu, trayEvents); process.exit(1); }
+            if (n.clickStatusItem(tray, 'left') !== false) { console.error('a left click with a menu set must decline'); process.exit(1); }
+            n.setStatusItemMenu(tray, null);
+            trayEvents.length = 0;
+            for (const kind of ['left', 'right', 'middle']) { if (!n.clickStatusItem(tray, kind)) { console.error('clickStatusItem', kind); process.exit(1); } n.pump2(); }
+            if (!(trayEvents.length === 3 && trayEvents.every((e) => e.type === 'status-item-click' && e.statusItem === tray && e.width > 0) && trayEvents.map((e) => e.kind).join() === 'left,right,middle')) { console.error('status-item-click', trayEvents); process.exit(1); }
+            n.setStatusItem(tray, { image: s, imageTemplate: false, title: 'T', visible: false, length: 'square' });
+            ti = n.statusItemInfo(tray);
+            if (!(ti.title === 'T' && ti.hasImage && !ti.imageTemplate && ti.imageWidth === 32 && ti.imageHeight === 24 && ti.visible === false && ti.length === 'square')) { console.error('setStatusItem', ti); process.exit(1); }
+            n.removeStatusItem(tray);
+            if (n.statusItemInfo(tray) !== null || n.clickStatusItem(tray) !== false) { console.error('removeStatusItem'); process.exit(1); }
+            n.setBackendEventCallback(null);
             // file panels: the OS type database behind the filters, then a real NSOpenPanel
             // as a sheet on one of our windows, cancelled from JS, answering null through the pump
             if (n.contentTypeFor({ extension: 'png' }) !== 'public.png' || n.contentTypeFor({ mime: 'application/json' }) !== 'public.json' || n.contentTypeFor({ extension: 'nobody-declared-this' }) === null) { console.error('contentTypeFor'); process.exit(1); }

@@ -55,6 +55,19 @@ jobs:
             const viaLayout = paint((g) => n.drawLayout(g, layout.handle, 4, 30 - layout.lines[0].baseline));
             const viaGlyphs = paint((g) => n.ctxDrawGlyphs(g, [{ font, glyphs: ids, positions: new Float64Array([4, 30, 4 + adv[0], 30]) }]));
             if (!viaGlyphs.some((v) => v !== 255) || viaGlyphs.some((v, i) => v !== viaLayout[i])) { console.error('ctxDrawGlyphs does not match drawLayout'); process.exit(1); }
+            // privacy (TCC) authorizations: every kind answers one of the four statuses without
+            // prompting, automation only answers for a running target, and a bad shape is a TypeError
+            const statuses = new Set(['authorized', 'denied', 'restricted', 'notDetermined']);
+            for (const k of ['camera', 'microphone', 'screen-recording', 'accessibility', 'input-monitoring', 'location']) {
+              const s = n.authorizationStatus(k);
+              if (!statuses.has(s)) { console.error('authorizationStatus', k, s); process.exit(1); }
+            }
+            let finder; try { finder = n.authorizationStatus('automation', { target: 'com.apple.finder' }); } catch (e) { finder = e; }
+            if (!statuses.has(finder) && !/not running/.test(finder && finder.message)) { console.error('automation status', finder); process.exit(1); }
+            for (const bad of [() => n.authorizationStatus('bogus'), () => n.authorizationStatus('automation'), () => n.requestAuthorization('camera'), () => n.openPrivacySettings('bogus')]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
+            }
             console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
           "
 

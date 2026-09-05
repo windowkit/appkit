@@ -118,6 +118,11 @@ static void EmitToJS(Napi::Env env, Napi::Object ev) {
   gBackendCb.Call({ev});
 }
 
+// The same callback, for the faces in other files: notifications.mm hands
+// the UNUserNotificationCenter delegate's responses through here.
+bool CALHasBackendCb() { return HasBackendCb(); }
+void CALEmitBackendEvent(Napi::Env env, Napi::Object ev) { EmitToJS(env, ev); }
+
 // Window bookkeeping: delegate + view need to reach the JS callback with the
 // window's number attached, and windowShouldClose needs to answer NO while
 // telling JS. One delegate class serves every window.
@@ -551,9 +556,15 @@ static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// notifications.mm: responses that arrived before a listener was installed
+void CALNotificationsReplayHeld(Napi::Env env);
+
 static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
+  // a notification acted on before the callback existed (one that launched
+  // the app, say) goes out ahead of this tick's input
+  CALNotificationsReplayHeld(env);
   @autoreleasepool {
     while (true) {
       NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny

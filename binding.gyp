@@ -2,7 +2,12 @@
   "targets": [
     {
       "target_name": "calayers",
-      "sources": ["src/addon.mm", "src/backend.mm", "src/permissions.mm"],
+      "sources": [
+        "src/addon.mm",
+        "src/backend.mm",
+        "src/permissions.mm",
+        "src/notifications.mm"
+      ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
       ],
@@ -23,7 +28,8 @@
           "-framework AVFoundation",
           "-framework CoreLocation",
           "-framework IOKit",
-          "-framework ApplicationServices"
+          "-framework ApplicationServices",
+          "-framework UserNotifications"
         ]
       }
     }

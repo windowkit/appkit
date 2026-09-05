@@ -68,7 +68,40 @@ jobs:
               let err; try { bad(); } catch (e) { err = e; }
               if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
             }
-            console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
+            // notifications: a bare node process is no app bundle, so the capability reads false with a
+            // reason, every mutator throws an Error (never a silent no-op), and a bad shape is a TypeError
+            let notifSync = true;
+            n.notificationSettings((s) => {
+              if (notifSync || s.available !== false || s.bundleIdentifier !== null || typeof s.reason !== 'string') { console.error('notificationSettings', notifSync, s); process.exit(1); }
+            });
+            notifSync = false;
+            for (const bad of [() => n.postNotification({ title: 't' }), () => n.requestNotificationAuthorization(['alert'], () => {}), () => n.setNotificationCategories([]), () => n.removeNotification('x'), () => n.deliveredNotifications(() => {})]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof Error) || err instanceof TypeError || !/unavailable/.test(err.message)) { console.error('expected an unavailable Error, got', err); process.exit(1); }
+            }
+            for (const bad of [() => n.notificationSettings(), () => n.requestNotificationAuthorization(['bogus'], () => {}), () => n.postNotification({ body: 'no title' }), () => n.updateNotification('', { title: 't' }), () => n.removeNotification(5), () => n.setNotificationCategories([{ id: 'c', actions: [{ id: 'a' }] }]), () => n.postNotificationResponse({})]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
+            }
+            // the response path, with synthesized responses: what arrives before a listener exists is held
+            // and replayed, in order, at the first pump2 with one; what arrives after reaches it on its own
+            const got = [];
+            n.postNotificationResponse({ identifier: 'held-1', actionId: 'open', categoryId: 'download', userInfo: { a: [1, null, 'x'] } });
+            n.postNotificationResponse({ identifier: 'held-2', dismissed: true });
+            setTimeout(() => {
+              n.setBackendEventCallback((ev) => got.push(ev));
+              if (got.length) { console.error('delivered with no listener', got); process.exit(1); }
+              n.initApp(); n.pump2();
+              const [a, d] = got;
+              if (got.length !== 2 || a.type !== 'notification-action' || a.identifier !== 'held-1' || a.actionId !== 'open' || a.categoryId !== 'download' || JSON.stringify(a.userInfo) !== '{\"a\":[1,null,\"x\"]}') { console.error('held action', got); process.exit(1); }
+              if (d.type !== 'notification-dismissed' || d.identifier !== 'held-2' || d.reason !== 'dismissed' || d.categoryId !== null || 'userInfo' in d || 'actionId' in d) { console.error('held dismissal', got); process.exit(1); }
+              n.postNotificationResponse({ identifier: 'live' });
+              setTimeout(() => {
+                if (got.length !== 3 || got[2].identifier !== 'live' || got[2].actionId !== 'default') { console.error('live response', got); process.exit(1); }
+                n.setBackendEventCallback(null);
+                console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
+              }, 50);
+            }, 50);
           "
 
   # Same steps the release workflow uses to produce the prebuilt binaries

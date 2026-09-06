@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.5.0](https://github.com/windowkit/appkit/compare/v0.4.0...v0.5.0) (2026-09-06)
+
+
+### Features
+
+* accessibility display options — reduce motion and its siblings, the change as a backend event ([#32](https://github.com/windowkit/appkit/issues/32)) ([2835d12](https://github.com/windowkit/appkit/commit/2835d1214f46db503b6fdd1f05a2ae9686cf20a7))
+* animation verbs — control-point timing, additive, delay, keyframes, springs, presentationValue, completion events ([#30](https://github.com/windowkit/appkit/issues/30)) ([e9eac8e](https://github.com/windowkit/appkit/commit/e9eac8e4c2096811fe094184ae8bdc698be34b97))
+* app lifecycle — open-URL/open-file, reopen and quit requests through the app delegate ([d5e7d77](https://github.com/windowkit/appkit/commit/d5e7d772ab293119f2e09febb10f87c5bf3b1ff1))
+* app lifecycle events — open-URL/open-file, reopen and quit requests through the app delegate ([a0580e0](https://github.com/windowkit/appkit/commit/a0580e0d4b92515e6bdc7f0b7329a13c1604081f)), closes [#18](https://github.com/windowkit/appkit/issues/18)
+* desktop notifications — UNUserNotificationCenter settings, authorization, categories, post/update/remove, action events ([c5da10e](https://github.com/windowkit/appkit/commit/c5da10e521ce372ad06223a95ab6457b81f87bb4))
+* desktop notifications — UNUserNotificationCenter: settings, authorization, categories, post/update/remove, action events ([646105a](https://github.com/windowkit/appkit/commit/646105a261a298b8c9e162dbdbdccd4c6ec0bb41))
+* Dock and app-switcher presence — badge, user attention, Dock menu, activation policy, app name ([547b9b4](https://github.com/windowkit/appkit/commit/547b9b4726ce3df8b9aa054b97fd308559cc8170))
+* Dock and app-switcher presence — badge, user attention, Dock menu, activation policy, app name ([41ab634](https://github.com/windowkit/appkit/commit/41ab6348056326aa259e84211bfbfb12c3752390))
+* drag and drop — NSDraggingDestination on the hosting view, NSDraggingSource from it ([8aa305a](https://github.com/windowkit/appkit/commit/8aa305aa58a2af24ef6340bbfb987a812af5e4b8))
+* drag and drop — NSDraggingDestination on the hosting view, NSDraggingSource from it ([90cf29a](https://github.com/windowkit/appkit/commit/90cf29afb7ccd87fb29a3b9dc7e1f72fa6d508a9)), closes [#16](https://github.com/windowkit/appkit/issues/16)
+* native file open/save panels (NSOpenPanel / NSSavePanel) ([51c38c2](https://github.com/windowkit/appkit/commit/51c38c28a81ca54011c3f20b7d163a97b75f4ce5))
+* native file open/save panels (NSOpenPanel / NSSavePanel) ([8b1a198](https://github.com/windowkit/appkit/commit/8b1a1988ba69cb22d6377e2d6f021590a423a26d)), closes [#14](https://github.com/windowkit/appkit/issues/14)
+* NSStatusItem, the menu-bar extra — image/title/tooltip, the main menu's item spec, clicks as events ([8e68294](https://github.com/windowkit/appkit/commit/8e68294986663a5bb53ccc3470c542e739b765f0))
+* NSStatusItem, the menu-bar extra — image/title/tooltip, the main menu's item spec, clicks as events ([2da777e](https://github.com/windowkit/appkit/commit/2da777eca659b8c32bf8506ff7607f35414ee14c))
+* privacy (TCC) authorizations — authorizationStatus, requestAuthorization, openPrivacySettings ([265e638](https://github.com/windowkit/appkit/commit/265e638b87bcdab50046cf04e809532bbfd8c3c7))
+* privacy (TCC) authorizations — status, request, openPrivacySettings ([5cbbc57](https://github.com/windowkit/appkit/commit/5cbbc5739a57511400c9401c33418c0f912b8bcd))
+
+
+### Bug Fixes
+
+* never show a tab bar; getWindowFrame reports the content view's rect ([63742ec](https://github.com/windowkit/appkit/commit/63742ec7076649d0de780ff92b2896220f1097ba))
+* never show a tab bar; report the content view's rect from getWindowFrame and geometry events ([9eaa8a5](https://github.com/windowkit/appkit/commit/9eaa8a584985fdaf859b7b3f493a02f26f3719f4)), closes [#12](https://github.com/windowkit/appkit/issues/12)
+* static event-callback references outlive the env — suppress their destructors ([bb8d2d9](https://github.com/windowkit/appkit/commit/bb8d2d9a67cf5a8d828f4978484931d2ee4ae394))
+
 ## [0.4.0](https://github.com/windowkit/appkit/compare/v0.3.0...v0.4.0) (2026-09-03)
 
 

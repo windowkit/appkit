@@ -183,7 +183,9 @@ jobs:
       # The app delegate, driven by the Apple Events Launch Services would
       # send (open-URL, open-documents, reopen, quit), dispatched in-process.
       - name: App lifecycle events through the delegate
-        run: npm test
+        run: node test/app-lifecycle.js
+      - name: Animation verbs, read back through the presentation layer
+        run: node test/animation.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

@@ -916,6 +916,9 @@ void InitBackend(Napi::Env env, Napi::Object exports);
 // src/permissions.mm — privacy (TCC) authorizations: status, the system
 // prompt where a framework offers one, the Settings pane otherwise.
 void InitPermissions(Napi::Env env, Napi::Object exports);
+// src/notifications.mm — user notifications through UNUserNotificationCenter:
+// settings, authorization, categories, post/update/remove, action events.
+void InitNotifications(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -955,6 +958,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #undef FN
   InitBackend(env, exports);
   InitPermissions(env, exports);
+  InitNotifications(env, exports);
   return exports;
 }
 

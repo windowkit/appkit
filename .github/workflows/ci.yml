@@ -122,6 +122,46 @@ jobs:
             n.removeStatusItem(tray);
             if (n.statusItemInfo(tray) !== null || n.clickStatusItem(tray) !== false) { console.error('removeStatusItem'); process.exit(1); }
             n.setBackendEventCallback(null);
+            // notifications: a bare node process is no app bundle, so the capability reads false with a
+            // reason, every mutator throws an Error (never a silent no-op), and a bad shape is a TypeError
+            let notifSync = true;
+            n.notificationSettings((s) => {
+              if (notifSync || s.available !== false || s.bundleIdentifier !== null || typeof s.reason !== 'string') { console.error('notificationSettings', notifSync, s); process.exit(1); }
+            });
+            notifSync = false;
+            for (const bad of [() => n.postNotification({ title: 't' }), () => n.requestNotificationAuthorization(['alert'], () => {}), () => n.setNotificationCategories([]), () => n.removeNotification('x'), () => n.deliveredNotifications(() => {})]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof Error) || err instanceof TypeError || !/unavailable/.test(err.message)) { console.error('expected an unavailable Error, got', err); process.exit(1); }
+            }
+            for (const bad of [() => n.notificationSettings(), () => n.requestNotificationAuthorization(['bogus'], () => {}), () => n.postNotification({ body: 'no title' }), () => n.updateNotification('', { title: 't' }), () => n.removeNotification(5), () => n.setNotificationCategories([{ id: 'c', actions: [{ id: 'a' }] }]), () => n.postNotificationResponse({})]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
+            }
+            // the response path, with synthesized responses: what arrives before a listener exists is held
+            // and replayed, in order, at the first pump2 with one; what arrives after reaches it on its own.
+            // A timer alone could run in the same timers phase as a long pump below, before the poll phase
+            // that hands the responses over, so the checks wait for an immediate (poll runs in between).
+            const got = [];
+            let notifDone = false;
+            n.postNotificationResponse({ identifier: 'held-1', actionId: 'open', categoryId: 'download', userInfo: { a: [1, null, 'x'] } });
+            n.postNotificationResponse({ identifier: 'held-2', dismissed: true });
+            setTimeout(() => setImmediate(() => {
+              n.setBackendEventCallback((ev) => { if (ev.type.startsWith('notification-')) got.push(ev); });
+              if (got.length) { console.error('delivered with no listener', got); process.exit(1); }
+              n.initApp(); n.pump2();
+              const [a, d] = got;
+              if (got.length !== 2 || a.type !== 'notification-action' || a.identifier !== 'held-1' || a.actionId !== 'open' || a.categoryId !== 'download' || JSON.stringify(a.userInfo) !== '{\"a\":[1,null,\"x\"]}') { console.error('held action', got); process.exit(1); }
+              if (d.type !== 'notification-dismissed' || d.identifier !== 'held-2' || d.reason !== 'dismissed' || d.categoryId !== null || 'userInfo' in d || 'actionId' in d) { console.error('held dismissal', got); process.exit(1); }
+              n.postNotificationResponse({ identifier: 'live' });
+              const until = Date.now() + 2000;
+              const live = () => setTimeout(() => setImmediate(() => {
+                if (got.length < 3 && Date.now() < until) return live();
+                if (got.length !== 3 || got[2].identifier !== 'live' || got[2].actionId !== 'default') { console.error('live response', got); process.exit(1); }
+                n.setBackendEventCallback(null);
+                notifDone = true;
+              }), 10);
+              live();
+            }), 50);
             // file panels: the OS type database behind the filters, then a real NSOpenPanel
             // as a sheet on one of our windows, cancelled from JS, answering null through the pump
             if (n.contentTypeFor({ extension: 'png' }) !== 'public.png' || n.contentTypeFor({ mime: 'application/json' }) !== 'public.json' || n.contentTypeFor({ extension: 'nobody-declared-this' }) === null) { console.error('contentTypeFor'); process.exit(1); }
@@ -135,6 +175,7 @@ jobs:
               clearInterval(pump);
               if (answer !== null || n.cancelPanel(panel)) { console.error('sheet did not answer null on cancel:', answer); process.exit(1); }
               n.destroyWindow2(win);
+              if (!notifDone) { console.error('the notification response checks did not finish'); process.exit(1); }
               console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
               process.exit(0);
             }, 4000);

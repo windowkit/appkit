@@ -471,6 +471,85 @@ native.appInfo(); // -> { activationPolicy, name, dockBadge, active }
 `dockMenuInfo()` and `activateDockMenuItem([i, j, …])` mirror `mainMenuInfo()` and
 `activateMenuItem()` for tests; both go through the delegate method the Dock itself calls.
 
+## Desktop notifications (UNUserNotificationCenter)
+
+Banners, the Notification Center list and action buttons through the
+`UserNotifications` framework — the macOS counterpart of freedesktop's
+`org.freedesktop.Notifications`, and the API that replaced the deprecated
+`NSUserNotification`. Mechanism only: what to say, when to ask, and what to do
+with a refusal stay in the renderer.
+
+```js
+const { notifications, native } = require('@windowkit/appkit');
+
+const s = await notifications.settings();
+// { available: false, bundleIdentifier: null, reason }            — a bare `node`: fall to another rung
+// { available: true, bundleIdentifier, authorizationStatus,        — 'notDetermined' | 'denied' | 'authorized' | 'provisional'
+//   alert, sound, badge, notificationCenter, lockScreen,           — 'notSupported' | 'disabled' | 'enabled'
+//   criticalAlert, alertStyle, showPreviews, timeSensitive }
+
+await notifications.requestAuthorization(['alert', 'sound', 'badge']);   // the system prompt, once per app -> granted
+notifications.setCategories([
+  { id: 'download', actions: [{ id: 'open', title: 'Open', foreground: true },
+                              { id: 'trash', title: 'Delete', destructive: true }] },
+]);
+const id = await notifications.post({ title: 'Export finished', body: 'report.pdf — 2.4 MB',
+                                      sound: 'default', categoryId: 'download',
+                                      userInfo: { path: '/tmp/report.pdf' } });
+await notifications.update(id, { title: 'Export finished', body: 'opened' });  // same identifier: replaced in place
+notifications.remove(id);                                                    // out of Notification Center
+
+native.setBackendEventCallback((ev) => {
+  // 'notification-action'    { identifier, actionId, categoryId, userInfo }   actionId 'default' = a click on the banner
+  // 'notification-dismissed' { identifier, reason: 'dismissed', categoryId, userInfo }
+});
+
+// the natives underneath, callback-shaped
+native.notificationSettings(cb);                             // never throws; cb(settings) once, asynchronously
+native.requestNotificationAuthorization(options, cb);        // cb(granted, error)
+native.setNotificationCategories(categories);                // replaces the set
+native.postNotification(props, cb?) -> identifier;           // cb(error | null) once the system has taken it
+native.updateNotification(identifier, props, cb?);           // = post with that identifier
+native.removeNotification(identifier | [identifiers]);       // delivered and pending
+native.deliveredNotifications(cb); native.notificationCategories(cb);   // readback
+native.postNotificationResponse({ identifier, actionId?, dismissed?, ... }); // test-only: a response as the
+                                                             // delegate would queue it (no bundle needed)
+```
+
+- **The bundle-identity constraint.** The system attributes every banner to an
+  app bundle — a `CFBundleIdentifier` Launch Services can see — and
+  `UNUserNotificationCenter` raises (`bundleProxyForCurrentProcess is nil`) in
+  a process that is none, which is what a bare `node` is. The centre is probed
+  once, at `require` time, behind that check; the outcome is
+  `settings().available`, with the reason when false. Every other call throws
+  an `Error` in that state — never a silent drop — so check `available` and
+  fall to another rung (`osascript display notification`, say). To run as a
+  bundle, put the executable in `Name.app/Contents/MacOS/` with an
+  `Info.plist` that names it and carries `CFBundleIdentifier`, and sign it
+  (`codesign --force --deep --sign - Name.app` is enough locally).
+- **Authorization** is the system's prompt, shown once per bundle id; until it
+  is granted a post is refused with `UNErrorCodeNotificationsNotAllowed`
+  (`error.code === 1`, `error.domain === 'UNErrorDomain'`), and the system
+  keeps no categories for the app (`notificationCategories` reads back
+  empty). The bridge keeps the last set and hands it over again when a
+  request is granted.
+- **The delegate** is installed at `require` time, before `initApp()` finishes
+  launching, so a click that launched the app is delivered too. Responses are
+  marshalled onto node's loop and emitted through the backend callback;
+  anything that arrives before `setBackendEventCallback` is held and replayed
+  at the start of the next `pump2()`, ahead of that tick's input. While the
+  app is frontmost, `willPresent` still shows the banner (list and sound too).
+- **Dismissals.** The system reports an explicit dismissal only for a category
+  carrying `UNNotificationCategoryOptionCustomDismissAction`; every category
+  set here carries it (`customDismissAction: false` opts out), and a
+  notification with no `categoryId` is filed under a bridge-owned category
+  that has it. A banner that times out into Notification Center, or is
+  removed by `removeNotification`, is not reported by the system and produces
+  no event. `'default'` is the `actionId` of a click on the banner itself, so
+  it is not a name for an action of your own.
+- `userInfo` is opaque: `JSON.stringify`'d on the way in and parsed back on
+  the way out, so whatever JSON can carry round-trips exactly.
+
 ## Mapping to a React reconciler
 
 The shape of a host config on top of this:

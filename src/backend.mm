@@ -145,6 +145,11 @@ static void EmitToJS(Napi::Env env, Napi::Object ev) {
   gBackendCb.Call({ev});
 }
 
+// The same callback, for the faces in other files: notifications.mm hands
+// the UNUserNotificationCenter delegate's responses through here.
+bool CALHasBackendCb() { return HasBackendCb(); }
+void CALEmitBackendEvent(Napi::Env env, Napi::Object ev) { EmitToJS(env, ev); }
+
 // ---------------------------------------------------------------------------
 // app lifecycle: what the OS asks the application as a whole
 // ---------------------------------------------------------------------------
@@ -829,12 +834,18 @@ static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// notifications.mm: responses that arrived before a listener was installed
+void CALNotificationsReplayHeld(Napi::Env env);
+
 static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
-  // the launch's URL (or a Dock click) that came before the callback did,
-  // ahead of this tick's input so the renderer hears of it first
+  // what came before the callback did, ahead of this tick's input so the
+  // renderer hears of it first: the launch's URL (or a Dock click), then a
+  // notification acted on before the callback existed (one that launched
+  // the app, say)
   FlushPendingAppEvents(env);
+  CALNotificationsReplayHeld(env);
   @autoreleasepool {
     while (true) {
       NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny

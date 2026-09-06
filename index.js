@@ -195,7 +195,48 @@ const permissions = {
   openSettings: (kind) => native.openPrivacySettings(kind),
 };
 
+// Desktop notifications through UNUserNotificationCenter — the macOS
+// counterpart of org.freedesktop.Notifications. Mechanism only: what to say,
+// when to ask and what to do with a refusal stay in the renderer. Banners
+// are attributed to an app bundle, so a bare `node` process can post none:
+// read settings().available first (it carries the reason when false) and
+// fall to another rung; every other call throws in that state rather than
+// dropping silently. Responses arrive as backend events, through
+// native.setBackendEventCallback: 'notification-action' { identifier,
+// actionId ('default' for a click on the banner itself), categoryId,
+// userInfo } and 'notification-dismissed' { identifier, reason, ... }.
+const notifications = {
+  // -> { available: false, bundleIdentifier, reason } | { available: true,
+  //      bundleIdentifier, authorizationStatus: 'notDetermined' | 'denied' |
+  //      'authorized' | 'provisional', alert, sound, badge, ... }
+  settings: () => new Promise((resolve) => native.notificationSettings(resolve)),
+  // The system prompt, once per app; resolves to granted (boolean).
+  requestAuthorization: (options = ['alert', 'sound', 'badge']) =>
+    new Promise((resolve, reject) =>
+      native.requestNotificationAuthorization(options, (granted, err) =>
+        err ? reject(err) : resolve(granted))),
+  // [{ id, actions: [{ id, title, destructive?, foreground? }] }] — the action
+  // sets a notification's categoryId can name; replaces the whole set.
+  setCategories: (categories) => native.setNotificationCategories(categories),
+  // { identifier?, title, subtitle?, body?, sound?: 'default' | null,
+  //   categoryId?, userInfo?, threadId?, badge? } -> identifier, once the
+  // system has accepted it (rejects while the app is not authorized).
+  post: (props) =>
+    new Promise((resolve, reject) => {
+      const id = native.postNotification(props, (err) => (err ? reject(err) : resolve(id)));
+    }),
+  // The same identifier again replaces the banner in place.
+  update: (identifier, props) =>
+    new Promise((resolve, reject) => {
+      native.updateNotification(identifier, props, (err) => (err ? reject(err) : resolve(identifier)));
+    }),
+  remove: (identifiers) => native.removeNotification(identifiers),
+  // readback: what is in Notification Center for this app, and the categories
+  delivered: () => new Promise((resolve) => native.deliveredNotifications(resolve)),
+  categories: () => new Promise((resolve) => native.notificationCategories(resolve)),
+};
+
 module.exports = {
   app, Window, Layer, TextLayer, GradientLayer, ShapeLayer,
-  transaction, withoutAnimations, text, controls, permissions, native,
+  transaction, withoutAnimations, text, controls, permissions, notifications, native,
 };

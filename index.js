@@ -245,7 +245,15 @@ const notifications = {
   categories: () => new Promise((resolve) => native.notificationCategories(resolve)),
 };
 
+const accessibility = {
+  // System Settings › Accessibility › Display, as NSWorkspace reports it:
+  // { reduceMotion, reduceTransparency, increaseContrast, differentiateWithoutColor, invertColors }.
+  // A change arrives as an 'accessibility-display-changed' backend event with the same fields;
+  // install the callback first, then read this (README "Accessibility display options").
+  displayOptions: () => native.accessibilityDisplayOptions(),
+};
+
 module.exports = {
   app, Window, Layer, TextLayer, GradientLayer, ShapeLayer,
-  transaction, withoutAnimations, text, controls, permissions, notifications, native,
+  transaction, withoutAnimations, text, controls, permissions, notifications, accessibility, native,
 };

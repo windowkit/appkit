@@ -186,6 +186,8 @@ jobs:
         run: node test/app-lifecycle.js
       - name: Animation verbs, read back through the presentation layer
         run: node test/animation.js
+      - name: Accessibility display options and their change event
+        run: node test/accessibility-display.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

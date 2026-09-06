@@ -90,6 +90,7 @@ static bool gAppLaunched = false;
 static NSMenu* gDockMenu = nil;  // applicationDockMenu: answer; setDockMenu
 
 static void BInstallAppDelegate();  // the app lifecycle section, below
+static void BInstallAccessibilityObserver();  // the accessibility section, below
 
 void BEnsureApp() {
   if (gAppLaunched) return;
@@ -105,6 +106,7 @@ void BEnsureApp() {
     // launched for (a URL, a document) is dispatched inside that call, and
     // a delegate installed a line later would never hear of it.
     BInstallAppDelegate();
+    BInstallAccessibilityObserver();
     [NSApp finishLaunching];
   }
   gAppLaunched = true;
@@ -279,6 +281,73 @@ static CALAppDelegate* gAppDelegate = nil;
 static void BInstallAppDelegate() {
   if (!gAppDelegate) gAppDelegate = [CALAppDelegate new];
   NSApp.delegate = gAppDelegate;
+}
+
+// ---------------------------------------------------------------------------
+// accessibility display options: reduce motion and its siblings
+// ---------------------------------------------------------------------------
+//
+// System Settings › Accessibility › Display, as NSWorkspace reports it
+// (windowkit/appkit#31). The query answers synchronously; a change arrives as
+// a backend event from NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+// which AppKit posts on the main thread as the pump runs the run loop. Nothing
+// is held for a listener that is not there yet: a setting is a fact rather
+// than a message, so a renderer reads it when it installs its callback and
+// hears of changes from then on. Mechanism only — what a renderer does with
+// reduceMotion (react-x11: loops never start, transitions still run) is its
+// own call.
+
+static Napi::Object AccessibilityDisplayOptions(Napi::Env env) {
+  NSWorkspace* ws = NSWorkspace.sharedWorkspace;
+  Napi::Object o = Napi::Object::New(env);
+  o.Set("reduceMotion", (bool)ws.accessibilityDisplayShouldReduceMotion);
+  o.Set("reduceTransparency", (bool)ws.accessibilityDisplayShouldReduceTransparency);
+  o.Set("increaseContrast", (bool)ws.accessibilityDisplayShouldIncreaseContrast);
+  o.Set("differentiateWithoutColor",
+        (bool)ws.accessibilityDisplayShouldDifferentiateWithoutColor);
+  o.Set("invertColors", (bool)ws.accessibilityDisplayShouldInvertColors);
+  return o;
+}
+
+// accessibilityDisplayOptions() -> { reduceMotion, reduceTransparency,
+// increaseContrast, differentiateWithoutColor, invertColors }
+static Napi::Value AccessibilityDisplayOptionsFn(const Napi::CallbackInfo& info) {
+  return AccessibilityDisplayOptions(info.Env());
+}
+
+// The observer is installed once, with the app (BEnsureApp), so it is in
+// place before any callback could be. Its block runs on the main queue,
+// which the main run loop drains inside a pump — where a call into JS is
+// legal, the same place a window delegate's methods fire.
+static id gAccessibilityObserver = nil;
+
+static void BInstallAccessibilityObserver() {
+  if (gAccessibilityObserver) return;
+  gAccessibilityObserver = [NSWorkspace.sharedWorkspace.notificationCenter
+      addObserverForName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                  object:nil
+                   queue:NSOperationQueue.mainQueue
+              usingBlock:^(NSNotification* n) {
+                (void)n;
+                if (!HasBackendCb()) return;
+                Napi::Env env = gBackendCb.Env();
+                Napi::HandleScope scope(env);
+                Napi::Object ev = AccessibilityDisplayOptions(env);
+                ev.Set("type", "accessibility-display-changed");
+                EmitToJS(env, ev);
+              }];
+}
+
+// postAccessibilityDisplayChange() — the notification the system would post,
+// posted from here through the same centre, so the observer path can be
+// exercised without touching the user's settings. Test-only, like
+// postAppleEvent; the values it carries are whatever the settings are.
+static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info) {
+  BEnsureApp();
+  [NSWorkspace.sharedWorkspace.notificationCenter
+      postNotificationName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                    object:NSWorkspace.sharedWorkspace];
+  return info.Env().Undefined();
 }
 
 // Window bookkeeping: delegate + view need to reach the JS callback with the
@@ -5006,6 +5075,8 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("measureControl", MeasureControl);
   BFN("drawControlIntoSurface", DrawControlIntoSurface);
   BFN("listScreens", ListScreens);
+  BFN("accessibilityDisplayOptions", AccessibilityDisplayOptionsFn);
+  BFN("postAccessibilityDisplayChange", PostAccessibilityDisplayChange);
   BFN("setCursor", SetCursorFn);
   BFN("postKeyEvent", PostKeyEvent);
   BFN("postAppleEvent", PostAppleEvent);

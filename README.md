@@ -630,6 +630,36 @@ native.postNotificationResponse({ identifier, actionId?, dismissed?, ... }); // 
 - `userInfo` is opaque: `JSON.stringify`'d on the way in and parsed back on
   the way out, so whatever JSON can carry round-trips exactly.
 
+## Accessibility display options (reduce motion)
+
+System Settings › Accessibility › Display, as `NSWorkspace` reports it — the switch a renderer
+reads before it starts anything that moves on its own ([#31](https://github.com/windowkit/appkit/issues/31)):
+
+```js
+native.accessibilityDisplayOptions();
+// -> { reduceMotion, reduceTransparency, increaseContrast, differentiateWithoutColor, invertColors }
+accessibility.displayOptions();   // the same, on the wrapper
+```
+
+A change arrives as a backend event with the same five fields:
+
+```js
+{ type: 'accessibility-display-changed', reduceMotion, reduceTransparency, increaseContrast,
+  differentiateWithoutColor, invertColors }
+```
+
+It comes from `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`, delivered on the
+main thread inside a `pump2()` like every other event. Nothing is held for a listener that is
+not there yet — a setting is a fact rather than a message — so **install the callback, then
+query**: the query is the state, the events are what changes it from then on.
+
+Mechanism only: what to do with `reduceMotion` is the renderer's (react-x11: looping
+`animation`s never start, a `transition` that ends still runs).
+
+`native.postAccessibilityDisplayChange()` posts the same notification through the same centre,
+so the observer path can be exercised without touching the user's settings — test-only, like
+`postAppleEvent`; `test/accessibility-display.js` is the check.
+
 ## Mapping to a React reconciler
 
 The shape of a host config on top of this:

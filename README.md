@@ -386,7 +386,7 @@ native.openPrivacySettings(kind?);                                // no kind: th
 system status bar with a tooltip, and either owns a menu or reports clicks. The
 menu takes the same item spec `setMainMenu` does, so the tray, the app menu bar
 and — through react-x11's dbusmenu adapter — a Linux panel share one authoring
-model; activations arrive as the same `menu-activate` events.
+model; activations arrive as the same `menu-activate` events, tagged `menu: 'status'`.
 
 ```js
 const { native } = require('@windowkit/appkit');
@@ -432,6 +432,44 @@ the item's window (pump afterwards; declined for left/right while a menu is
 set, since that click would open it), and `snapshotStatusItem(item, file)`
 writes the composited item to a PNG.
 
+## Dock & app presence
+
+The handful of things an app shows outside its own windows — the Dock tile and the name
+the Dock, the ⌘-Tab switcher and the menu bar print for it — as flat natives on
+`ca.native`. Mechanism only: counts, reasons and timing stay in the renderer.
+
+```js
+const { native } = require('@windowkit/appkit');
+
+// Activation policy. Decide it before the first window so an agent app never
+// flashes a Dock tile: 'regular' (Dock tile, menu bar, ⌘-Tab entry),
+// 'accessory' (none of those, windows still work — LSUIElement), 'prohibited'.
+native.initApp({ activationPolicy: 'accessory' });
+native.setActivationPolicy('regular');       // live switch afterwards -> bool
+
+native.setDockBadge('3');                    // NSDockTile.badgeLabel; null clears
+const id = native.requestUserAttention('critical'); // Dock bounce until activated;
+                                                    // 'informational' bounces once
+native.cancelUserAttention(id);              // ignored while the app is active anyway
+
+// Dock menu (right-click the tile): one menu's worth of the item vocabulary
+// setMainMenu takes. Activations arrive on the backend event callback as
+// { type: 'menu-activate', id, menu: 'dock' } — menu-bar items say menu: 'main',
+// status-item menus menu: 'status'.
+native.setDockMenu([{ id: 7, title: 'New Window' }, { separator: true },
+                    { id: 8, title: 'Recent', items: [{ id: 9, title: '…' }] }]);
+native.setDockMenu(null);
+
+// The display name. Best-effort: an unbundled process (node, bun) is renamed in
+// LaunchServices' record of it, which is what the Dock and the switcher read; a
+// bundle's Info.plist wins when it declares CFBundleName/CFBundleDisplayName (-> false).
+native.setAppName('My App');
+
+native.appInfo(); // -> { activationPolicy, name, dockBadge, active }
+```
+
+`dockMenuInfo()` and `activateDockMenuItem([i, j, …])` mirror `mainMenuInfo()` and
+`activateMenuItem()` for tests; both go through the delegate method the Dock itself calls.
 
 ## Mapping to a React reconciler
 

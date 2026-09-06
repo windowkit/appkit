@@ -22,6 +22,7 @@
 #import <IOSurface/IOSurface.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <objc/runtime.h>
+#include <dlfcn.h>
 
 #include <cmath>
 #include <string>
@@ -68,17 +69,33 @@ static CGColorRef BMakeColor(Napi::Value v) {
   return CGColorCreateSRGB(r, g, b, al);
 }
 
+// ---------------------------------------------------------------------------
+// the application: one bootstrap for both faces of the addon. addon.mm's
+// EnsureApp calls BEnsureApp (not static for that reason), so NSApplication
+// is set up exactly once, whichever entry point (initApp, createWindow,
+// createWindow2, a control bezel) comes first, and the app delegate it
+// dispatches to is in place for finishLaunching.
+//
+// The activation policy has to be decided before finishLaunching: a Regular
+// launch registers a Dock tile, and an agent app that flips to Accessory
+// afterwards has already flashed its icon. `initApp({ activationPolicy })`
+// and setActivationPolicy therefore feed gActivationPolicy when the app is
+// not launched yet, and go through -[NSApplication setActivationPolicy:]
+// once it is (any policy may be set at runtime since 10.9).
+// ---------------------------------------------------------------------------
+
+static NSApplicationActivationPolicy gActivationPolicy =
+    NSApplicationActivationPolicyRegular;
+static bool gAppLaunched = false;
+static NSMenu* gDockMenu = nil;  // applicationDockMenu: answer; setDockMenu
+
 static void BInstallAppDelegate();  // the app lifecycle section, below
 
-// The one NSApplication setup, for both faces of the addon: addon.mm's
-// EnsureApp comes here too, so finishLaunching runs exactly once and the
-// delegate it dispatches to is in place for it. Not static for that reason.
 void BEnsureApp() {
-  static bool inited = false;
-  if (inited) return;
+  if (gAppLaunched) return;
   @autoreleasepool {
     [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp setActivationPolicy:gActivationPolicy];
     // A react-x11 window has no tab semantics. Left on, AppKit persists
     // "show tab bar" per process name (under bun the key lives in the `bun`
     // defaults domain) and grows a 28pt bar into the titlebar of every
@@ -90,7 +107,7 @@ void BEnsureApp() {
     BInstallAppDelegate();
     [NSApp finishLaunching];
   }
-  inited = true;
+  gAppLaunched = true;
 }
 
 // The top of the primary screen, for global coordinate flips. The primary
@@ -242,6 +259,12 @@ static void FlushPendingAppEvents(Napi::Env env) {
   if (!HasBackendCb()) return NSTerminateNow;
   EmitAppEvent(PendingAppEvent(AppEventKind::QuitRequest));
   return NSTerminateCancel;
+}
+// The Dock tile's menu (right-click or press-and-hold), asked for on every
+// open; the spec behind it comes from setDockMenu in the menu section.
+- (NSMenu*)applicationDockMenu:(NSApplication*)app {
+  (void)app;
+  return gDockMenu;
 }
 @end
 
@@ -591,16 +614,7 @@ static Napi::Value DestroyWindow2(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-// initApp([options]) — the NSApplication, its activation policy and the app
-// delegate (open-URL / open-file, reopen, quit routing; see the app
-// lifecycle section). Idempotent; every other entry point calls it
-// implicitly, but a renderer that wants the launching URL calls it first
-// thing and installs its callback next, before the first pump. `options`
-// is reserved: nothing is read from it yet.
-static Napi::Value InitApp(const Napi::CallbackInfo& info) {
-  BEnsureApp();
-  return info.Env().Undefined();
-}
+// initApp lives in the app presence section: it takes { activationPolicy }.
 
 static Napi::Value ActivateApp(const Napi::CallbackInfo& info) {
   BEnsureApp();
@@ -804,6 +818,11 @@ static void DispatchEvent2(Napi::Env env, NSEvent* e) {
 static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
   if (info[0].IsFunction()) {
     gBackendCb = Napi::Persistent(info[0].As<Napi::Function>());
+    // A static reference is destructed after the Node environment is gone;
+    // deleting it then is a segfault at exit on Node 18. Replacing or
+    // clearing it (Reset, above and in the move-assign) still frees the old
+    // reference while the environment is alive.
+    gBackendCb.SuppressDestruct();
   } else {
     gBackendCb.Reset();
   }
@@ -1143,6 +1162,7 @@ static NSString* BStrOr(Napi::Object o, const char* k, NSString* d);
 @interface CALMenuTarget : NSObject {
  @public
   napi_env env_;
+  const char* source_;  // "main" | "dock": which menu tree the item is in
 }
 - (void)activate:(NSMenuItem*)sender;
 @end
@@ -1153,20 +1173,31 @@ static NSString* BStrOr(Napi::Object o, const char* k, NSString* d);
   Napi::Object ev = Napi::Object::New(env);
   ev.Set("type", "menu-activate");
   ev.Set("id", (double)sender.tag);
+  // ids are the caller's; the two trees may allocate them independently
+  ev.Set("menu", source_);
   EmitToJS(env, ev);
 }
 @end
 
-static CALMenuTarget* gMenuTarget = nil;
+// One target per menu tree, so an activation says which tree it came from.
+static CALMenuTarget* gMenuTarget = nil;      // NSApp.mainMenu
+static CALMenuTarget* gDockMenuTarget = nil;  // the Dock menu
+static CALMenuTarget* gStatusMenuTarget = nil;  // status-item (tray) menus
 
-static void EnsureMenuTarget(Napi::Env env) {
-  if (!gMenuTarget) gMenuTarget = [CALMenuTarget new];
-  gMenuTarget->env_ = env;
+static CALMenuTarget* MenuTargetFor(Napi::Env env,
+                                    CALMenuTarget* __strong* slot,
+                                    const char* source) {
+  if (!*slot) *slot = [CALMenuTarget new];
+  (*slot)->env_ = env;
+  (*slot)->source_ = source;
+  return *slot;
 }
 
-static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items);
+static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items,
+                             CALMenuTarget* target);
 
-static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o) {
+static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o,
+                                 CALMenuTarget* target) {
   if (BBoolOr(o, "separator", false)) return [NSMenuItem separatorItem];
   NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:BStrOr(o, "title", @"")
                                               action:nil
@@ -1208,20 +1239,21 @@ static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o) {
   if (o.Has("items")) {
     Napi::Value v = o.Get("items");
     if (v.IsArray() && v.As<Napi::Array>().Length() > 0) {
-      NSMenu* sub = BuildMenuFrom(env, v.As<Napi::Array>());
+      NSMenu* sub = BuildMenuFrom(env, v.As<Napi::Array>(), target);
       sub.title = it.title;
       it.submenu = sub;
       hasChildren = true;
     }
   }
   if (!hasChildren) {
-    it.target = gMenuTarget;
+    it.target = target;
     it.action = @selector(activate:);
   }
   return it;
 }
 
-static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items) {
+static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items,
+                             CALMenuTarget* target) {
   NSMenu* m = [[NSMenu alloc] initWithTitle:@""];
   // we own enabled/hidden; AppKit's validation would grey everything whose
   // target it cannot interrogate
@@ -1229,7 +1261,7 @@ static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items) {
   for (uint32_t i = 0; i < items.Length(); i++) {
     Napi::Value v = items.Get(i);
     if (!v.IsObject()) continue;
-    [m addItem:BuildMenuItem(env, v.As<Napi::Object>())];
+    [m addItem:BuildMenuItem(env, v.As<Napi::Object>(), target)];
   }
   return m;
 }
@@ -1239,7 +1271,7 @@ static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items) {
 static Napi::Value SetMainMenuFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
-  EnsureMenuTarget(env);
+  CALMenuTarget* target = MenuTargetFor(env, &gMenuTarget, "main");
   Napi::Array spec = info[0].As<Napi::Array>();
   NSMenu* main = [[NSMenu alloc] initWithTitle:@"MainMenu"];
   main.autoenablesItems = NO;
@@ -1253,7 +1285,7 @@ static Napi::Value SetMainMenuFn(const Napi::CallbackInfo& info) {
                                              keyEquivalent:@""];
     Napi::Value items = m.Get("items");
     NSMenu* sub = items.IsArray()
-                      ? BuildMenuFrom(env, items.As<Napi::Array>())
+                      ? BuildMenuFrom(env, items.As<Napi::Array>(), target)
                       : [[NSMenu alloc] initWithTitle:title];
     sub.autoenablesItems = NO;
     sub.title = title;
@@ -1554,9 +1586,10 @@ static Napi::Value SetStatusItem(const Napi::CallbackInfo& info) {
 }
 
 // setStatusItemMenu(item, items | null) — items in setMainMenu's item
-// vocabulary (title, id, enabled, checked, key, iconName, items, ...).
-// With a menu, a click tracks it and the button's action stays silent;
-// null returns the item to click events.
+// vocabulary (title, id, enabled, checked, key, iconName, items, ...);
+// activations arrive as `menu-activate` with `menu: 'status'`. With a
+// menu, a click tracks it and the button's action stays silent; null
+// returns the item to click events.
 static Napi::Value SetStatusItemMenu(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   NSStatusItem* item = StatusItemFrom(info[0]);
@@ -1564,8 +1597,9 @@ static Napi::Value SetStatusItemMenu(const Napi::CallbackInfo& info) {
   Napi::Value spec = info.Length() > 1 ? info[1] : env.Null();
   @autoreleasepool {
     if (spec.IsArray()) {
-      EnsureMenuTarget(env);
-      item.menu = BuildMenuFrom(env, spec.As<Napi::Array>());
+      CALMenuTarget* target =
+          MenuTargetFor(env, &gStatusMenuTarget, "status");
+      item.menu = BuildMenuFrom(env, spec.As<Napi::Array>(), target);
     } else {
       item.menu = nil;
     }
@@ -1732,6 +1766,268 @@ static Napi::Value SnapshotStatusItem(const Napi::CallbackInfo& info) {
   }
   CGImageRelease(img);
   return Napi::Boolean::New(env, ok);
+}
+
+// setDockMenu(items | null) — the menu behind a right-click (or a press-
+// and-hold) on the Dock tile. `items` is one menu's worth of the item
+// vocabulary setMainMenu takes: {id, title, enabled, hidden, checked,
+// separator, iconName, iconData, items}. Activations arrive as
+// `menu-activate` with `menu: 'dock'`. The Dock asks the delegate for the
+// menu every time it opens it, so a new spec shows on the next click; null
+// removes the menu (the Dock then shows only its own entries).
+static Napi::Value SetDockMenuFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  Napi::Value v = info[0];
+  if (v.IsNull() || v.IsUndefined()) {
+    gDockMenu = nil;
+    return env.Undefined();
+  }
+  if (!v.IsArray()) {
+    Napi::TypeError::New(env, "setDockMenu: expected an array of items or null")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  CALMenuTarget* target = MenuTargetFor(env, &gDockMenuTarget, "dock");
+  gDockMenu = BuildMenuFrom(env, v.As<Napi::Array>(), target);
+  return env.Undefined();
+}
+
+// The menu the Dock would get: through the delegate, so the test exercises
+// the wiring the Dock uses, not the variable behind it.
+static NSMenu* DockMenuViaDelegate() {
+  id<NSApplicationDelegate> d = NSApp.delegate;
+  if (![d respondsToSelector:@selector(applicationDockMenu:)]) return nil;
+  return [d applicationDockMenu:NSApp];
+}
+
+// dockMenuInfo() — the installed Dock menu as data (null when none). Tests.
+static Napi::Value DockMenuInfoFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  NSMenu* m = DockMenuViaDelegate();
+  if (!m) return env.Null();
+  return MenuInfo(env, m);
+}
+
+// activateDockMenuItem([i, j, ...]) — through the Dock menu.
+static Napi::Value ActivateDockMenuItemFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  if (!info[0].IsArray()) return Napi::Boolean::New(env, false);
+  return Napi::Boolean::New(
+      env, ActivateInMenu(DockMenuViaDelegate(), info[0].As<Napi::Array>()));
+}
+
+// ---------------------------------------------------------------------------
+// app presence: what the user sees of the process outside its windows — the
+// Dock tile (badge, bounce, menu, whether there is one) and the name the
+// Dock, the ⌘-Tab switcher and the menu bar print for it. Mechanism only:
+// the counts, the reasons and the timing are the renderer's.
+// ---------------------------------------------------------------------------
+
+static bool PolicyFromName(const std::string& s,
+                           NSApplicationActivationPolicy* out) {
+  if (s == "regular") *out = NSApplicationActivationPolicyRegular;
+  else if (s == "accessory") *out = NSApplicationActivationPolicyAccessory;
+  else if (s == "prohibited") *out = NSApplicationActivationPolicyProhibited;
+  else return false;
+  return true;
+}
+
+static const char* PolicyName(NSApplicationActivationPolicy p) {
+  switch (p) {
+    case NSApplicationActivationPolicyRegular: return "regular";
+    case NSApplicationActivationPolicyAccessory: return "accessory";
+    case NSApplicationActivationPolicyProhibited: return "prohibited";
+  }
+  return "regular";
+}
+
+// Before launch the policy is what the app launches with (no Dock tile ever
+// registers for an agent); after launch it is a live switch.
+static bool ApplyActivationPolicy(NSApplicationActivationPolicy p) {
+  if (!gAppLaunched) {
+    gActivationPolicy = p;
+    BEnsureApp();
+    return true;
+  }
+  return [NSApp setActivationPolicy:p];
+}
+
+// Reads `activationPolicy` off an options object; throws on an unknown name.
+// Returns false when it threw.
+static bool ApplyPolicyOption(Napi::Env env, Napi::Value v) {
+  if (v.IsUndefined() || v.IsNull()) return true;
+  NSApplicationActivationPolicy p;
+  if (!v.IsString() || !PolicyFromName(v.As<Napi::String>().Utf8Value(), &p)) {
+    Napi::RangeError::New(
+        env, "activationPolicy: expected 'regular' | 'accessory' | 'prohibited'")
+        .ThrowAsJavaScriptException();
+    return false;
+  }
+  ApplyActivationPolicy(p);
+  return true;
+}
+
+// initApp({ activationPolicy? }) — the NSApplication, its activation policy
+// and the app delegate (open-URL / open-file, reopen, quit and Dock-menu
+// routing; see the app lifecycle section). Idempotent; every other entry
+// point calls it implicitly, but a renderer that wants the launching URL
+// calls it first thing and installs its callback next, before the first
+// pump. The policy option is honoured on any call: before launch it decides
+// how the app launches, afterwards it switches live.
+static Napi::Value InitAppFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() > 0 && info[0].IsObject()) {
+    Napi::Object o = info[0].As<Napi::Object>();
+    if (!ApplyPolicyOption(env, o.Get("activationPolicy"))) return env.Undefined();
+  }
+  BEnsureApp();
+  return env.Undefined();
+}
+
+// setActivationPolicy('regular' | 'accessory' | 'prohibited') -> bool
+// 'regular': Dock tile, menu bar, ⌘-Tab entry. 'accessory': none of those,
+// windows still work (LSUIElement — menu-bar and agent apps). 'prohibited':
+// no UI at all. Returns what AppKit answers (true on every supported macOS).
+static Napi::Value SetActivationPolicyFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NSApplicationActivationPolicy p;
+  if (!info[0].IsString() ||
+      !PolicyFromName(info[0].As<Napi::String>().Utf8Value(), &p)) {
+    Napi::RangeError::New(
+        env, "setActivationPolicy: expected 'regular' | 'accessory' | 'prohibited'")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  return Napi::Boolean::New(env, ApplyActivationPolicy(p));
+}
+
+// setDockBadge(label | null) — NSDockTile.badgeLabel: the red pill on the
+// Dock tile (an unread count, usually). A number is stringified; null or
+// undefined clears. Shows only while the tile exists (policy 'regular').
+static Napi::Value SetDockBadgeFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  Napi::Value v = info[0];
+  if (v.IsNull() || v.IsUndefined()) {
+    NSApp.dockTile.badgeLabel = nil;
+  } else if (v.IsString() || v.IsNumber()) {
+    NSApp.dockTile.badgeLabel = BToNSString(v.ToString());
+  } else {
+    Napi::TypeError::New(env, "setDockBadge: expected a string, a number or null")
+        .ThrowAsJavaScriptException();
+  }
+  return env.Undefined();
+}
+
+// requestUserAttention('informational' | 'critical') -> requestId
+// The Dock bounce, _NET_WM_STATE_DEMANDS_ATTENTION's counterpart:
+// 'informational' bounces once, 'critical' keeps bouncing until the app is
+// activated. AppKit ignores the request while the app is active (the id it
+// returns then is still safe to cancel; appInfo().active says which case a
+// caller is in). Anything else as the type is a RangeError.
+static Napi::Value RequestUserAttentionFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  NSRequestUserAttentionType type;
+  std::string s = info[0].IsString() ? info[0].As<Napi::String>().Utf8Value() : "";
+  if (s == "informational") type = NSInformationalRequest;
+  else if (s == "critical") type = NSCriticalRequest;
+  else {
+    Napi::RangeError::New(
+        env, "requestUserAttention: expected 'informational' | 'critical'")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  return Napi::Number::New(env, (double)[NSApp requestUserAttention:type]);
+}
+
+// cancelUserAttention(requestId) — stop a bounce early (the message was
+// read some other way); a request that already ended is a no-op.
+static Napi::Value CancelUserAttentionFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsNumber()) {
+    Napi::TypeError::New(env, "cancelUserAttention: expected the request id")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  BEnsureApp();
+  [NSApp cancelUserAttentionRequest:(NSInteger)info[0].As<Napi::Number>().Int64Value()];
+  return env.Undefined();
+}
+
+// setAppName(name) -> bool — the name the Dock tile, the ⌘-Tab switcher,
+// Force Quit and the application menu print for this process.
+//
+// A bundled app gets that name from its Info.plist and keeps it: when the
+// main bundle declares CFBundleName or CFBundleDisplayName this is a no-op
+// answering false. An unbundled process (`node`, `bun`) is registered with
+// LaunchServices under its executable name, and the only way to change that
+// record from inside is the private LaunchServices call WebKit, Chromium
+// and the JDK's -Xdock:name use: _LSSetApplicationInformationItem with
+// _kLSDisplayNameKey on the process's own ASN. It is looked up at runtime,
+// so a macOS that drops it makes this answer false rather than fail to
+// load. NSRunningApplication.localizedName reads the same record back
+// (appInfo().name).
+typedef CFTypeRef (*CALLSGetCurrentApplicationASN)(void);
+typedef OSStatus (*CALLSSetApplicationInformationItem)(int, CFTypeRef,
+                                                       CFStringRef, CFStringRef,
+                                                       CFDictionaryRef*);
+
+static bool BundleDeclaresName() {
+  NSBundle* b = [NSBundle mainBundle];
+  return [b objectForInfoDictionaryKey:@"CFBundleDisplayName"] != nil ||
+         [b objectForInfoDictionaryKey:@"CFBundleName"] != nil;
+}
+
+static bool SetLaunchServicesDisplayName(NSString* name) {
+  void* h = dlopen(
+      "/System/Library/Frameworks/CoreServices.framework/CoreServices",
+      RTLD_LAZY);
+  if (!h) return false;
+  auto getASN = (CALLSGetCurrentApplicationASN)dlsym(
+      h, "_LSGetCurrentApplicationASN");
+  auto setItem = (CALLSSetApplicationInformationItem)dlsym(
+      h, "_LSSetApplicationInformationItem");
+  auto key = (CFStringRef*)dlsym(h, "_kLSDisplayNameKey");
+  if (!getASN || !setItem || !key || !*key) return false;
+  CFTypeRef asn = getASN();
+  if (!asn) return false;
+  // -2: the "current session" LSSessionID WebKit passes here
+  return setItem(-2, asn, *key, (__bridge CFStringRef)name, NULL) == noErr;
+}
+
+static Napi::Value SetAppNameFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsString()) {
+    Napi::TypeError::New(env, "setAppName: expected a string")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  BEnsureApp();
+  if (BundleDeclaresName()) return Napi::Boolean::New(env, false);
+  return Napi::Boolean::New(env,
+                            SetLaunchServicesDisplayName(BToNSString(info[0])));
+}
+
+// appInfo() -> { activationPolicy, name, dockBadge, active } — the presence
+// state read back from AppKit and LaunchServices, for tests and for a
+// renderer deciding whether a bounce would even be seen.
+static Napi::Value AppInfoFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  BEnsureApp();
+  Napi::Object r = Napi::Object::New(env);
+  r.Set("activationPolicy", PolicyName(NSApp.activationPolicy));
+  NSString* name = NSRunningApplication.currentApplication.localizedName;
+  if (name) r.Set("name", name.UTF8String);
+  else r.Set("name", env.Null());
+  NSString* badge = NSApp.dockTile.badgeLabel;
+  if (badge.length) r.Set("dockBadge", badge.UTF8String);
+  else r.Set("dockBadge", env.Null());
+  r.Set("active", (bool)NSApp.isActive);
+  return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -4590,7 +4886,6 @@ static Napi::Value PasteboardTypeInfo(const Napi::CallbackInfo& info) {
 
 void InitBackend(Napi::Env env, Napi::Object exports) {
 #define BFN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
-  BFN("initApp", InitApp);
   BFN("createWindow2", CreateWindow2);
   BFN("showWindow", ShowWindowFn);
   BFN("hideWindow", HideWindowFn);
@@ -4687,6 +4982,16 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("savePanel", SavePanelFn);
   BFN("cancelPanel", CancelPanelFn);
   BFN("contentTypeFor", ContentTypeForFn);
+  BFN("setDockMenu", SetDockMenuFn);
+  BFN("dockMenuInfo", DockMenuInfoFn);
+  BFN("activateDockMenuItem", ActivateDockMenuItemFn);
+  BFN("initApp", InitAppFn);
+  BFN("setActivationPolicy", SetActivationPolicyFn);
+  BFN("setDockBadge", SetDockBadgeFn);
+  BFN("requestUserAttention", RequestUserAttentionFn);
+  BFN("cancelUserAttention", CancelUserAttentionFn);
+  BFN("setAppName", SetAppNameFn);
+  BFN("appInfo", AppInfoFn);
   BFN("measureControl", MeasureControl);
   BFN("drawControlIntoSurface", DrawControlIntoSurface);
   BFN("listScreens", ListScreens);

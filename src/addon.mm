@@ -247,6 +247,7 @@ static Napi::Value PostMouseEvent(const Napi::CallbackInfo& info) {
 static Napi::Value SetEventCallback(const Napi::CallbackInfo& info) {
   if (info[0].IsFunction()) {
     gEventCb = Napi::Persistent(info[0].As<Napi::Function>());
+    gEventCb.SuppressDestruct();  // static: outlives the env, see backend.mm
   } else {
     gEventCb.Reset();
   }

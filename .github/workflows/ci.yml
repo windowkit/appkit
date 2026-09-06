@@ -85,6 +85,21 @@ jobs:
               let err; try { bad(); } catch (e) { err = e; }
               if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
             }
+            // app presence (#15): badge and policy read back, a dock menu round-trips through the
+            // delegate the Dock calls and its activation arrives tagged menu:'dock', attention ids cancel
+            n.initApp();
+            const infoA = n.appInfo();
+            if (infoA.activationPolicy !== 'regular' || infoA.dockBadge !== null) { console.error('appInfo', infoA); process.exit(1); }
+            n.setDockBadge(3); if (n.appInfo().dockBadge !== '3') { console.error('dock badge'); process.exit(1); }
+            n.setDockBadge(null); if (n.appInfo().dockBadge !== null) { console.error('dock badge clear'); process.exit(1); }
+            let menuEv = null; n.setBackendEventCallback((ev) => { if (ev.type === 'menu-activate') menuEv = ev; });
+            n.setDockMenu([{ id: 7, title: 'Open' }, { separator: true }, { id: 8, title: 'More', items: [{ id: 9, title: 'Deep' }] }]);
+            const dm = n.dockMenuInfo();
+            if (!dm || dm.items.length !== 3 || dm.items[2].submenu.items[0].id !== 9) { console.error('dockMenuInfo', JSON.stringify(dm)); process.exit(1); }
+            if (!n.activateDockMenuItem([2, 0]) || !menuEv || menuEv.id !== 9 || menuEv.menu !== 'dock') { console.error('dock activation', menuEv); process.exit(1); }
+            n.setDockMenu(null); if (n.dockMenuInfo() !== null) { console.error('dock menu clear'); process.exit(1); }
+            const rid = n.requestUserAttention('informational'); if (typeof rid !== 'number') { console.error('attention id', rid); process.exit(1); } n.cancelUserAttention(rid);
+            console.log('setAppName ->', n.setAppName('appkit-ci'), n.appInfo().name);
             // the menu-bar extra: an item with a symbol and a title; its menu in setMainMenu's vocabulary,
             // fired by index path; without a menu, real clicks posted into its window come back as events
             // carrying the same handle; an in-place patch; removal

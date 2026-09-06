@@ -182,9 +182,19 @@ be additive; for that there is `presentationValue`.
 value the render server is showing for that key path right now, animations applied: a
 number, a point or size as `[x, y]`, a rect as `[x, y, w, h]`, a colour as `[r, g, b, a]`, a
 transform as its sixteen components; `null` before the layer's first commit. A colour comes
-back in generic RGB, the space it went in, so it can be handed straight back as a `from` —
+back in sRGB, the space it went in, so it can be handed straight back as a `from` —
 but CA interpolates in the display's space, so the components' midpoint there is not this
-space's midpoint. `speed: 0, timeOffset: t` plus a read is how a curve is sampled without
+space's midpoint.
+
+**`native.colorSpace()`** — `'sRGB'`: the space every colour crossing this bridge is in —
+a layer's `backgroundColor`, `borderColor` and `shadowColor`, a shape's fill and stroke,
+a gradient's stops, an animation's `from`/`to`, a presentation value, a text span's ink
+and the surfaces `createSurface` makes. One space, so a colour set on a layer and the
+same colour rastered into a surface composite to the same pixels. (Before 0.6 the layer
+half was Generic RGB, which the compositor converts on its way to the display: `#dbe7f4`
+on a layer showed as (228, 236, 245) beside a surface's (219, 231, 244), and a colour
+animation landed on a model value that did not match its own `to`. A caller that draws
+both ways — react-x11's layer promotion — feature-detects the verb.) `speed: 0, timeOffset: t` plus a read is how a curve is sampled without
 waiting for it, which is how `test/animation.js` checks every curve above.
 
 **The end of an animation.** With an `id`, the animation's delegate forwards

@@ -44,13 +44,29 @@ static NSString* StrOr(Napi::Object o, const char* k, NSString* d) {
 }
 
 // [r,g,b] or [r,g,b,a], components 0..1 — caller owns the returned color.
+//
+// sRGB, like every other colour this bridge makes: the surfaces
+// (createSurface, backend.mm), a text span's ink, an animation's from/to
+// (BMakeColor). This one used to be Generic RGB, which the compositor
+// converts on its way to the display, so a layer's backgroundColor came out
+// paler than the same colour rastered into a surface — #dbe7f4 showed as
+// (228, 236, 245) beside a bitmap's (219, 231, 244) — and a colour animation
+// landed on a model value that did not match its own `to`. One space
+// everywhere, and `colorSpace()` says so.
 static CGColorRef MakeColor(Napi::Value v) {
   Napi::Array a = v.As<Napi::Array>();
   double r = a.Get(0u).As<Napi::Number>().DoubleValue();
   double g = a.Get(1u).As<Napi::Number>().DoubleValue();
   double b = a.Get(2u).As<Napi::Number>().DoubleValue();
   double al = a.Length() > 3 ? a.Get(3u).As<Napi::Number>().DoubleValue() : 1.0;
-  return CGColorCreateGenericRGB(r, g, b, al);
+  return CGColorCreateSRGB(r, g, b, al);
+}
+
+// The colour space every colour crossing this bridge is in — layer
+// properties, animation values, presentation values, surfaces. A caller
+// that rasters in sRGB can feature-detect that a layer colour will match.
+static Napi::Value ColorSpace(const Napi::CallbackInfo& info) {
+  return Napi::String::New(info.Env(), "sRGB");
 }
 
 static CGPoint PointFrom(Napi::Value v) {
@@ -863,7 +879,9 @@ static Napi::Value JSFromCAValue(Napi::Env env, id v) {
   }
   if (CFGetTypeID((__bridge CFTypeRef)v) == CGColorGetTypeID()) {
     CGColorRef c = (__bridge CGColorRef)v;
-    CGColorSpaceRef rgb = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB);
+    // read back in the space colours go in by (MakeColor), so a value that
+    // went out comes back as the same numbers
+    CGColorSpaceRef rgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGColorRef conv = CGColorCreateCopyByMatchingToColorSpace(rgb, kCGRenderingIntentDefault, c, NULL);
     CGColorSpaceRelease(rgb);
     CGColorRef src = conv ? conv : c;
@@ -960,7 +978,7 @@ static NSAttributedString* AttrString(Napi::Object o, CGColorRef* outColor) {
   NSString* fontName = StrOr(o, "fontName", @"Helvetica");
   double fontSize = NumOr(o, "fontSize", 14);
   CGColorRef color = o.Has("color") ? MakeColor(o.Get("color"))
-                                    : CGColorCreateGenericRGB(0, 0, 0, 1);
+                                    : CGColorCreateSRGB(0, 0, 0, 1);
   CTFontRef font = CTFontCreateWithName((__bridge CFStringRef)fontName, fontSize, NULL);
   NSDictionary* attrs = @{
     (__bridge id)kCTFontAttributeName : (__bridge id)font,
@@ -1295,6 +1313,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   FN("txBegin", TxBegin);
   FN("txCommit", TxCommit);
   FN("presentationValue", PresentationValue);
+  FN("colorSpace", ColorSpace);
   FN("hitTest", HitTest);
   FN("measureText", MeasureText);
   FN("createTextImage", CreateTextImage);

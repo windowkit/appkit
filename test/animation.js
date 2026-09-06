@@ -151,10 +151,12 @@ function throwsType(fn, what) {
   // 7. value types round-trip: a point, a colour, a transform component
   const pos = sample(layer, 'position', { from: [0, 0], to: [100, 50], duration: 1, timing: 'linear' }, 0.5);
   if (!Array.isArray(pos) || !near(pos[0], 50, 0.5) || !near(pos[1], 25, 0.5)) fail('position at 0.5', pos);
-  // A colour comes back in the space it went in (generic RGB), so it can be
-  // handed straight back as a `from`. CA interpolates in the display's space,
-  // where the components' midpoint is not this space's midpoint — so the
-  // check is that the mix is between its ends, not where exactly.
+  // A colour comes back in the space it went in — sRGB, like every colour
+  // this bridge makes, which `colorSpace()` says — so it can be handed
+  // straight back as a `from`. CA interpolates in the display's space, where
+  // the components' midpoint is not this space's midpoint — so the check is
+  // that the mix is between its ends, not where exactly.
+  if (native.colorSpace() !== 'sRGB') fail('colorSpace', native.colorSpace());
   const color = sample(layer, 'backgroundColor', { from: [1, 0, 0, 1], to: [0, 0, 1, 1], duration: 1, timing: 'linear' }, 0.5);
   if (!Array.isArray(color) || color.length !== 4 || !(color[0] > 0.2 && color[0] < 0.8 && color[2] > 0.2 && color[2] < 0.8) || !near(color[3], 1, 0.01)) fail('backgroundColor at 0.5', color);
   const same = sample(layer, 'backgroundColor', { from: [0.2, 0.6, 0.9, 0.5], to: [0.2, 0.6, 0.9, 0.5], duration: 1 }, 0.5);

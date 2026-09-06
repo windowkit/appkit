@@ -74,12 +74,20 @@ class Layer {
     }
   }
 
-  // Explicit CABasicAnimation on any animatable keyPath, e.g.
-  // 'transform.rotation.z', 'position', 'opacity', 'strokeEnd', 'backgroundColor'.
+  // Explicit animation on any animatable keyPath, e.g. 'transform.rotation.z',
+  // 'position', 'opacity', 'strokeEnd', 'backgroundColor': a CABasicAnimation
+  // ({ from, to }), a CAKeyframeAnimation ({ values }) or a CASpringAnimation
+  // ({ spring }) — README "Animations" lists the options. Returns the layer;
+  // native.addAnimation returns the duration the animation will take (a
+  // spring's settling time).
   animate(keyPath, opts = {}, key = keyPath) {
     native.addAnimation(this._h, keyPath, opts, key);
     return this;
   }
+
+  // The value the render server is showing for a key path right now,
+  // animations applied — null before the layer's first commit.
+  presentationValue(keyPath) { return native.presentationValue(this._h, keyPath); }
 
   removeAnimation(key) { native.removeAnimation(this._h, key); }
   removeAllAnimations() { native.removeAllAnimations(this._h); }
@@ -130,7 +138,8 @@ class Window {
   snapshot(file) { return native.snapshotWindow(this._h, file); } // renderInContext -> PNG
 }
 
-// Group property changes into one CATransaction (shared animation duration/timing).
+// Group property changes into one CATransaction (shared animation duration and
+// timing — a curve name or cubic-bezier control points [x1, y1, x2, y2]).
 function transaction(fn, opts = {}) {
   native.txBegin(opts);
   try { fn(); } finally { native.txCommit(); }

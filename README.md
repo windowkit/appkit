@@ -83,9 +83,12 @@ transaction(() => card.set({ position: [400, 300] }),
 // no animation (e.g. initial tree construction, reconciler commits)
 withoutAnimations(() => card.set({ opacity: 0.5 }));
 
-// explicit animation on any animatable keyPath
+// explicit animation on any animatable keyPath — from/to, keyframes ('values') or a
+// spring ('spring'); a curve by name or by control points; see "Animations"
 card.animate('transform.rotation.z',
              { from: 0, to: Math.PI * 2, duration: 1, repeat: Infinity, timing: 'linear' });
+card.animate('transform.translation.y',
+             { values: [0, -6, 6, -6, 0], duration: 0.3, timing: [0.33, 1, 0.68, 1], id: 'shake' });
 
 // text, two ways
 const label = new TextLayer();
@@ -118,6 +121,83 @@ app.run({ onTick: () => { if (!win.visible) process.exit(0); } });
 
 win.snapshot('/tmp/out.png'); // real composited pixels of the window
 ```
+
+## Animations
+
+Core Animation runs an animation in the render server: the pump's cadence and a busy JS
+thread do not touch it. The verbs here are shaped for a renderer that keeps its own model
+of what is animating and hands over only the pixels — the layer's model value set under
+`disableActions`, an explicit animation carrying the presentation from where it was to
+where the model now is (react-x11's
+[animation design](https://github.com/sidorares/react-x11/blob/master/docs/architecture/animation.md),
+[#29](https://github.com/windowkit/appkit/issues/29)).
+
+```js
+// the model goes straight to its target, with no implicit animation…
+withoutAnimations(() => card.set({ opacity: 1 }));
+// …and an explicit one carries the pixels there
+card.animate('opacity', { from: 0, to: 1, duration: 0.2, timing: [0.33, 1, 0.68, 1], id: 'fade' });
+// native.addAnimation(layer, keyPath, opts, key) is the same call, and returns the
+// duration in seconds — a spring's settling time
+```
+
+Three kinds, told apart by which option is present:
+
+| options                                                  | animation             |                                                                                                   |
+| -------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------- |
+| `{ from, to, duration }`                                 | `CABasicAnimation`    | `duration` defaults to 0.25s                                                                      |
+| `{ values, keyTimes?, timings?, calculationMode? }`      | `CAKeyframeAnimation` | `keyTimes` one per value in 0..1, never decreasing (evenly spaced when omitted); `timings` one curve per segment; `calculationMode` `linear` (default), `discrete`, `paced`, `cubic`, `cubicPaced` |
+| `{ spring: { mass, stiffness, damping, initialVelocity } \| true, from, to }` | `CASpringAnimation` | CA's defaults for what is omitted (`true` is all of them); the duration is the settling time unless a `duration` cuts it short |
+
+A value — `from`, `to`, an entry of `values` — is a number, a point `[x, y]`, or a colour
+`[r, g, b, a]` in generic RGB like every colour in this API.
+
+Options every kind takes:
+
+| option        |                                                                                                                                                          |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timing`      | a curve name — `linear`, `easeIn`, `easeOut`, `easeInEaseOut`, `default`, or their CSS spellings `ease-in`, `ease-out`, `ease-in-out`, `ease` — or cubic-bezier control points `[x1, y1, x2, y2]`. An unknown name is a `TypeError` |
+| `repeat`      | a count, or `Infinity`                                                                                                                                   |
+| `autoreverse` | turn around at the end of each pass                                                                                                                      |
+| `additive`    | the values are deltas over the model value, and several in flight on one key path sum                                                                    |
+| `cumulative`  | each repetition starts where the last ended                                                                                                              |
+| `delay`       | seconds before it starts; the layer shows `from` while it waits (`fillMode: backwards`)                                                                  |
+| `speed`, `timeOffset` | `CAMediaTiming`'s; `speed: 0` with a `timeOffset` is an animation paused at that time                                                             |
+| `hold`        | keep the final value on screen after the end (`removedOnCompletion: NO`, `fillMode: forwards`) — the model value stays what it was                        |
+| `id`          | report the end as a backend event (below)                                                                                                                |
+
+Control points rather than names are what a renderer with its own interpolator needs: the
+same four numbers evaluate to the same curve on its side and in the render server, where a
+name means whatever each side thinks it means — react-x11's ease-out is
+cubic-bezier(0.33, 1, 0.68, 1), and CA's named `easeOut` is (0, 0, 0.58, 1), a fifth of the
+range apart at t = 0.35. `transaction(fn, { duration, timing })` takes the same forms.
+
+**Retargeting without reading back.** Set the model to the new target and add an additive
+animation `from: old − new, to: 0`: the pixels carry on from wherever the previous animation
+had got to, because the previous one is still running and the two sum. That covers every
+numeric key path (`opacity`, `position`, `transform.*`, `cornerRadius`, …). A colour cannot
+be additive; for that there is `presentationValue`.
+
+**`native.presentationValue(layer, keyPath)`** (`layer.presentationValue(keyPath)`) — the
+value the render server is showing for that key path right now, animations applied: a
+number, a point or size as `[x, y]`, a rect as `[x, y, w, h]`, a colour as `[r, g, b, a]`, a
+transform as its sixteen components; `null` before the layer's first commit. A colour comes
+back in generic RGB, the space it went in, so it can be handed straight back as a `from` —
+but CA interpolates in the display's space, so the components' midpoint there is not this
+space's midpoint. `speed: 0, timeOffset: t` plus a read is how a curve is sampled without
+waiting for it, which is how `test/animation.js` checks every curve above.
+
+**The end of an animation.** With an `id`, the animation's delegate forwards
+`animationDidStop:finished:` through `setBackendEventCallback` as
+
+```js
+{ type: 'animation-end', id, key, keyPath, finished }
+```
+
+`finished` is `false` for an animation that was removed (`removeAnimation`,
+`removeAllAnimations`) or whose layer left the tree before it ran out. It arrives inside a
+`pump2()`, like a window delegate's events. Without an `id` no delegate is set and nothing is
+reported.
 
 ## Native controls
 

@@ -515,7 +515,31 @@ static Napi::Value SetShapeProps(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 // animations & transactions
 // ---------------------------------------------------------------------------
+//
+// Mechanism for a renderer that keeps its own model of what is animating
+// (react-x11's transitions and loops, windowkit/appkit#29): the layer's
+// model value is set under disableActions and an explicit animation carries
+// the pixels from `from` to `to` — or through `values` — while the render
+// server interpolates. Beyond CA's own vocabulary, four things let a
+// renderer's timing model stay the truth about an animation it no longer
+// ticks: a curve given as control points, which the renderer can evaluate
+// identically on its side (a name means whatever each side thinks it
+// means); an additive animation, so a retarget carries on from wherever the
+// last one got to with nothing read back; a delay that shows `from` while it
+// waits; and the presentation value plus the completion event, which say
+// where an animation is and when it stopped.
 
+// backend.mm's event callback, for the completion event.
+bool CALHasBackendCb();
+void CALEmitBackendEvent(Napi::Env env, Napi::Object ev);
+
+static bool ThrowType(Napi::Env env, const char* msg) {
+  Napi::TypeError::New(env, msg).ThrowAsJavaScriptException();
+  return false;
+}
+
+// A number, a point [x, y] or a colour [r, g, b(, a)] — the value types a key
+// path takes here. nil for anything else, which the caller reports.
 static id AnimValue(Napi::Value v) {
   if (v.IsNumber()) return @(v.As<Napi::Number>().DoubleValue());
   if (v.IsArray()) {
@@ -529,35 +553,271 @@ static id AnimValue(Napi::Value v) {
   return nil;
 }
 
-static CAMediaTimingFunction* TimingFn(NSString* name) {
-  if ([name isEqualToString:@"linear"]) return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
-  if ([name isEqualToString:@"easeIn"]) return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
-  if ([name isEqualToString:@"easeOut"]) return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-  if ([name isEqualToString:@"easeInEaseOut"]) return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-  return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionDefault];
+// A timing function: one of CA's names (their CSS spellings are accepted
+// too — they are the same four curves), or the control points of a cubic
+// bezier. nil with a TypeError pending for anything else: an animation on
+// the wrong curve is the kind of bug nobody files, they just think the app
+// feels off.
+static CAMediaTimingFunction* TimingFrom(Napi::Env env, Napi::Value v) {
+  if (v.IsString()) {
+    NSString* name = ToNSString(v);
+    if ([name isEqualToString:@"linear"])
+      return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    if ([name isEqualToString:@"easeIn"] || [name isEqualToString:@"ease-in"])
+      return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
+    if ([name isEqualToString:@"easeOut"] || [name isEqualToString:@"ease-out"])
+      return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    if ([name isEqualToString:@"easeInEaseOut"] || [name isEqualToString:@"ease-in-out"])
+      return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    if ([name isEqualToString:@"default"] || [name isEqualToString:@"ease"])
+      return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionDefault];
+    ThrowType(env, "timing: expected linear, easeIn, easeOut, easeInEaseOut, default "
+                   "(or the CSS spellings) or control points [x1, y1, x2, y2]");
+    return nil;
+  }
+  if (v.IsArray()) {
+    Napi::Array a = v.As<Napi::Array>();
+    float p[4] = {0, 0, 0, 0};
+    bool ok = a.Length() == 4;
+    for (uint32_t i = 0; ok && i < 4; i++) {
+      Napi::Value e = a.Get(i);
+      ok = e.IsNumber() && std::isfinite(e.As<Napi::Number>().DoubleValue());
+      if (ok) p[i] = (float)e.As<Napi::Number>().DoubleValue();
+    }
+    // x is time: it has to stay inside the unit interval for the curve to be
+    // a function of it. y may overshoot — that is what a back-out curve is.
+    if (ok) ok = p[0] >= 0 && p[0] <= 1 && p[2] >= 0 && p[2] <= 1;
+    if (!ok) {
+      ThrowType(env, "timing: control points are [x1, y1, x2, y2], finite, with x1 and x2 in 0..1");
+      return nil;
+    }
+    return [CAMediaTimingFunction functionWithControlPoints:p[0]:p[1]:p[2]:p[3]];
+  }
+  ThrowType(env, "timing: expected a curve name or control points [x1, y1, x2, y2]");
+  return nil;
 }
 
-// addAnimation(layer, keyPath, opts, key)
+// The completion event. A delegate is set only when the caller passes an
+// `id`, so an animation nobody wants to hear about costs nothing; CAAnimation
+// holds its delegate strongly, so this lives exactly as long as the animation.
+// animationDidStop: arrives on the main thread from the run loop the pump
+// drives — inside pump2(), like a window delegate's methods — so it calls
+// into JS directly. `finished` is NO for an animation that was removed, or
+// whose layer left the tree, before it ran out.
+@interface CALAnimationDelegate : NSObject <CAAnimationDelegate>
+@property(nonatomic, assign) napi_env env;
+@property(nonatomic, copy) NSString* animId;
+@property(nonatomic, copy) NSString* key;
+@property(nonatomic, copy) NSString* keyPath;
+@end
+
+@implementation CALAnimationDelegate
+- (void)animationDidStop:(CAAnimation*)anim finished:(BOOL)flag {
+  if (!CALHasBackendCb()) return;
+  Napi::Env env(self.env);
+  Napi::HandleScope scope(env);
+  Napi::Object ev = Napi::Object::New(env);
+  ev.Set("type", "animation-end");
+  ev.Set("id", self.animId.UTF8String);
+  ev.Set("key", self.key.UTF8String);
+  ev.Set("keyPath", self.keyPath.UTF8String);
+  ev.Set("finished", Napi::Boolean::New(env, flag));
+  CALEmitBackendEvent(env, ev);
+}
+@end
+
+// What every animation kind shares: repetition, the curve, additive, a
+// delay, speed/timeOffset, hold, and the completion delegate. false with a
+// TypeError pending.
+static bool ApplyTiming(Napi::Env env, CAPropertyAnimation* a, CALayer* L, Napi::Object o,
+                        NSString* key) {
+  double rep = NumOr(o, "repeat", 0);
+  if (rep > 0) a.repeatCount = std::isinf(rep) ? HUGE_VALF : (float)rep;
+  a.autoreverses = BoolOr(o, "autoreverse", false);
+  if (o.Has("timing")) {
+    CAMediaTimingFunction* fn = TimingFrom(env, o.Get("timing"));
+    if (!fn) return false;
+    a.timingFunction = fn;
+  }
+  // Additive: the animation's values are deltas over the model value, and
+  // several in flight on one key path sum. That is how a retarget stays
+  // continuous — the model goes straight to the new target, the animation
+  // runs (old − new) → 0 — and why nothing has to be read back for it.
+  a.additive = BoolOr(o, "additive", false);
+  a.cumulative = BoolOr(o, "cumulative", false);
+  // speed 0 with a timeOffset is an animation paused at that time: how a
+  // caller pauses one, and how a test samples a curve without waiting for it
+  if (o.Has("speed")) a.speed = (float)NumOr(o, "speed", 1);
+  if (o.Has("timeOffset")) a.timeOffset = NumOr(o, "timeOffset", 0);
+  bool hold = BoolOr(o, "hold", false);
+  double delay = NumOr(o, "delay", 0);
+  if (delay > 0) {
+    // in the layer's own time — the media time unless the layer itself has
+    // been slowed or offset
+    a.beginTime = [L convertTime:CACurrentMediaTime() fromLayer:nil] + delay;
+    // and the layer shows `from` while it waits, rather than the model value
+    // it is about to leave and then snap back from
+    a.fillMode = hold ? kCAFillModeBoth : kCAFillModeBackwards;
+  }
+  if (hold) {
+    a.removedOnCompletion = NO;
+    if (delay <= 0) a.fillMode = kCAFillModeForwards;
+  }
+  if (o.Has("id")) {
+    Napi::Value idv = o.Get("id");
+    if (!idv.IsString()) return ThrowType(env, "id: expected a string");
+    CALAnimationDelegate* d = [CALAnimationDelegate new];
+    d.env = env;
+    d.animId = ToNSString(idv);
+    d.key = key;
+    d.keyPath = a.keyPath;
+    a.delegate = d;
+  }
+  return true;
+}
+
+static bool ReadFromTo(Napi::Env env, CABasicAnimation* a, Napi::Object o) {
+  if (o.Has("from")) {
+    id v = AnimValue(o.Get("from"));
+    if (!v) return ThrowType(env, "from: expected a number, [x, y] or [r, g, b, a]");
+    a.fromValue = v;
+  }
+  if (o.Has("to")) {
+    id v = AnimValue(o.Get("to"));
+    if (!v) return ThrowType(env, "to: expected a number, [x, y] or [r, g, b, a]");
+    a.toValue = v;
+  }
+  return true;
+}
+
+// addAnimation(layer, keyPath, opts, key) -> the animation's duration in
+// seconds, which for a spring is its settling time — the number a caller
+// needs to know when the animation is over.
+//
+//   { from, to, duration }                              CABasicAnimation
+//   { values, keyTimes?, timings?, calculationMode? }   CAKeyframeAnimation
+//   { spring: { mass, stiffness, damping, initialVelocity } | true, from, to }
+//                                                       CASpringAnimation
+// plus, for any of them: repeat, autoreverse, timing (a name or control
+// points), additive, cumulative, delay, speed, timeOffset, hold, and id —
+// with an id the animation reports its end as an `animation-end` backend
+// event { id, key, keyPath, finished }.
 static Napi::Value AddAnimation(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
   CALayer* L = Deref<CALayer*>(info[0]);
   NSString* keyPath = ToNSString(info[1]);
   Napi::Object o = info[2].As<Napi::Object>();
   NSString* key = info.Length() > 3 && info[3].IsString() ? ToNSString(info[3]) : keyPath;
 
-  CABasicAnimation* a = [CABasicAnimation animationWithKeyPath:keyPath];
-  if (o.Has("from")) a.fromValue = AnimValue(o.Get("from"));
-  if (o.Has("to")) a.toValue = AnimValue(o.Get("to"));
-  a.duration = NumOr(o, "duration", 0.25);
-  double rep = NumOr(o, "repeat", 0);
-  if (rep > 0) a.repeatCount = std::isinf(rep) ? HUGE_VALF : (float)rep;
-  a.autoreverses = BoolOr(o, "autoreverse", false);
-  if (o.Has("timing")) a.timingFunction = TimingFn(ToNSString(o.Get("timing")));
-  if (BoolOr(o, "hold", false)) {
-    a.removedOnCompletion = NO;
-    a.fillMode = kCAFillModeForwards;
+  bool keyframe = o.Has("values");
+  bool spring = o.Has("spring");
+  if (keyframe && spring) {
+    ThrowType(env, "values and spring are two different animations; pass one of them");
+    return env.Undefined();
   }
+
+  CAPropertyAnimation* a = nil;
+  if (keyframe) {
+    CAKeyframeAnimation* k = [CAKeyframeAnimation animationWithKeyPath:keyPath];
+    Napi::Value vv = o.Get("values");
+    if (!vv.IsArray() || vv.As<Napi::Array>().Length() < 2) {
+      ThrowType(env, "values: expected an array of at least two values");
+      return env.Undefined();
+    }
+    Napi::Array varr = vv.As<Napi::Array>();
+    NSMutableArray* values = [NSMutableArray arrayWithCapacity:varr.Length()];
+    for (uint32_t i = 0; i < varr.Length(); i++) {
+      id v = AnimValue(varr.Get(i));
+      if (!v) {
+        ThrowType(env, "values: each entry is a number, [x, y] or [r, g, b, a]");
+        return env.Undefined();
+      }
+      [values addObject:v];
+    }
+    k.values = values;
+    if (o.Has("keyTimes")) {
+      Napi::Value kv = o.Get("keyTimes");
+      bool ok = kv.IsArray() && kv.As<Napi::Array>().Length() == varr.Length();
+      NSMutableArray* times = [NSMutableArray arrayWithCapacity:varr.Length()];
+      double last = 0;
+      for (uint32_t i = 0; ok && i < varr.Length(); i++) {
+        Napi::Value t = kv.As<Napi::Array>().Get(i);
+        double d = t.IsNumber() ? t.As<Napi::Number>().DoubleValue() : -1;
+        ok = d >= last && d <= 1 && (i > 0 || d == 0);
+        last = d;
+        [times addObject:@(d)];
+      }
+      if (!ok) {
+        ThrowType(env, "keyTimes: one per value, from 0 to at most 1, never decreasing");
+        return env.Undefined();
+      }
+      k.keyTimes = times;
+    }
+    if (o.Has("timings")) {
+      Napi::Value tv = o.Get("timings");
+      if (!tv.IsArray() || tv.As<Napi::Array>().Length() != varr.Length() - 1) {
+        ThrowType(env, "timings: one curve per segment, so one fewer than values");
+        return env.Undefined();
+      }
+      NSMutableArray* fns = [NSMutableArray arrayWithCapacity:varr.Length() - 1];
+      for (uint32_t i = 0; i + 1 < varr.Length(); i++) {
+        CAMediaTimingFunction* fn = TimingFrom(env, tv.As<Napi::Array>().Get(i));
+        if (!fn) return env.Undefined();
+        [fns addObject:fn];
+      }
+      k.timingFunctions = fns;
+    }
+    if (o.Has("calculationMode")) {
+      NSString* mode = StrOr(o, "calculationMode", @"linear");
+      if ([mode isEqualToString:@"linear"]) k.calculationMode = kCAAnimationLinear;
+      else if ([mode isEqualToString:@"discrete"]) k.calculationMode = kCAAnimationDiscrete;
+      else if ([mode isEqualToString:@"paced"]) k.calculationMode = kCAAnimationPaced;
+      else if ([mode isEqualToString:@"cubic"]) k.calculationMode = kCAAnimationCubic;
+      else if ([mode isEqualToString:@"cubicPaced"]) k.calculationMode = kCAAnimationCubicPaced;
+      else {
+        ThrowType(env, "calculationMode: expected linear, discrete, paced, cubic or cubicPaced");
+        return env.Undefined();
+      }
+    }
+    k.duration = NumOr(o, "duration", 0.25);
+    a = k;
+  } else if (spring) {
+    CASpringAnimation* s = [CASpringAnimation animationWithKeyPath:keyPath];
+    Napi::Value sv = o.Get("spring");
+    if (sv.IsObject()) {
+      Napi::Object so = sv.As<Napi::Object>();
+      // checked before they are set: CA refuses a bad value with a log line
+      // and keeps its default, which would make the check below pass
+      double mass = NumOr(so, "mass", s.mass);
+      double stiffness = NumOr(so, "stiffness", s.stiffness);
+      double damping = NumOr(so, "damping", s.damping);
+      double velocity = NumOr(so, "initialVelocity", s.initialVelocity);
+      if (!(mass > 0 && stiffness > 0 && damping >= 0 && std::isfinite(velocity))) {
+        ThrowType(env, "spring: mass and stiffness are positive, damping is not negative");
+        return env.Undefined();
+      }
+      s.mass = mass;
+      s.stiffness = stiffness;
+      s.damping = damping;
+      s.initialVelocity = velocity;
+    } else if (!(sv.IsBoolean() && sv.As<Napi::Boolean>().Value())) {
+      ThrowType(env, "spring: expected { mass, stiffness, damping, initialVelocity } or true for CA's defaults");
+      return env.Undefined();
+    }
+    if (!ReadFromTo(env, s, o)) return env.Undefined();
+    // CA's default duration is 0.25s and would cut the spring off mid-swing;
+    // it settles when the physics says, unless the caller cuts it themselves
+    s.duration = o.Has("duration") ? NumOr(o, "duration", 0.25) : s.settlingDuration;
+    a = s;
+  } else {
+    CABasicAnimation* b = [CABasicAnimation animationWithKeyPath:keyPath];
+    if (!ReadFromTo(env, b, o)) return env.Undefined();
+    b.duration = NumOr(o, "duration", 0.25);
+    a = b;
+  }
+  if (!ApplyTiming(env, a, L, o, key)) return env.Undefined();
   [L addAnimation:a forKey:key];
-  return info.Env().Undefined();
+  return Napi::Number::New(env, a.duration);
 }
 
 static Napi::Value RemoveAnimation(const Napi::CallbackInfo& info) {
@@ -572,15 +832,101 @@ static Napi::Value RemoveAllAnimations(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// A CA value back to JS: a number; a point or size as [x, y]; a rect as
+// [x, y, w, h]; a colour as [r, g, b, a] in generic RGB; a transform as its
+// sixteen components, row by row. null for anything else.
+static Napi::Value JSFromCAValue(Napi::Env env, id v) {
+  if (!v) return env.Null();
+  if ([v isKindOfClass:[NSNumber class]]) return Napi::Number::New(env, [(NSNumber*)v doubleValue]);
+  if ([v isKindOfClass:[NSValue class]]) {
+    NSValue* nv = (NSValue*)v;
+    const char* t = nv.objCType;
+    Napi::Array arr = Napi::Array::New(env);
+    if (strcmp(t, @encode(CGPoint)) == 0) {
+      CGPoint p = nv.pointValue;
+      arr.Set(0u, p.x); arr.Set(1u, p.y);
+    } else if (strcmp(t, @encode(CGSize)) == 0) {
+      CGSize s = nv.sizeValue;
+      arr.Set(0u, s.width); arr.Set(1u, s.height);
+    } else if (strcmp(t, @encode(CGRect)) == 0) {
+      CGRect r = nv.rectValue;
+      arr.Set(0u, r.origin.x); arr.Set(1u, r.origin.y);
+      arr.Set(2u, r.size.width); arr.Set(3u, r.size.height);
+    } else if (strcmp(t, @encode(CATransform3D)) == 0) {
+      CATransform3D m = nv.CATransform3DValue;
+      const CGFloat* c = &m.m11;
+      for (uint32_t i = 0; i < 16; i++) arr.Set(i, (double)c[i]);
+    } else {
+      return env.Null();
+    }
+    return arr;
+  }
+  if (CFGetTypeID((__bridge CFTypeRef)v) == CGColorGetTypeID()) {
+    CGColorRef c = (__bridge CGColorRef)v;
+    CGColorSpaceRef rgb = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB);
+    CGColorRef conv = CGColorCreateCopyByMatchingToColorSpace(rgb, kCGRenderingIntentDefault, c, NULL);
+    CGColorSpaceRelease(rgb);
+    CGColorRef src = conv ? conv : c;
+    const CGFloat* comps = CGColorGetComponents(src);
+    size_t n = CGColorGetNumberOfComponents(src);
+    Napi::Array arr = Napi::Array::New(env, 4);
+    if (n == 4) {
+      for (uint32_t i = 0; i < 4; i++) arr.Set(i, (double)comps[i]);
+    } else if (n == 2) {
+      arr.Set(0u, (double)comps[0]); arr.Set(1u, (double)comps[0]);
+      arr.Set(2u, (double)comps[0]); arr.Set(3u, (double)comps[1]);
+    } else {
+      if (conv) CGColorRelease(conv);
+      return env.Null();
+    }
+    if (conv) CGColorRelease(conv);
+    return arr;
+  }
+  return env.Null();
+}
+
+// presentationValue(layer, keyPath) -> the value the render server is
+// showing for that key path right now, animations applied — or null before
+// the layer's first commit. The model value is what the caller set; this is
+// where the pixels are, which is the `from` an interrupted colour animation
+// needs and the number a test reads a curve back through.
+static Napi::Value PresentationValue(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALayer* L = Deref<CALayer*>(info[0]);
+  NSString* keyPath = ToNSString(info[1]);
+  CALayer* p = L.presentationLayer;
+  if (!p) return env.Null();
+  id v = nil;
+  @try {
+    v = [p valueForKeyPath:keyPath];
+  } @catch (NSException* e) {
+    return env.Null();
+  }
+  return JSFromCAValue(env, v);
+}
+
 static Napi::Value TxBegin(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CAMediaTimingFunction* timing = nil;
+  bool hasTiming = false;
+  if (info.Length() > 0 && info[0].IsObject()) {
+    Napi::Object o = info[0].As<Napi::Object>();
+    if (o.Has("timing")) {
+      hasTiming = true;
+      timing = TimingFrom(env, o.Get("timing"));
+      // a bad curve is reported before anything is begun, so a throw here
+      // leaves no transaction open
+      if (!timing) return env.Undefined();
+    }
+  }
   [CATransaction begin];
   if (info.Length() > 0 && info[0].IsObject()) {
     Napi::Object o = info[0].As<Napi::Object>();
     if (o.Has("duration")) [CATransaction setAnimationDuration:NumOr(o, "duration", 0.25)];
     if (BoolOr(o, "disableActions", false)) [CATransaction setDisableActions:YES];
-    if (o.Has("timing")) [CATransaction setAnimationTimingFunction:TimingFn(ToNSString(o.Get("timing")))];
+    if (hasTiming) [CATransaction setAnimationTimingFunction:timing];
   }
-  return info.Env().Undefined();
+  return env.Undefined();
 }
 
 static Napi::Value TxCommit(const Napi::CallbackInfo& info) {
@@ -948,6 +1294,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   FN("removeAllAnimations", RemoveAllAnimations);
   FN("txBegin", TxBegin);
   FN("txCommit", TxCommit);
+  FN("presentationValue", PresentationValue);
   FN("hitTest", HitTest);
   FN("measureText", MeasureText);
   FN("createTextImage", CreateTextImage);

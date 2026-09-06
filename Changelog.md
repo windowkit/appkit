@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/windowkit/appkit/compare/v0.5.0...v0.5.1) (2026-09-06)
+
+
+### Bug Fixes
+
+* every colour crossing the bridge is sRGB, and colorSpace() says so ([#33](https://github.com/windowkit/appkit/issues/33)) ([7f005ad](https://github.com/windowkit/appkit/commit/7f005adbe8b95f2015088e31e371093e89ed2f8d))
+
 ## [0.5.0](https://github.com/windowkit/appkit/compare/v0.4.0...v0.5.0) (2026-09-06)
 
 

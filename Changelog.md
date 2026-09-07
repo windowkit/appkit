@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/windowkit/appkit/compare/v0.5.1...v0.6.0) (2026-09-07)
+
+
+### Features
+
+* a window the pointer passes through — ignoresMouseEvents at creation and as a setter, and windowNumberAtPoint to see it ([#35](https://github.com/windowkit/appkit/issues/35)) ([b6193ea](https://github.com/windowkit/appkit/commit/b6193ea6b2560e3ebff8ff33b217461facf6c5af))
+
 ## [0.5.1](https://github.com/windowkit/appkit/compare/v0.5.0...v0.5.1) (2026-09-06)
 
 

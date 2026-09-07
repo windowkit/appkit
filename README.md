@@ -251,6 +251,62 @@ vibrancy materials need private API to reproduce; expose real `NSMenu` instead.
 `native.postMouseEvent(win, 'down'|'up'|'move'|'drag', x, y)` synthesizes events through
 the real pump — used by the demo's self-test (`CAL_CLICKS="x,y;x,y" npm run demo`).
 
+## Surfaces: blend modes and blits
+
+A surface (`native.createSurface(wPx, hPx, scale)`, or `createSurfaceIOSurface` for the
+zero-copy presentation kind) is a `CGBitmapContext` with a top-left origin and the canvas
+drawing verbs over it — `ctxFillRect`, `ctxDrawSurface`, `ctxDrawGlyphs` and the rest.
+Two of those verbs are what a 2d context needs to composite one surface into another
+without paying for a `CGImage`:
+
+- **`native.ctxSetBlendMode(surface, mode)`** — canvas's `globalCompositeOperation`, in
+  CoreGraphics' spelling. Every canvas name maps to an exact `CGBlendMode`:
+  `source-over` (the default) through `xor` and `lighter`, and the separable and
+  non-separable blend modes below them, `multiply` … `luminosity`; `clear`,
+  `plus-lighter` and `plus-darker` are CoreGraphics' own and go through too. A name off
+  that list leaves the mode in force alone and answers `false` — canvas's rule for an
+  unknown value, so a caller can keep its own property in step — and a known one answers
+  `true`. The mode is graphics state, so `ctxSave`/`ctxRestore` bracket it.
+
+  `copy` is the one that matters for compositing: it makes a paint a *replacement*
+  rather than a blend, alpha included, which is what an offscreen surface presented into
+  a window wants and what `PictOp.Src` means on the X11 side.
+
+- **`native.blitSurface(src, sx, sy, w, h, dst, dx, dy, clip?)`** — a row `memcpy` of a
+  rect of one surface into another, at surfaces of any two sizes, returning the
+  destination rect it actually wrote as `[x, y, w, h]` or `null` when the intersection
+  came out empty. `copySurfaceRegion` is the same-size special case a swapchain wants;
+  this is the general one, for a caller compositing an offscreen surface into a window at
+  a translate — a terminal's grid, an element's retained scene. It is exactly what a
+  `copy`-mode `ctxDrawSurface` at 1:1 under a translate-only transform produces, byte for
+  byte, without building a `CGImage` of the whole source: 2000x1620 into a window-sized
+  surface is 1.2ms that way and 0.42ms this way on an M1 Pro.
+
+  Coordinates are device pixels, top-left origin — the convention `createSurface`'s CTM
+  gives user space, and the one `copySurfaceRegion`'s rects already use. Neither the
+  destination's CTM nor its clip is visible to a `memcpy`, so `clip`, when given, is
+  `[x, y, w, h]` in the **destination's** pixels and the caller passes the clip it is
+  drawing under; a damage region of several rects is several calls. The rect copied is
+  the destination rect intersected with that clip and with both surfaces' bounds, the
+  source origin moving with it. An IOSurface-backed surface at either end wants the usual
+  `surfaceLock`/`surfaceUnlock` bracketing, and two handles onto one bitmap — a shared
+  IOSurface looked up at both ends, or a surface onto itself — are refused, because
+  overlapping `memcpy` rows have no defined result.
+
+```js
+const grid = native.createSurface(2000, 1620, 2);   // the offscreen scene
+const win = native.createSurface(2200, 1800, 2);    // what the window presents
+
+// the composite, clipped to the paint pass's damage rect
+native.blitSurface(grid, 0, 0, 2000, 1620, win, 40, 30, [100, 100, 1200, 900]);
+// -> [100, 100, 1200, 900] — the clip, which the blit covered whole
+
+// the same pixels the slow way, for anything that is not a 1:1 translate
+native.ctxSetBlendMode(win, 'copy');
+native.ctxDrawSurface(win, grid, 0, 0, 2000, 1620, 40, 30, 2000, 1620);
+native.ctxSetBlendMode(win, 'source-over');
+```
+
 ## App lifecycle: open-URL, open-file, reopen, quit
 
 The OS talks to the application as a whole through Apple Events: a URL for a scheme

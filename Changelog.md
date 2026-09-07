@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/windowkit/appkit/compare/v0.6.0...v0.7.0) (2026-09-07)
+
+
+### Features
+
+* globalCompositeOperation on a surface's context, and a memcpy blit for a surface composited at a translate ([#37](https://github.com/windowkit/appkit/issues/37)) ([c53c94d](https://github.com/windowkit/appkit/commit/c53c94d94230ddc739ebe639a656fba2c642a89a))
+
 ## [0.6.0](https://github.com/windowkit/appkit/compare/v0.5.1...v0.6.0) (2026-09-07)
 
 

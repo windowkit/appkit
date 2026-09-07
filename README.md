@@ -417,6 +417,22 @@ native.beginDrag(win, {
   default — at its own size unless `imageWidth` / `imageHeight` say otherwise.
   A drop on one of our own windows arrives through the destination events of
   that window with `local: true` and the source's `sourceWindowNumber`.
+- **A preview window of your own is the window under the pointer.** A
+  renderer that draws its drag preview as a live window of its own — a
+  borderless popup following the pointer, instead of the session's image —
+  has put a window between the pointer and every destination, and the window
+  server finds that one first. Registering it for no dragged types is not a
+  way past it: the drag then simply has no destination, and the window
+  beneath never hears of it; transparent pixels pass no hit either.
+  `createWindow2({ …, ignoresMouseEvents: true })`, or
+  `setWindowIgnoresMouseEvents(win, flag)` on a live window, makes it one
+  the pointer passes through, so a click or a drag reaches whatever is
+  beneath; `getWindowFrame` reports the flag beside `visible` and `key`.
+  `windowNumberAtPoint(x, y, belowWindowNumber?)` is the window server's own
+  answer to which window a mouse-down at a global top-left point would
+  reach, any application's, or 0 — the question the flag changes — and
+  handing an answer back as `belowWindowNumber` looks beneath it, which is
+  how a test finds its own windows under another application's.
 - **`postDragEvent(win, phase, { x, y, items, operations, local })`** drives
   the destination methods with a dragging info of the bridge's own over a
   private pasteboard — what `postMouseEvent` is to clicks. `'enter'` and

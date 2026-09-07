@@ -188,6 +188,8 @@ jobs:
         run: node test/animation.js
       - name: Accessibility display options and their change event
         run: node test/accessibility-display.js
+      - name: A window the pointer passes through, and the hit test that shows it
+        run: node test/ignores-mouse-events.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

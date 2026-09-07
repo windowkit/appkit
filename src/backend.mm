@@ -503,6 +503,7 @@ static char kDelegateKey;
 //                 title, kind,            // 'normal' | 'popup' | 'borderless'
 //                 x, y,                   // top-left global, points (optional)
 //                 resizable, opaque, hasShadow, level,   // level: 'normal'|'popup'|'floating'
+//                 ignoresMouseEvents,     // the pointer passes through (below)
 //                 backgroundColor })      // [r,g,b,a] or absent
 static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -559,6 +560,14 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
       win.opaque = BBoolOr(o, "opaque", true);
       if (!win.opaque) win.backgroundColor = NSColor.clearColor;
     }
+    // A window the pointer passes through. The window server hit-tests
+    // past it, so a click or a drag reaches whatever is beneath — what a
+    // drag preview following the pointer needs. Registering no dragged
+    // types is not that: the window under the pointer is found first, an
+    // unregistered one is still the one found, and the drag then has no
+    // destination at all. Transparent pixels do not pass a hit either.
+    if (o.Has("ignoresMouseEvents"))
+      win.ignoresMouseEvents = BBoolOr(o, "ignoresMouseEvents", false);
 
     CALBackendView* view = [[CALBackendView alloc] initWithFrame:rect];
     view->env_ = (napi_env)env;
@@ -622,6 +631,15 @@ static Napi::Value SetWindowTitle(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// setWindowIgnoresMouseEvents(win, flag) — createWindow2's option of the
+// same name, changed on a live window; the next hit the window server
+// resolves honours it.
+static Napi::Value SetWindowIgnoresMouseEvents(const Napi::CallbackInfo& info) {
+  NSWindow* win = BDeref<NSWindow*>(info[0]);
+  win.ignoresMouseEvents = info.Length() > 1 && info[1].ToBoolean().Value();
+  return info.Env().Undefined();
+}
+
 // setWindowFrame(win, x, y, w, h) — any argument may be null to keep it.
 // x/y are the content's top-left in global top-left coordinates, points.
 static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
@@ -642,8 +660,8 @@ static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-// -> { x, y, width, height, scale, visible, occluded, key } — content rect, top-left
-// global coordinates, points.
+// -> { x, y, width, height, scale, visible, occluded, key, ignoresMouseEvents }
+// — content rect, top-left global coordinates, points.
 static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   NSWindow* win = BDeref<NSWindow*>(info[0]);
@@ -658,7 +676,34 @@ static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
   // visible but with no pixel on glass: fully behind another app's window
   r.Set("occluded", win.isVisible && !WindowOnGlass(win));
   r.Set("key", (bool)win.isKeyWindow);
+  r.Set("ignoresMouseEvents", (bool)win.ignoresMouseEvents);
   return r;
+}
+
+// windowNumberAtPoint(x, y, belowWindowNumber?) -> number — the window the
+// window server would hand a mouse-down at a global top-left point, any
+// application's, or 0 for none. It is the question `ignoresMouseEvents`
+// changes the answer to, and where a drag's destination lookup starts. A
+// window number in `belowWindowNumber` starts the search beneath that
+// window, so walking the answers back in finds what sits under another
+// application's window — a lock screen, a floating panel.
+static Napi::Value WindowNumberAtPoint(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "windowNumberAtPoint: x and y must be numbers")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  BEnsureApp();
+  double x = info[0].As<Napi::Number>().DoubleValue();
+  double y = info[1].As<Napi::Number>().DoubleValue();
+  NSInteger below = info.Length() > 2 && info[2].IsNumber()
+                        ? (NSInteger)info[2].As<Napi::Number>().Int64Value()
+                        : 0;
+  NSInteger hit =
+      [NSWindow windowNumberAtPoint:NSMakePoint(x, PrimaryScreenTop() - y)
+          belowWindowWithWindowNumber:below];
+  return Napi::Number::New(env, (double)hit);
 }
 
 static Napi::Value SetWindowMinMax(const Napi::CallbackInfo& info) {
@@ -4970,6 +5015,8 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("showWindow", ShowWindowFn);
   BFN("hideWindow", HideWindowFn);
   BFN("setWindowTitle", SetWindowTitle);
+  BFN("setWindowIgnoresMouseEvents", SetWindowIgnoresMouseEvents);
+  BFN("windowNumberAtPoint", WindowNumberAtPoint);
   BFN("setWindowFrame", SetWindowFrame);
   BFN("getWindowFrame", GetWindowFrame);
   BFN("setWindowMinMax", SetWindowMinMax);

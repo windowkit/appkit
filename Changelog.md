@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.0](https://github.com/windowkit/appkit/compare/v0.7.0...v0.8.0) (2026-09-08)
+
+
+### Features
+
+* creating, changing and removing events through EventKit — the span for a recurring one, the occurrence it reaches, the default calendar, a batch ([#45](https://github.com/windowkit/appkit/issues/45)) ([9469006](https://github.com/windowkit/appkit/commit/94690061b709bc536e1e1e6e4ec46fc22a3acdbe))
+* privacy authorizations for calendars and reminders — EventKit's TCC grants, including macOS 14's write-only one ([#42](https://github.com/windowkit/appkit/issues/42)) ([c49685e](https://github.com/windowkit/appkit/commit/c49685e109eabafa9bf2f48877d61a4050cc3700)), closes [#39](https://github.com/windowkit/appkit/issues/39)
+* the user's calendars and the occurrences in a range, through EventKit, with the store's change as a backend event ([#44](https://github.com/windowkit/appkit/issues/44)) ([a947e50](https://github.com/windowkit/appkit/commit/a947e50e7445e44b6aae96f1b63eb18c13132836))
+
 ## [0.7.0](https://github.com/windowkit/appkit/compare/v0.6.0...v0.7.0) (2026-09-07)
 
 

@@ -20,13 +20,25 @@
 //   location             CLLocationManager.authorizationStatus /
 //                        requestWhenInUseAuthorization, answered through the
 //                        delegate on the main run loop — i.e. during the pump
+//   calendars, reminders EKEventStore authorizationStatusForEntityType: /
+//                        requestFullAccessToEventsWithCompletion:,
+//                        requestWriteOnlyAccessToEventsWithCompletion:,
+//                        requestFullAccessToRemindersWithCompletion: on 14+
+//                        (requestAccessToEntityType:completion: before), on
+//                        the process's one EKEventStore; the completion lands
+//                        on an arbitrary queue like AVFoundation's
 //
 // Every status that crosses to JS is one of 'authorized' | 'denied' |
-// 'restricted' | 'notDetermined'. Screen recording and accessibility only
-// ever answer with a bool, so they never say notDetermined; their "request"
-// posts the system's own go-to-Settings dialog and returns at once — the
-// user finishes the grant in Settings, which is what openPrivacySettings is
-// for. The folder grants (Desktop, Documents, Downloads) need nothing here:
+// 'restricted' | 'notDetermined' — plus 'writeOnly', which only calendars
+// and reminders can answer: macOS 14's partial grant (the app may save items
+// it cannot read back). It crosses as its own word rather than as either
+// side, because whether it counts as granted depends on what the consumer
+// wanted to do — a writer has what it needs, a reader does not — and that is
+// the renderer's decision. Screen recording and accessibility only ever
+// answer with a bool, so they never say notDetermined; their "request" posts
+// the system's own go-to-Settings dialog and returns at once — the user
+// finishes the grant in Settings, which is what openPrivacySettings is for.
+// The folder grants (Desktop, Documents, Downloads) need nothing here:
 // reading the directory is the prompt, and EPERM is the denial.
 //
 // Every request answers asynchronously, once, through the callback — never
@@ -37,6 +49,7 @@
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreLocation/CoreLocation.h>
+#import <EventKit/EventKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <IOKit/hidsystem/IOHIDLib.h>
 
@@ -47,6 +60,7 @@ static const char* const kAuthorized = "authorized";
 static const char* const kDenied = "denied";
 static const char* const kRestricted = "restricted";
 static const char* const kNotDetermined = "notDetermined";
+static const char* const kWriteOnly = "writeOnly";
 
 enum class Kind {
   Camera,
@@ -56,11 +70,13 @@ enum class Kind {
   InputMonitoring,
   Automation,
   Location,
+  Calendars,
+  Reminders,
 };
 
 static const char* const kKindNames =
     "camera, microphone, screen-recording, accessibility, input-monitoring, "
-    "automation, location";
+    "automation, location, calendars, reminders";
 
 static bool ParseKind(const std::string& s, Kind* out) {
   if (s == "camera") *out = Kind::Camera;
@@ -70,14 +86,26 @@ static bool ParseKind(const std::string& s, Kind* out) {
   else if (s == "input-monitoring") *out = Kind::InputMonitoring;
   else if (s == "automation") *out = Kind::Automation;
   else if (s == "location") *out = Kind::Location;
+  else if (s == "calendars") *out = Kind::Calendars;
+  else if (s == "reminders") *out = Kind::Reminders;
   else return false;
   return true;
 }
 
-// (kind, opts?) — the kind string, and for 'automation' the target bundle id
-// from opts.target. Throws a TypeError and returns false on a bad shape.
+// The parsed (kind, opts?) of a status or request call: the kind, for
+// 'automation' the target bundle id from opts.target, and for 'calendars' the
+// level from opts.access — 'full' (the default) or 'write-only', macOS 14's
+// partial grant. Reminders have no write-only grant, so asking for one there
+// is a bad shape, not a request that would silently ask for something else.
+struct KindArgs {
+  Kind kind;
+  NSString* target = nil;
+  bool writeOnly = false;
+};
+
+// Throws a TypeError and returns false on a bad shape.
 static bool ParseKindArgs(const char* fn, const Napi::CallbackInfo& info,
-                          Kind* kind, NSString** target) {
+                          KindArgs* out) {
   Napi::Env env = info.Env();
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, std::string(fn) + ": expected a kind string (" +
@@ -86,18 +114,21 @@ static bool ParseKindArgs(const char* fn, const Napi::CallbackInfo& info,
     return false;
   }
   std::string name = info[0].As<Napi::String>().Utf8Value();
-  if (!ParseKind(name, kind)) {
+  if (!ParseKind(name, &out->kind)) {
     Napi::TypeError::New(env, std::string(fn) + ": unknown kind '" + name +
                                   "' (" + kKindNames + ")")
         .ThrowAsJavaScriptException();
     return false;
   }
-  *target = nil;
-  if (*kind == Kind::Automation) {
+  Napi::Object opts;
+  if (info.Length() > 1 && info[1].IsObject() && !info[1].IsFunction()) {
+    opts = info[1].As<Napi::Object>();
+  }
+  out->target = nil;
+  out->writeOnly = false;
+  if (out->kind == Kind::Automation) {
     Napi::Value t;
-    if (info.Length() > 1 && info[1].IsObject()) {
-      t = info[1].As<Napi::Object>().Get("target");
-    }
+    if (!opts.IsEmpty()) t = opts.Get("target");
     if (t.IsEmpty() || !t.IsString()) {
       Napi::TypeError::New(env, std::string(fn) +
                                     ": 'automation' needs { target: <bundle "
@@ -106,7 +137,29 @@ static bool ParseKindArgs(const char* fn, const Napi::CallbackInfo& info,
       return false;
     }
     std::string s = t.As<Napi::String>().Utf8Value();
-    *target = [NSString stringWithUTF8String:s.c_str()];
+    out->target = [NSString stringWithUTF8String:s.c_str()];
+  }
+  if (out->kind == Kind::Calendars || out->kind == Kind::Reminders) {
+    Napi::Value a;
+    if (!opts.IsEmpty()) a = opts.Get("access");
+    if (!a.IsEmpty() && !a.IsUndefined() && !a.IsNull()) {
+      std::string s = a.IsString() ? a.As<Napi::String>().Utf8Value() : "";
+      if (s == "write-only" && out->kind == Kind::Calendars) {
+        out->writeOnly = true;
+      } else if (s == "write-only") {
+        Napi::TypeError::New(env, std::string(fn) +
+                                      ": 'reminders' has no write-only grant; "
+                                      "access must be 'full'")
+            .ThrowAsJavaScriptException();
+        return false;
+      } else if (s != "full") {
+        Napi::TypeError::New(env, std::string(fn) + ": '" + name +
+                                      "' access must be 'full' or "
+                                      "'write-only'")
+            .ThrowAsJavaScriptException();
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -151,6 +204,39 @@ static CLLocationManager* LocationStatusManager() {
   return m;
 }
 
+static EKEntityType EntityOf(Kind kind) {
+  return kind == Kind::Reminders ? EKEntityTypeReminder : EKEntityTypeEvent;
+}
+
+// EventKit's grant for one entity type, Apple's word as it is. FullAccess
+// (14+) has the raw value of the deprecated Authorized, so the one case reads
+// both; WriteOnly (14+) is the partial grant and crosses as its own word.
+static const char* EKStatus(EKEntityType type) {
+  EKAuthorizationStatus st =
+      [EKEventStore authorizationStatusForEntityType:type];
+  if (@available(macOS 14.0, *)) {
+    if (st == EKAuthorizationStatusWriteOnly) return kWriteOnly;
+  }
+  switch (st) {
+    case EKAuthorizationStatusAuthorized: return kAuthorized;
+    case EKAuthorizationStatusDenied: return kDenied;
+    case EKAuthorizationStatusRestricted: return kRestricted;
+    case EKAuthorizationStatusNotDetermined:
+    default: return kNotDetermined;
+  }
+}
+
+// The process's one EKEventStore, created on the first request and never
+// released: a store is inert until a grant and creating one never prompts —
+// only the request does — and a grant refreshes it in place (it posts
+// EKEventStoreChangedNotification), so the store verbs that read calendars
+// and reminders share this instance rather than making their own.
+EKEventStore* CALEventStore() {
+  static EKEventStore* store = nil;
+  if (!store) store = [EKEventStore new];
+  return store;
+}
+
 // TCC's answer for sending Apple Events to `bundleId`. With `ask`, the call
 // blocks while the consent dialog is up. procNotFound means the target is
 // not running — TCC only answers for a running target, so the caller turns
@@ -185,17 +271,30 @@ static bool ThrowIfTargetNotRunning(Napi::Env env, const char* fn,
 
 // --- the answer path -------------------------------------------------------
 
-// Deliver one status to the request's callback as cb(granted, status) on the
+// Deliver one answer to the request's callback as cb(granted, status) on the
 // JS thread, from any thread, then let the thread-safe function go. The
 // status strings are the static literals above, so a bare pointer travels.
-static void Answer(Napi::ThreadSafeFunction tsfn, const char* status) {
-  tsfn.BlockingCall(
-      const_cast<char*>(status),
-      [](Napi::Env env, Napi::Function cb, char* s) {
-        cb.Call({Napi::Boolean::New(env, strcmp(s, kAuthorized) == 0),
-                 Napi::String::New(env, s)});
+struct Reply {
+  const char* status;
+  bool granted;
+};
+
+static void Answer(Napi::ThreadSafeFunction tsfn, const char* status,
+                   bool granted) {
+  Reply* r = new Reply{status, granted};
+  napi_status st = tsfn.BlockingCall(
+      r, [](Napi::Env env, Napi::Function cb, Reply* r) {
+        cb.Call({Napi::Boolean::New(env, r->granted),
+                 Napi::String::New(env, r->status)});
+        delete r;
       });
+  if (st != napi_ok) delete r;
   tsfn.Release();
+}
+
+// For every kind but the EventKit pair, granted is the one full grant.
+static void Answer(Napi::ThreadSafeFunction tsfn, const char* status) {
+  Answer(tsfn, status, strcmp(status, kAuthorized) == 0);
 }
 
 // A location request: its own CLLocationManager whose delegate reports the
@@ -238,13 +337,15 @@ static void StartLocationRequest(Napi::ThreadSafeFunction tsfn) {
 // --- the natives -----------------------------------------------------------
 
 // authorizationStatus(kind, opts?) -> 'authorized' | 'denied' | 'restricted'
-// | 'notDetermined'. Never prompts.
+// | 'notDetermined' | 'writeOnly' (calendars and reminders only). Never
+// prompts.
 static Napi::Value AuthorizationStatus(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  Kind kind;
-  NSString* target;
-  if (!ParseKindArgs("authorizationStatus", info, &kind, &target))
+  KindArgs args;
+  if (!ParseKindArgs("authorizationStatus", info, &args))
     return env.Undefined();
+  Kind kind = args.kind;
+  NSString* target = args.target;
   @autoreleasepool {
     const char* s = kNotDetermined;
     switch (kind) {
@@ -265,19 +366,25 @@ static Napi::Value AuthorizationStatus(const Napi::CallbackInfo& info) {
         break;
       }
       case Kind::Location: s = LocationStatusOf(LocationStatusManager()); break;
+      case Kind::Calendars:
+      case Kind::Reminders: s = EKStatus(EntityOf(kind)); break;
     }
     return Napi::String::New(env, s);
   }
 }
 
 // requestAuthorization(kind, opts?, cb) — raises the system prompt where the
-// framework offers one; cb(granted, status) once, asynchronously.
+// framework offers one; cb(granted, status) once, asynchronously. granted is
+// whether the level asked for is held afterwards: for every kind the full
+// grant, and for a { access: 'write-only' } calendars request write-only or
+// full (full access can save too).
 static Napi::Value RequestAuthorization(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  Kind kind;
-  NSString* target;
-  if (!ParseKindArgs("requestAuthorization", info, &kind, &target))
+  KindArgs args;
+  if (!ParseKindArgs("requestAuthorization", info, &args))
     return env.Undefined();
+  Kind kind = args.kind;
+  NSString* target = args.target;
   size_t cbAt = info.Length() > 1 && info[1].IsFunction() ? 1 : 2;
   if (info.Length() <= cbAt || !info[cbAt].IsFunction()) {
     Napi::TypeError::New(env, "requestAuthorization: expected a callback "
@@ -339,6 +446,32 @@ static Napi::Value RequestAuthorization(const Napi::CallbackInfo& info) {
         break;
       }
       case Kind::Location: StartLocationRequest(tsfn); break;
+      case Kind::Calendars:
+      case Kind::Reminders: {
+        EKEntityType type = EntityOf(kind);
+        bool writeOnly = args.writeOnly;
+        // the status after the request is the answer (a refusal reads back
+        // as denied, a prompt nobody saw leaves notDetermined); the
+        // completion's own flag is not consulted, as for AVFoundation
+        EKEventStoreRequestAccessCompletionHandler done = ^(BOOL, NSError*) {
+          const char* s = EKStatus(type);
+          Answer(tsfn, s, s == kAuthorized || (writeOnly && s == kWriteOnly));
+        };
+        EKEventStore* store = CALEventStore();
+        if (@available(macOS 14.0, *)) {
+          if (type == EKEntityTypeReminder)
+            [store requestFullAccessToRemindersWithCompletion:done];
+          else if (writeOnly)
+            [store requestWriteOnlyAccessToEventsWithCompletion:done];
+          else
+            [store requestFullAccessToEventsWithCompletion:done];
+        } else {
+          // 11–13 have one grant per entity and no write-only level, so a
+          // write-only request asks for the only grant there is
+          [store requestAccessToEntityType:type completion:done];
+        }
+        break;
+      }
     }
   }
   return env.Undefined();
@@ -366,6 +499,8 @@ static Napi::Value OpenPrivacySettings(const Napi::CallbackInfo& info) {
   else if (kind == "input-monitoring") anchor = "Privacy_ListenEvent";
   else if (kind == "automation") anchor = "Privacy_Automation";
   else if (kind == "location") anchor = "Privacy_LocationServices";
+  else if (kind == "calendars") anchor = "Privacy_Calendars";
+  else if (kind == "reminders") anchor = "Privacy_Reminders";
   else if (kind == "files-and-folders") anchor = "Privacy_FilesAndFolders";
   else if (kind == "full-disk-access") anchor = "Privacy_AllFiles";
   if (!anchor) {

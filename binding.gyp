@@ -30,7 +30,8 @@
           "-framework CoreLocation",
           "-framework IOKit",
           "-framework ApplicationServices",
-          "-framework UserNotifications"
+          "-framework UserNotifications",
+          "-framework EventKit"
         ]
       }
     }

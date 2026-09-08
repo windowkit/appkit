@@ -81,7 +81,14 @@ jobs:
             }
             let finder; try { finder = n.authorizationStatus('automation', { target: 'com.apple.finder' }); } catch (e) { finder = e; }
             if (!statuses.has(finder) && !/not running/.test(finder && finder.message)) { console.error('automation status', finder); process.exit(1); }
-            for (const bad of [() => n.authorizationStatus('bogus'), () => n.authorizationStatus('automation'), () => n.requestAuthorization('camera'), () => n.openPrivacySettings('bogus')]) {
+            // EventKit's pair can also say writeOnly (macOS 14's save-only grant); the level named in
+            // the options is validated, and a write-only ask of reminders — which have no such grant — is a TypeError
+            for (const k of ['calendars', 'reminders']) {
+              const s = n.authorizationStatus(k);
+              if (!statuses.has(s) && s !== 'writeOnly') { console.error('authorizationStatus', k, s); process.exit(1); }
+              if (n.authorizationStatus(k, { access: 'full' }) !== s) { console.error('authorizationStatus', k, 'with access'); process.exit(1); }
+            }
+            for (const bad of [() => n.authorizationStatus('bogus'), () => n.authorizationStatus('automation'), () => n.requestAuthorization('camera'), () => n.openPrivacySettings('bogus'), () => n.authorizationStatus('reminders', { access: 'write-only' }), () => n.requestAuthorization('calendars', { access: 'read' }, () => {})]) {
               let err; try { bad(); } catch (e) { err = e; }
               if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
             }
@@ -192,6 +199,8 @@ jobs:
         run: node test/ignores-mouse-events.js
       - name: Surface blits and blend modes
         run: node test/surface-blit.js
+      - name: EventKit privacy authorizations, the reading half and the argument shapes
+        run: node test/eventkit-permissions.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

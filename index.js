@@ -256,19 +256,33 @@ const notifications = {
 // anything else is left alone so it is refused there rather than coerced.
 const toMs = (v) => (v instanceof Date ? v.getTime() : v);
 
-// The user's calendars and the occurrences in a date range, through EventKit
-// (EKEventStore) — every account added in System Settings › Internet Accounts
-// (iCloud, Google, Exchange, CalDAV, a subscribed feed) is served by it, and
-// the desktop did the OAuth, so the app never sees a credential. Mechanism
-// only: which calendars to show, how to render an all-day span and when to
-// re-query stay in the renderer.
+// The same for every date in a save: start, end, the occurrence, the
+// recurrence's until, an absolute alarm. A spread leaves absent fields
+// undefined, which the bridge reads as absent.
+const eventMs = (p) => {
+  const out = { ...p, start: toMs(p.start), end: toMs(p.end), occurrenceDate: toMs(p.occurrenceDate) };
+  if (p.recurrence && typeof p.recurrence === 'object') out.recurrence = { ...p.recurrence, until: toMs(p.recurrence.until) };
+  if (Array.isArray(p.alarms)) out.alarms = p.alarms.map((a) => (a && a.at instanceof Date ? { ...a, at: a.at.getTime() } : a));
+  return out;
+};
+const optsMs = (o) => (o && o.occurrenceDate instanceof Date ? { ...o, occurrenceDate: o.occurrenceDate.getTime() } : o);
+
+// The user's calendars, the occurrences in a date range, and the writes —
+// an event put in, changed or taken out — through EventKit (EKEventStore):
+// every account added in System Settings › Internet Accounts (iCloud,
+// Google, Exchange, CalDAV, a subscribed feed) is served by it, and the
+// desktop did the OAuth, so the app never sees a credential. Mechanism only:
+// which calendars to show, how to render an all-day span, when to re-query
+// and what to put in an event stay in the renderer.
 //
-// Reading needs the 'calendars' authorization (permissions.request); without
-// it these reject with an error naming the status rather than answering an
-// empty list, so "no events" and "not allowed to look" stay apart. A change
-// to anything in the store arrives as a 'calendar-store-changed' backend
-// event (native.setBackendEventCallback) whose only sensible answer is to
-// query again; the observer is in place from the first EventKit call.
+// Reading needs the 'calendars' authorization (permissions.request); a write
+// is content with macOS 14's write-only grant too. Without one these reject
+// with an error naming the status rather than answering an empty list, so
+// "no events" and "not allowed to look" stay apart. A change to anything in
+// the store — the consumer's own commit included — arrives as a
+// 'calendar-store-changed' backend event (native.setBackendEventCallback)
+// whose only sensible answer is to query again; the observer is in place
+// from the first EventKit call.
 const calendars = {
   // -> [{ id, title, color: [r, g, b, a] | null (sRGB), type: 'local' |
   //      'calDAV' | 'exchange' | 'subscription' | 'birthday', source: { id,
@@ -288,6 +302,33 @@ const calendars = {
         { start: toMs(start), end: toMs(end), calendars: ids },
         (err, events) => (err ? reject(err) : resolve(events)),
       )),
+  // -> the calendar a save with no calendar goes to (defaultCalendarForNewEvents),
+  //    in the shape list() gives, or null when the store has none
+  defaultCalendar: () =>
+    new Promise((resolve, reject) =>
+      native.defaultCalendar((err, cal) => (err ? reject(err) : resolve(cal)))),
+  // { id?, occurrenceDate?, calendar?, title?, start, end, allDay?, location?,
+  //   notes?, url?, timeZone?, availability?, recurrence?, alarms? } — epoch ms
+  // or Date. No id creates an event (start and end required; the default
+  // calendar when none is named); an id changes that event, and with
+  // occurrenceDate the one occurrence of a recurring one, a field absent
+  // left as it is and null cleared. opts: { span: 'this' | 'future', commit }.
+  // Resolves to the event's id. What the framework refuses rejects with its
+  // EKError: { code, domain: 'EKErrorDomain', reason: 'EKErrorCalendarReadOnly' }.
+  saveEvent: (props = {}, opts) =>
+    new Promise((resolve, reject) =>
+      native.saveEvent(eventMs(props), opts, (err, id) => (err ? reject(err) : resolve(id)))),
+  // (id, { span, commit, occurrenceDate }) — the same span; the occurrence
+  // when one is named.
+  removeEvent: (id, opts) =>
+    new Promise((resolve, reject) =>
+      native.removeEvent(id, optsMs(opts), (err) => (err ? reject(err) : resolve()))),
+  // A batch: saves and removes with { commit: false } wait for this, in the
+  // order they were asked; reset() forgets them instead.
+  commit: () =>
+    new Promise((resolve, reject) =>
+      native.commitCalendarStore((err) => (err ? reject(err) : resolve()))),
+  reset: () => new Promise((resolve) => native.resetCalendarStore(resolve)),
 };
 
 const accessibility = {

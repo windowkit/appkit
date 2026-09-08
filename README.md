@@ -564,8 +564,9 @@ Every account the user added in System Settings › Internet Accounts — iCloud
 Google, Exchange, CalDAV, a subscribed feed — is served by one framework,
 `EKEventStore`: the macOS counterpart of Evolution Data Server plus GNOME
 Online Accounts, where the desktop did the OAuth and the app never sees a
-credential. Mechanism only — which calendars to show, how to draw an all-day
-span and when to re-query stay in the renderer.
+credential. Reading and writing go through the same store and the same
+grant. Mechanism only — which calendars to show, how to draw an all-day
+span, when to re-query and what to put in an event stay in the renderer.
 
 ```js
 const { calendars, permissions, native } = require('@windowkit/appkit');
@@ -588,15 +589,36 @@ native.setBackendEventCallback((ev) => {
   // 'calendar-store-changed' {}   something in the store changed: query again
 });
 
+// writing: the same store, the full grant or macOS 14's write-only one
+const home = await calendars.defaultCalendar();   // where a save with no calendar goes, or null
+const id = await calendars.saveEvent({
+  title: 'Dentist', start: new Date('2026-10-05T09:00'), end: new Date('2026-10-05T10:00'),
+  location: '12 High St', alarms: [{ offset: -15 * 60 }],
+  recurrence: { frequency: 'weekly', daysOfWeek: [{ day: 2 }], count: 6 },   // six Mondays
+});
+const [, second] = await calendars.eventsBetween({ start, end, calendars: [home.id] });
+await calendars.saveEvent({ id, occurrenceDate: second.occurrenceDate, start: later, end: later + hour }, { span: 'this' });
+await calendars.saveEvent({ id, occurrenceDate: second.occurrenceDate, title: 'Orthodontist' }, { span: 'future' });
+await calendars.removeEvent(id, { span: 'future' });   // the whole series, from its first occurrence
+// a batch: nothing reaches the database until commit(); reset() forgets it instead
+await calendars.saveEvent(a, { commit: false });
+await calendars.saveEvent(b, { commit: false });
+await calendars.commit();
+
 // the natives underneath, callback-shaped
 native.calendars(cb);                                   // cb(err, [calendar])
 native.eventsBetween({ start, end, calendars? }, cb);   // epoch ms; cb(err, [event])
+native.defaultCalendar(cb);                             // cb(err, calendar | null)
+native.saveEvent(props, opts?, cb);                     // cb(err, id)
+native.removeEvent(id, opts?, cb);                      // opts: { span, commit, occurrenceDate }; cb(err)
+native.commitCalendarStore(cb);                         // cb(err)
+native.resetCalendarStore(cb);                          // cb(null)
 native.postCalendarStoreChanged();                      // test-only: the notification EventKit posts
 ```
 
 | event field                     | what                                                                                                                                                                       |
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`, `itemId`, `externalId`    | `eventIdentifier`, `calendarItemIdentifier`, `calendarItemExternalIdentifier` — `null` where the store has none (a local calendar's items carry no external id)             |
+| `id`, `itemId`, `externalId`    | `eventIdentifier`, `calendarItemIdentifier`, `calendarItemExternalIdentifier` — `null` where the store has none (a local calendar's items carry no external id). Every occurrence of a series shares the series' `id`; a detached occurrence gets its own, the series' with `/RID=<slot>` appended |
 | `calendar`                      | the `id` of the calendar it is in                                                                                                                                          |
 | `title`, `location`, `notes`, `url` | strings, or `null` where the item has none — never `''` for absent                                                                                                     |
 | `start`, `end`                  | epoch ms, as the store reports them                                                                                                                                        |
@@ -604,8 +626,27 @@ native.postCalendarStoreChanged();                      // test-only: the notifi
 | `status`                        | `'none'`, `'confirmed'`, `'tentative'`, `'cancelled'`                                                                                                                      |
 | `availability`                  | `'notSupported'`, `'busy'`, `'free'`, `'tentative'`, `'unavailable'`                                                                                                       |
 | `recurring`, `detached`         | `hasRecurrenceRules`; whether this occurrence was edited away from its series                                                                                              |
-| `occurrenceDate`                | where the occurrence sits in the series (epoch ms), which for a detached one is not its `start`                                                                             |
+| `occurrenceDate`                | where the occurrence sits in the series (epoch ms). For a detached occurrence that was moved, macOS 15.2 reports the start it was moved *to* (the original slot survives as the `RID=` in its `externalId`), not the documented original date — pass it back as reported |
 | `organizer`, `attendees`        | present only when the event has them: `{ name, url, status, role, type, isCurrentUser }` — `url` is the `mailto:` the account gave, `status` `'unknown'` … `'inProcess'`, `role` `'required'`/`'optional'`/`'chair'`/`'nonParticipant'`, `type` `'person'`/`'room'`/`'resource'`/`'group'` |
+| `recurrence`                    | present only on a recurring event: its rule in the shape `saveEvent` takes (below), so it can be read, changed and written back. The framework allows several rules on an item; the first is carried, which is the only one Calendar or any account writes |
+| `alarms`                        | present only when the event has alarms: `[{ offset: seconds from the start, negative before it } \| { at: epoch ms }]` |
+
+`saveEvent(props, opts?)` — every field but the ones that identify the event
+is optional. On an existing event a field left out stays as it is and `null`
+clears it; on a new one `start` and `end` are required.
+
+| prop                                       | what                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`, `occurrenceDate`                     | neither: a new event. `id` names an existing one (`eventWithIdentifier:`); with `occurrenceDate` — as `eventsBetween` reported it for that occurrence — one occurrence of a recurring event, found through the same predicate the reads use; without it the first occurrence, which with `span: 'future'` is the whole series                                  |
+| `calendar`                                 | a calendar id. A new event without one goes to `defaultCalendar()`; on an existing event it is a move, which an invitation refuses (`EKErrorInvitesCannotBeMoved`)                                                                                                                                                                                         |
+| `title`, `location`, `notes`, `url`, `timeZone` | strings, or `null` to clear. `url` must be absolute (`https://…`), `timeZone` an identifier (`'Europe/London'`), `null` for a floating event                                                                                                                                                                                                               |
+| `start`, `end`                             | epoch ms, or a `Date` through the wrapper. Inverted ones are the framework's to refuse (`EKErrorDatesInverted`)                                                                                                                                                                                                                                             |
+| `allDay`                                   | in the store's own convention, the one `eventsBetween` reports: `start` at local midnight, `end` at the last second of the last day. An exclusive end — the next midnight — makes a two-day event (measured: it reads back as 48 hours)                                                                                                                       |
+| `availability`                             | `'busy'`, `'free'`, `'tentative'`, `'unavailable'`                                                                                                                                                                                                                                                                                                        |
+| `recurrence`                               | `EKRecurrenceRule`'s own vocabulary, what its initialiser takes: `{ frequency: 'daily' \| 'weekly' \| 'monthly' \| 'yearly', interval?, until? \| count?, daysOfWeek?: [{ day: 1..7 (Sunday = 1), week? }], daysOfMonth?, monthsOfYear?, weeksOfYear?, daysOfYear?, setPositions? }` — `until` epoch ms, `count` occurrences, neither for never; the arrays as iCalendar's BYDAY, BYMONTHDAY, BYMONTH, BYWEEKNO, BYYEARDAY, BYSETPOS, negatives counting from the end; `week` on a day only in a monthly (±1..5) or yearly (±1..53) rule. `null` removes the rule. Not an RRULE string: a consumer holding iCalendar text parses it on its own side |
+| `alarms`                                   | `[{ offset: seconds from the start, negative before it }]` or `[{ at: epoch ms }]`; `null` or `[]` removes them                                                                                                                                                                                                                                             |
+| `opts.span`                                | `'this'` (the default) or `'future'`: how far a change to — or the removal of — a recurring event reaches, `EKSpanThisEvent` / `EKSpanFutureEvents`. `'this'` on one occurrence detaches it (it then carries its own `id`); `'future'` from a middle occurrence splits the series there, and what follows answers under a new `id` — though the account keeps it with the original object, so removing `'future'` from an earlier occurrence takes the split-off part and any detached occurrence with it |
+| `opts.commit`                              | `true` by default. `false` leaves the change pending for `commit()` — `commitCalendarStore` — and `reset()` forgets what is pending; the id is answered either way                                                                                                                                                                                          |
 
 - **Reading needs the full grant.** Both verbs answer an error naming the
   status — `notDetermined`, `denied`, `restricted`, or macOS 14's `writeOnly`,
@@ -642,8 +683,43 @@ native.postCalendarStoreChanged();                      // test-only: the notifi
   `setBackendEventCallback` is held and replayed at the start of the next
   `pump2()`, coalesced into one. The framework coalesces too, and a duplicate
   is harmless to a renderer whose answer is to re-query.
+- **Writing needs either grant.** A save, a removal, a commit and the
+  default calendar answer under the full grant or macOS 14's `writeOnly`
+  one, and an error naming the status otherwise. Under write-only the store
+  cannot read back what it saved — `eventWithIdentifier:` answers nil — so
+  changing or removing an event by id is refused as the EKError it is
+  (`EKErrorEventStoreNotAuthorized`) rather than reported as success; what
+  a write-only app can do is add. Measured on 15.2: `defaultCalendar()`
+  answers a stand-in the framework makes for the grant — id
+  `VIRTUAL_APP_CALENDAR_UUID`, title "Calendar", a source called "Account"
+  — and a save into it, or with no calendar named, lands in the user's real
+  default calendar; `list()` and `eventsBetween()` answer the error naming
+  `writeOnly`.
+- **What the framework refuses crosses as its error, never as a bare
+  boolean.** The rejection carries `code` (the `EKErrorCode` number),
+  `domain` (`'EKErrorDomain'`) and `reason`, the code's name from the
+  framework's own header — `EKErrorCalendarReadOnly`, `EKErrorNoCalendar`,
+  `EKErrorDatesInverted`, `EKErrorInvitesCannotBeMoved` … — so a consumer
+  can switch on the word; the message carries the framework's own text. An
+  id that names no event, a calendar id that names none, an `occurrenceDate`
+  that is not one of the series: errors through the callback with the
+  bridge's own message. What the framework *raises* — a rule it cannot
+  build, an object from another store — is caught and crosses the same way
+  rather than ending the process. A save that finds nothing changed is not a
+  failure.
+- **Writes are serial.** Every write runs on one serial queue at the reads'
+  QoS — off the JS thread, answered through a thread-safe function, never
+  inside the call — and one after another in the order asked, which is what
+  makes a batch (`commit: false` … `commit()`) mean something. A commit,
+  the consumer's own included, is followed by `'calendar-store-changed'`,
+  so a change made here and one made elsewhere look the same to the reader,
+  which is correct.
+- **No system sheet.** There is no `EKEventEditViewController` on macOS, so
+  there is nothing to defer to; this is API only, and the renderer draws the
+  editor.
 - **Not here:** reminders (`EKReminder` has its own predicate and its own
-  grant) and writing.
+  grant), calendars themselves (`saveCalendar:`), and attendees, which an
+  account manages through its invitations.
 
 ## Status item (the menu-bar extra)
 

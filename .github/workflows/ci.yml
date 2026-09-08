@@ -108,6 +108,22 @@ jobs:
               calDone = true;
             });
             calSync = false;
+            // the calendar writes (#41): a bad shape is a TypeError before anything is saved — a create
+            // without dates, a recurrence the framework would raise for, a span that is not one — and on a
+            // runner with no grant a save answers an error naming the status, never an id
+            for (const bad of [() => n.saveEvent({ title: 'no dates' }, () => {}), () => n.saveEvent({ start: 0, end: 1, recurrence: { frequency: 'weekly', daysOfWeek: [{ day: 2, week: 1 }] } }, () => {}), () => n.saveEvent({ start: 0, end: 1 }, { span: 'all' }, () => {}), () => n.removeEvent('', () => {}), () => n.defaultCalendar()]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
+            }
+            let saveSync = true, saveDone = false;
+            n.saveEvent({ title: 'appkit ci', start: 0, end: 1 }, (err, id) => {
+              if (saveSync) { console.error('saveEvent answered inside the call'); process.exit(1); }
+              const ok = calStatus === 'authorized' || calStatus === 'writeOnly' ? typeof id === 'string' || err instanceof Error : err instanceof Error && err.message.includes(calStatus);
+              if (!ok) { console.error('saveEvent', calStatus, err, id); process.exit(1); }
+              if (typeof id === 'string') n.removeEvent(id, () => {});
+              saveDone = true;
+            });
+            saveSync = false;
             // app presence (#15): badge and policy read back, a dock menu round-trips through the
             // delegate the Dock calls and its activation arrives tagged menu:'dock', attention ids cancel
             n.initApp();
@@ -200,6 +216,7 @@ jobs:
               n.destroyWindow2(win);
               if (!notifDone) { console.error('the notification response checks did not finish'); process.exit(1); }
               if (!calDone) { console.error('the calendar read did not answer'); process.exit(1); }
+              if (!saveDone) { console.error('the calendar write did not answer'); process.exit(1); }
               console.log('appkit addon OK on', process.platform, process.arch, 'node', process.version);
               process.exit(0);
             }, 4000);
@@ -220,6 +237,8 @@ jobs:
         run: node test/eventkit-permissions.js
       - name: EventKit calendar reads, the ungranted half and the store's change event
         run: node test/calendars.js
+      - name: EventKit calendar writes, the argument shapes and the ungranted half
+        run: node test/calendar-writes.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

@@ -950,6 +950,8 @@ static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
 
 // notifications.mm: responses that arrived before a listener was installed
 void CALNotificationsReplayHeld(Napi::Env env);
+// calendars.mm: an EventKit store change from before there was a listener
+void CALCalendarsReplayHeld(Napi::Env env);
 
 static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -957,9 +959,10 @@ static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   // what came before the callback did, ahead of this tick's input so the
   // renderer hears of it first: the launch's URL (or a Dock click), then a
   // notification acted on before the callback existed (one that launched
-  // the app, say)
+  // the app, say), then a calendar store that changed under it
   FlushPendingAppEvents(env);
   CALNotificationsReplayHeld(env);
+  CALCalendarsReplayHeld(env);
   @autoreleasepool {
     while (true) {
       NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny

@@ -56,6 +56,11 @@
 #include <cstring>
 #include <string>
 
+// src/calendars.mm — the change observer the process's store gets as it is
+// created, so EKEventStoreChangedNotification is watched from the store's
+// first moment whichever verb made it.
+void CALCalendarsObserveStore(EKEventStore* store);
+
 static const char* const kAuthorized = "authorized";
 static const char* const kDenied = "denied";
 static const char* const kRestricted = "restricted";
@@ -226,16 +231,26 @@ static const char* EKStatus(EKEntityType type) {
   }
 }
 
-// The process's one EKEventStore, created on the first request and never
-// released: a store is inert until a grant and creating one never prompts —
-// only the request does — and a grant refreshes it in place (it posts
-// EKEventStoreChangedNotification), so the store verbs that read calendars
-// and reminders share this instance rather than making their own.
+// The process's one EKEventStore, created by the first EventKit verb and
+// never released: a store is inert until a grant and creating one never
+// prompts — only the request does — and a grant refreshes it in place (it
+// posts EKEventStoreChangedNotification), so the store verbs that read
+// calendars and reminders share this instance rather than making their own.
+// Taken on the JS thread only: the fetches are thread-safe, the lazy
+// creation is not.
 EKEventStore* CALEventStore() {
   static EKEventStore* store = nil;
-  if (!store) store = [EKEventStore new];
+  if (!store) {
+    store = [EKEventStore new];
+    CALCalendarsObserveStore(store);
+  }
   return store;
 }
+
+// The grant calendars.mm reads before a fetch, so a store that may not be
+// read answers an error naming the status rather than an empty list. Apple's
+// mapping stays here, in the one place that knows it.
+const char* CALEventsAuthorizationStatus() { return EKStatus(EKEntityTypeEvent); }
 
 // TCC's answer for sending Apple Events to `bundleId`. With `ask`, the call
 // blocks while the consent dialog is up. procNotFound means the target is

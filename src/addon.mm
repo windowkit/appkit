@@ -1283,6 +1283,9 @@ void InitPermissions(Napi::Env env, Napi::Object exports);
 // src/notifications.mm — user notifications through UNUserNotificationCenter:
 // settings, authorization, categories, post/update/remove, action events.
 void InitNotifications(Napi::Env env, Napi::Object exports);
+// src/calendars.mm — the user's calendars and the occurrences in a range
+// through EventKit, and the store's change notification as a backend event.
+void InitCalendars(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1325,6 +1328,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitBackend(env, exports);
   InitPermissions(env, exports);
   InitNotifications(env, exports);
+  InitCalendars(env, exports);
   return exports;
 }
 

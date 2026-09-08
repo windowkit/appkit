@@ -558,6 +558,93 @@ native.openPrivacySettings(kind?);                                // no kind: th
   directory *is* the prompt and `EPERM` is the denial. `openSettings` also
   takes `'files-and-folders'` and `'full-disk-access'` for their panes.
 - `restricted` is MDM or parental controls: the user cannot grant it.
+## Calendars (EventKit)
+
+Every account the user added in System Settings › Internet Accounts — iCloud,
+Google, Exchange, CalDAV, a subscribed feed — is served by one framework,
+`EKEventStore`: the macOS counterpart of Evolution Data Server plus GNOME
+Online Accounts, where the desktop did the OAuth and the app never sees a
+credential. Mechanism only — which calendars to show, how to draw an all-day
+span and when to re-query stay in the renderer.
+
+```js
+const { calendars, permissions, native } = require('@windowkit/appkit');
+
+await permissions.request('calendars');          // the TCC grant — "Privacy authorizations" above
+
+const list = await calendars.list();
+// [{ id, title, color: [r, g, b, a] | null, type: 'local' | 'calDAV' | 'exchange' |
+//    'subscription' | 'birthday', source: { id, title, type }, immutable,
+//    allowsModifications, subscribed }]
+
+const day = 24 * 60 * 60 * 1000;
+const events = await calendars.eventsBetween({ start: Date.now(), end: Date.now() + 7 * day });
+// the occurrences in the range, recurrences already expanded, sorted by start
+const oneCalendar = await calendars.eventsBetween({
+  start: new Date('2026-09-01'), end: new Date('2026-10-01'), calendars: [list[0].id],
+});
+
+native.setBackendEventCallback((ev) => {
+  // 'calendar-store-changed' {}   something in the store changed: query again
+});
+
+// the natives underneath, callback-shaped
+native.calendars(cb);                                   // cb(err, [calendar])
+native.eventsBetween({ start, end, calendars? }, cb);   // epoch ms; cb(err, [event])
+native.postCalendarStoreChanged();                      // test-only: the notification EventKit posts
+```
+
+| event field                     | what                                                                                                                                                                       |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`, `itemId`, `externalId`    | `eventIdentifier`, `calendarItemIdentifier`, `calendarItemExternalIdentifier` — `null` where the store has none (a local calendar's items carry no external id)             |
+| `calendar`                      | the `id` of the calendar it is in                                                                                                                                          |
+| `title`, `location`, `notes`, `url` | strings, or `null` where the item has none — never `''` for absent                                                                                                     |
+| `start`, `end`                  | epoch ms, as the store reports them                                                                                                                                        |
+| `allDay`, `timeZone`            | `isAllDay`; the event's time-zone identifier (`'Europe/London'`) or `null` for a floating one                                                                               |
+| `status`                        | `'none'`, `'confirmed'`, `'tentative'`, `'cancelled'`                                                                                                                      |
+| `availability`                  | `'notSupported'`, `'busy'`, `'free'`, `'tentative'`, `'unavailable'`                                                                                                       |
+| `recurring`, `detached`         | `hasRecurrenceRules`; whether this occurrence was edited away from its series                                                                                              |
+| `occurrenceDate`                | where the occurrence sits in the series (epoch ms), which for a detached one is not its `start`                                                                             |
+| `organizer`, `attendees`        | present only when the event has them: `{ name, url, status, role, type, isCurrentUser }` — `url` is the `mailto:` the account gave, `status` `'unknown'` … `'inProcess'`, `role` `'required'`/`'optional'`/`'chair'`/`'nonParticipant'`, `type` `'person'`/`'room'`/`'resource'`/`'group'` |
+
+- **Reading needs the full grant.** Both verbs answer an error naming the
+  status — `notDetermined`, `denied`, `restricted`, or macOS 14's `writeOnly`,
+  which may save what it cannot read — rather than an empty list, so "no
+  events" and "not allowed to look" stay distinguishable. Neither verb
+  prompts: ask for `'calendars'` first. They share the one `EKEventStore` the
+  grant created, and `refreshSourcesIfNecessary` runs before a listing so a
+  calendar just added in Settings is there (the refresh itself is
+  asynchronous; what it pulls in arrives as a change event).
+- **Four years.** `predicateForEventsWithStartDate:endDate:calendars:` is
+  limited to a four-year span, so a longer range is a `TypeError` at the
+  bridge rather than a silently truncated answer — chunk it. An `end` before
+  the `start` is one too, and so is a `calendars` filter naming nothing: an
+  empty list would reach the predicate as "every calendar", the opposite of
+  what it says. An id that names no calendar is an error through the
+  callback, not a widened query.
+- **All-day events cross as the store reports them**: `allDay` true, `start`
+  at local midnight and `end` at the last second of the last day (23:59:59),
+  *not* an exclusive end. Normalising is the renderer's job; the bridge is
+  mechanism, and `test/calendars.js` pins the convention so a renderer's
+  normalisation has something to be checked against.
+- **Off the JS thread.** `eventsMatchingPredicate:` is synchronous and can
+  take a while over many calendars, so both verbs run on a background queue
+  and answer through a thread-safe function — never inside the call — holding
+  the loop open like pending I/O until they do. What the framework hands back
+  is copied into plain objects on that queue, so nothing EventKit-owned
+  crosses to JS. Colours are converted to sRGB like every other colour on
+  this bridge.
+- **The change event.** EventKit posts one notification for *any* change, and
+  its documented contract is "re-fetch": `'calendar-store-changed'` carries
+  nothing, and the answer to it is to query again. The observer is installed
+  with the process's store — i.e. from the first EventKit call, before a
+  listener could exist — and a change that arrives before
+  `setBackendEventCallback` is held and replayed at the start of the next
+  `pump2()`, coalesced into one. The framework coalesces too, and a duplicate
+  is harmless to a renderer whose answer is to re-query.
+- **Not here:** reminders (`EKReminder` has its own predicate and its own
+  grant) and writing.
+
 ## Status item (the menu-bar extra)
 
 `NSStatusItem` is the tray. An item shows an image or a title (or both) in the

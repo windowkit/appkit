@@ -501,11 +501,11 @@ native.beginDrag(win, {
 ## Privacy authorizations (TCC)
 
 macOS decides per process whether an app may use the camera, microphone,
-screen, accessibility, input monitoring or location, or send Apple Events to
-another app. The bridge is mechanism only: read the status, raise the system
-prompt where a framework offers one, and deep-link to the Settings pane where
-it does not. Policy — when to ask, what to do with a refusal — stays in the
-renderer.
+screen, accessibility, input monitoring or location, read the user's
+calendars and reminders, or send Apple Events to another app. The bridge is
+mechanism only: read the status, raise the system prompt where a framework
+offers one, and deep-link to the Settings pane where it does not. Policy —
+when to ask, what to do with a refusal — stays in the renderer.
 
 ```js
 const { permissions, native } = require('@windowkit/appkit');
@@ -513,6 +513,8 @@ const { permissions, native } = require('@windowkit/appkit');
 permissions.status('camera');             // 'authorized' | 'denied' | 'restricted' | 'notDetermined'
 await permissions.request('microphone');  // raises the system prompt; resolves to granted (boolean)
 permissions.status('automation', { target: 'com.apple.finder' });  // Apple Events, per target app
+permissions.status('calendars');          // the four words, or 'writeOnly' — macOS 14's save-only grant
+await permissions.request('calendars', { access: 'write-only' });  // the narrower prompt; granted when write-only or full access is held
 permissions.openSettings('screen-recording');  // System Settings › Privacy & Security › Screen Recording
 
 // the natives underneath, callback-shaped
@@ -529,6 +531,7 @@ native.openPrivacySettings(kind?);                                // no kind: th
 | `input-monitoring`       | `IOHIDCheckAccess` (listen)                    | `IOHIDRequestAccess`                       | granted / denied / unknown → `notDetermined`; the request posts the prompt and resolves at once, `notDetermined` while it is still up                              |
 | `automation`             | `AEDeterminePermissionToAutomateTarget`        | the same, asking                           | needs `{ target: bundleId }` of a **running** app, otherwise throws — TCC only answers for a running target. Asking blocks until answered, so it runs off the main thread |
 | `location`               | `CLLocationManager.authorizationStatus`        | `requestWhenInUseAuthorization`            | the answer comes through the delegate on the main run loop, i.e. while `app.run()` is pumping                                                                      |
+| `calendars`, `reminders` | `EKEventStore authorizationStatusForEntityType:` | `requestFullAccessToEventsWithCompletion:`, `requestWriteOnlyAccessToEventsWithCompletion:`, `requestFullAccessToRemindersWithCompletion:` (14+; `requestAccessToEntityType:completion:` before) | the fifth word: on macOS 14+ the status can be `writeOnly`, the partial grant that lets an app save items it cannot read. It crosses as it is — a writer treats it as granted, a reader as denied, and that is the renderer's call. `{ access: 'write-only' }` asks calendars for just that grant (reminders have no such grant: a TypeError); `granted` in the answer is whether the level asked for is held afterwards, so a write-only request is granted by write-only or full access. One `EKEventStore` serves the process, created by the first request — creating a store never prompts, only the request does — and it is the store the calendar-reading verbs share |
 
 - A request answers **once, asynchronously** — never inside the call — and
   holds the event loop open until then, like pending I/O.
@@ -536,8 +539,21 @@ native.openPrivacySettings(kind?);                                // no kind: th
   process* (Terminal, an IDE) or to `node` itself, and prompts with no
   usage-description strings. A bundled app must carry the keys
   (`NSCameraUsageDescription`, `NSMicrophoneUsageDescription`,
-  `NSLocationUsageDescription`, `NSAppleEventsUsageDescription`); without
-  them the request never prompts, or TCC ends the process.
+  `NSLocationUsageDescription`, `NSAppleEventsUsageDescription`; for
+  EventKit on macOS 14+ `NSCalendarsFullAccessUsageDescription`,
+  `NSCalendarsWriteOnlyAccessUsageDescription` and
+  `NSRemindersFullAccessUsageDescription`, and before 14
+  `NSCalendarsUsageDescription` / `NSRemindersUsageDescription`); without
+  them the request never prompts, or TCC ends the process. A sandboxed build
+  also needs the App Sandbox's one EventKit entitlement,
+  `com.apple.security.personal-information.calendars`.
+- **A refusal is an answer; a prompt nobody saw is not.** After a calendars
+  or reminders request the status is what the request reads back: `denied`
+  when the user refused, and still `notDetermined` when nothing was shown
+  (a bundle without the usage string, a process TCC cannot attribute) —
+  measured on macOS 15.2, a bundle without the keys gets its answer within
+  a few milliseconds, `granted` false and the status unchanged. The bridge
+  does not tell those apart; the renderer re-reads and decides.
 - **Folders** (Desktop, Documents, Downloads) need nothing native: reading the
   directory *is* the prompt and `EPERM` is the denial. `openSettings` also
   takes `'files-and-folders'` and `'full-disk-access'` for their panes.

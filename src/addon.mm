@@ -1286,6 +1286,9 @@ void InitNotifications(Napi::Env env, Napi::Object exports);
 // src/calendars.mm — the user's calendars and the occurrences in a range
 // through EventKit, and the store's change notification as a backend event.
 void InitCalendars(Napi::Env env, Napi::Object exports);
+// src/screencolor.mm — the eyedropper: one colour off the screen through
+// NSColorSampler, the system's own out-of-process sampler.
+void InitScreenColor(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1329,6 +1332,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitPermissions(env, exports);
   InitNotifications(env, exports);
   InitCalendars(env, exports);
+  InitScreenColor(env, exports);
   return exports;
 }
 

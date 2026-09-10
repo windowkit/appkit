@@ -498,6 +498,48 @@ native.beginDrag(win, {
   way.
 
 
+## Screen colour sampling (the eyedropper)
+
+The dropper button on a colour picker asks for one pixel of the screen, which is
+precisely the thing an application cannot draw for itself. `NSColorSampler` (10.15+)
+is macOS's answer: the system shows its own loupe **out of process**, the user
+magnifies and clicks, and the app is told the one colour they picked. Nothing here
+reads the screen, so this needs no Screen Recording grant — and the user gets the
+magnifier every other Mac colour picker shows them.
+
+```js
+const { screenColor, native, app } = require('@windowkit/appkit');
+
+app.run();                                  // the answer arrives on the main thread
+
+const color = await screenColor.sample();
+// { r, g, b } — sRGB, 0–1 floats — or null if the user dismissed the sampler
+if (color) paint(`#${[color.r, color.g, color.b].map((c) => Math.round(c * 255).toString(16).padStart(2, '0')).join('')}`);
+
+// the same thing, unwrapped: cb(err, color)
+native.sampleScreenColor((err, color) => { /* color, or null on a cancel */ });
+```
+
+- **A cancel is an ordinary outcome, not an error.** Escape (or a dismissal any other
+  way) answers `null`, the same shape every rung of react-x11's eyedropper ladder
+  answers a cancel with; an `Error` is reserved for a colour that could not be read at
+  all.
+- **sRGB, 0–1 floats**, the colour space every colour crosses this bridge in and the
+  shape of the `org.freedesktop.portal.Screenshot.PickColor` triple this stands in for.
+  The sampler reads the pixel in the display's own space — wide-gamut on most Macs
+  now — and ColorSync gamut-maps on the way, so a Display P3 red arrives as
+  `{ r: 1, g: 0, b: 0 }` rather than as components outside the range.
+- **One at a time.** A second `sample()` while a loupe is up joins that session rather
+  than stacking a second one — AppKit's own rule, its header says a show "begins or
+  attaches to an existing color sampling session" — and both callers get the same
+  answer, each once.
+- **Nothing dismisses it from code.** AppKit offers no such call, so the session ends
+  when the user picks a colour or presses Escape; there is no `cancelPanel` counterpart
+  here. Until then the pending sample holds the event loop open like pending I/O, and
+  the app has to be pumping (`app.run()`) to hear the answer — it is delivered on the
+  main thread, like the location grant.
+
+
 ## Privacy authorizations (TCC)
 
 macOS decides per process whether an app may use the camera, microphone,

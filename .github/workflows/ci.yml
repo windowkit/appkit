@@ -201,6 +201,15 @@ jobs:
               }), 10);
               live();
             }), 50);
+            // the screen colour sampler (#46): the verb a consumer feature-detects is there, and a call
+            // that is not one is refused before anything is shown. Nothing here shows the sampler: the
+            // session it puts up ends only when a person picks a colour or presses Escape, so a runner
+            // would sit under the loupe until the job timed out
+            if (typeof n.sampleScreenColor !== 'function') { console.error('sampleScreenColor missing'); process.exit(1); }
+            for (const bad of [() => n.sampleScreenColor(), () => n.sampleScreenColor(null), () => n.sampleScreenColor({})]) {
+              let err; try { bad(); } catch (e) { err = e; }
+              if (!(err instanceof TypeError)) { console.error('expected a TypeError, got', err); process.exit(1); }
+            }
             // file panels: the OS type database behind the filters, then a real NSOpenPanel
             // as a sheet on one of our windows, cancelled from JS, answering null through the pump
             if (n.contentTypeFor({ extension: 'png' }) !== 'public.png' || n.contentTypeFor({ mime: 'application/json' }) !== 'public.json' || n.contentTypeFor({ extension: 'nobody-declared-this' }) === null) { console.error('contentTypeFor'); process.exit(1); }
@@ -239,6 +248,8 @@ jobs:
         run: node test/calendars.js
       - name: EventKit calendar writes, the argument shapes and the ungranted half
         run: node test/calendar-writes.js
+      - name: The screen colour sampler's argument shapes (the sampler itself needs a person)
+        run: node test/screencolor.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

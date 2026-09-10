@@ -7,7 +7,8 @@
         "src/backend.mm",
         "src/permissions.mm",
         "src/notifications.mm",
-        "src/calendars.mm"
+        "src/calendars.mm",
+        "src/screencolor.mm"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"

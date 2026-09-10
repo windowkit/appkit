@@ -331,6 +331,28 @@ const calendars = {
   reset: () => new Promise((resolve) => native.resetCalendarStore(resolve)),
 };
 
+// One colour off the screen — the eyedropper — through NSColorSampler, the
+// system's own sampler: the loupe is drawn out of process, so this needs no
+// Screen Recording grant and the user gets the magnifier every other Mac
+// colour picker shows. Mechanism only: what the colour means past this — the
+// hex a component paints with, whether a cancel resolves null or rejects —
+// stays in the renderer.
+//
+// Nothing dismisses the sampler from code (AppKit offers no such call): the
+// session ends when the user picks a colour or presses Escape, and until
+// then the pending sample holds the event loop open. The answer arrives on
+// the main thread, so the app has to be pumping (app.run()) to hear it.
+const screenColor = {
+  // -> { r, g, b } in sRGB, 0–1 floats (the Screenshot portal's (ddd) shape),
+  //    or null when the user dismissed the sampler without picking: a cancel
+  //    is an ordinary outcome, not an error. A sample asked for while one is
+  //    already showing joins that session rather than stacking a second
+  //    loupe, and both get the same answer.
+  sample: () =>
+    new Promise((resolve, reject) =>
+      native.sampleScreenColor((err, color) => (err ? reject(err) : resolve(color)))),
+};
+
 const accessibility = {
   // System Settings › Accessibility › Display, as NSWorkspace reports it:
   // { reduceMotion, reduceTransparency, increaseContrast, differentiateWithoutColor, invertColors }.
@@ -342,5 +364,5 @@ const accessibility = {
 module.exports = {
   app, Window, Layer, TextLayer, GradientLayer, ShapeLayer,
   transaction, withoutAnimations, text, controls, permissions, notifications, calendars,
-  accessibility, native,
+  screenColor, accessibility, native,
 };

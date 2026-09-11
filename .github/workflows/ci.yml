@@ -258,6 +258,8 @@ jobs:
         run: node test/threaded-frames.js
       - name: The live-resize handshake — a bounded wait for a frame at the new size
         run: node test/threaded-resize.js
+      - name: A live resize's begin and end, in pump mode
+        run: node test/live-resize.js
       - name: A worker that ends with an answer in flight — dropped, not a fatal error
         run: node test/ending-worker.js
 

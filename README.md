@@ -179,6 +179,10 @@ handshake the edge moves first while the content catches up a frame or more behi
 - It applies that batch inline, so the frame lands in the same transaction as the new
   window size.
 - Each wait is reported as `resize-handshake { width, height, live, waited, met }`.
+- A live resize is bracketed by `window-live-resize { phase: 'begin' | 'end' }`, in both
+  modes (windowkit/appkit#63). AppKit calls nothing when the pointer stops or lifts, so the
+  end is how a renderer knows to run the measured layout it deferred during the drag. The
+  published window state (`getWindowFrame`, `windowState`) carries `liveResize` too.
 
 JS never waits on the UI thread, so the worst case is the deadline. A frame that misses it
 shows the last frame at the new size, with the root layer's `backgroundColor` in the newly

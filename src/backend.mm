@@ -155,13 +155,19 @@ static bool HasBackendCb() { return !gBackendCb.IsEmpty(); }
 // is closed: the record materialized in the callback's own environment and
 // handed over inline, as every event always was. Producers everywhere build
 // a CALEvent and call CALEmit (channel.h); nothing calls the callback
-// directly any more. The call is raw (channel.h): the notification and
-// calendar-change hops reach here from a threadsafe function's callback.
+// directly any more. The call is raw, so a failed call is a status rather
+// than node-addon-api's fatal error; an exception the callback throws is
+// left pending. Inside pump2 (a JS call frame) it rethrows to pump2's
+// caller, as it always has; the notification and calendar-change hops,
+// which reach here from a threadsafe function's callback, make it the
+// uncaught exception themselves (CALRaiseUncaughtIfPending).
 void CALPumpDeliver(const CALEvent& ev) {
   if (!HasBackendCb()) return;
   Napi::Env env = gBackendCb.Env();
   Napi::HandleScope scope(env);
-  CALCallJS(env, gBackendCb.Value(), {ev.ToObject(env)});
+  napi_value undefined, arg = ev.ToObject(env);
+  if (napi_get_undefined(env, &undefined) != napi_ok) return;
+  napi_call_function(env, undefined, gBackendCb.Value(), 1, &arg, nullptr);
 }
 
 bool CALHasBackendCb() { return HasBackendCb(); }

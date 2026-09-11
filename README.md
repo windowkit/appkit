@@ -113,10 +113,40 @@ exists, and lets it go when none does, so an app with nothing on screen can end.
 `runModal` (`NSModalPanelRunLoopMode`) and live resize too. Each drain applies its
 batch inside one `CATransaction` with implicit actions off. A command that starts a modal
 loop runs from a run-loop callout of its own once its drain is done, so the rest of the
-batch never waits behind the gesture. Routing the AppKit verbs through the queue is
-windowkit/appkit#51. Until then, a window is made on the main thread before `runMain`
-(as `test/threaded.js` does), and a worker cannot yet use the verbs that touch AppKit.
-Surfaces, drawing and text work from a worker as they always have.
+batch never waits behind the gesture.
+
+**The verbs from a worker** (windowkit/appkit#51). The verbs are the same in both modes.
+Each runs inline on the main thread, as it always has, and is queued from any other
+thread. From a worker, what changes is the shape of what a verb returns, because JS never
+waits on the UI thread (`test/threaded-verbs.js` covers each row):
+
+| from a worker | verbs |
+| --- | --- |
+| unchanged, on the calling thread | surfaces, every `ctx*`, layouts and fonts, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
+| a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardClear`, `cancelPanel`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
+| a handle at the call | `createWindow2`, followed by `window-created { handle, windowNumber }`; every event about the window, input included, carries `handle`, so `ev.handle === win` |
+| | `windowRootLayer`, allocated with the window |
+| | `createStatusItem`: its clicks carry the handle, and it is held until `removeStatusItem` |
+| | `requestUserAttention`: a bridge id |
+| | `openPanel` / `savePanel`: the answer through the callback, as before |
+| the published copy | `getWindowFrame`, `windowIsVisible`, `windowNumber` (all `null` until the window is made), `listScreens`, `accessibilityDisplayOptions`, `activationPolicy`, `appInfo`, `pasteboardChangeCount` |
+| a callback, the last argument | `pasteboardReadText`, `snapshotWindow`, `snapshotStatusItem`, `windowNumberAtPoint`, `mainMenuInfo`, `dockMenuInfo`, `statusItemInfo`, `activateMenuItem`, `activateDockMenuItem`, `activateStatusItemMenuItem`, `clickStatusItem`, `dragItems`, `dragItemData`, `dragItemString`, `postDragEvent`. On the main thread each still answers synchronously when no callback is given. |
+| events | `beginDrag`: `drag-session-began`, or `drag-session-ended` with nothing dropped. Its `provide` is a TypeError; give every value up front. |
+
+A few verbs behave differently from a worker:
+- **`setDropResponse`** cannot answer the `draggingEntered:` that is running as its event
+  crosses. It sets the standing answer for what follows. To make up for it, a drop carries
+  `items: [{ types, strings }]`, its text and URL representations read in.
+- **An app-modal panel** can be cancelled with `cancelPanel`, because the queue drains
+  inside `runModal`.
+- **`sampleScreenColor` and a location permission request** make their AppKit calls on the
+  UI thread.
+- **`pump2` and the first-generation API** (`createWindow`, `pump`, `setEventCallback`,
+  `closeWindow`, `windowScale`, `windowContentSize`, `hitTest`, `drawControl`,
+  `appearanceIsDark`) throw off the main thread.
+
+Not routed yet: the layer verbs (windowkit/appkit#52) and control bezels
+(windowkit/appkit#54).
 
 **Published state.** The UI thread keeps a copy, under a lock, of what a renderer reads
 back synchronously: each window's content rect, visibility, occlusion, key state and

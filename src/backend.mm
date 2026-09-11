@@ -1125,77 +1125,84 @@ static Napi::Value ActivateApp(const Napi::CallbackInfo& info) {
 // Apple Event Manager, minus a spurious errAETimeout on kAEOpenDocuments,
 // whose AppKit handler suspends the event to reply later.) No Automation
 // permission is involved: nothing leaves the process.
+// A command from a worker, whose dispatch failure then goes unreported.
 static Napi::Value PostAppleEvent(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
   if (!info[0].IsString()) {
     Napi::TypeError::New(env, "postAppleEvent: kind must be a string")
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
   std::string kind = info[0].As<Napi::String>().Utf8Value();
-  @autoreleasepool {
-    NSAppleEventDescriptor* target =
-        [NSAppleEventDescriptor currentProcessDescriptor];
-    AEEventClass cls;
-    AEEventID id;
-    NSAppleEventDescriptor* direct = nil;
-    if (kind == "open-url") {
-      if (!info[1].IsString()) {
-        Napi::TypeError::New(env, "postAppleEvent('open-url', url): url must be a string")
-            .ThrowAsJavaScriptException();
-        return env.Undefined();
-      }
-      cls = kInternetEventClass;
-      id = kAEGetURL;
-      direct = [NSAppleEventDescriptor descriptorWithString:BToNSString(info[1])];
-    } else if (kind == "open-documents") {
-      if (!info[1].IsArray()) {
-        Napi::TypeError::New(env, "postAppleEvent('open-documents', paths): paths must be an array")
-            .ThrowAsJavaScriptException();
-        return env.Undefined();
-      }
-      cls = kCoreEventClass;
-      id = kAEOpenDocuments;
-      direct = [NSAppleEventDescriptor listDescriptor];
-      Napi::Array paths = info[1].As<Napi::Array>();
-      for (uint32_t i = 0; i < paths.Length(); i++) {
-        NSURL* url = [NSURL fileURLWithPath:BToNSString(paths.Get(i))];
-        [direct insertDescriptor:[NSAppleEventDescriptor descriptorWithFileURL:url]
-                         atIndex:0];  // 0 appends
-      }
-    } else if (kind == "reopen") {
-      cls = kCoreEventClass;
-      id = kAEReopenApplication;
-    } else if (kind == "quit") {
-      cls = kCoreEventClass;
-      id = kAEQuitApplication;
-    } else {
-      Napi::TypeError::New(env, "postAppleEvent: unknown kind '" + kind + "'")
+  NSString* url = nil;
+  NSMutableArray<NSString*>* paths = nil;
+  if (kind == "open-url") {
+    if (!info[1].IsString()) {
+      Napi::TypeError::New(env, "postAppleEvent('open-url', url): url must be a string")
           .ThrowAsJavaScriptException();
       return env.Undefined();
     }
-    NSAppleEventDescriptor* ev =
-        [NSAppleEventDescriptor appleEventWithEventClass:cls
-                                                 eventID:id
-                                        targetDescriptor:target
-                                                returnID:kAutoGenerateReturnID
-                                           transactionID:kAnyTransactionID];
-    if (direct) [ev setParamDescriptor:direct forKeyword:keyDirectObject];
-    AppleEvent reply = {typeNull, NULL};
-    // the refCon reaches raw C handlers only; AppKit's are Objective-C
-    // methods looked up by class and id, but the parameter is non-null
-    static char refCon;
-    OSErr err = [[NSAppleEventManager sharedAppleEventManager]
-        dispatchRawAppleEvent:ev.aeDesc
-                 withRawReply:&reply
-                handlerRefCon:(SRefCon)&refCon];
-    AEDisposeDesc(&reply);
-    if (err != noErr) {
-      Napi::Error::New(env, "postAppleEvent: dispatch failed (" +
-                                std::to_string((int)err) + ")")
+    url = BToNSString(info[1]);
+  } else if (kind == "open-documents") {
+    if (!info[1].IsArray()) {
+      Napi::TypeError::New(env, "postAppleEvent('open-documents', paths): paths must be an array")
           .ThrowAsJavaScriptException();
+      return env.Undefined();
     }
+    paths = [NSMutableArray array];
+    Napi::Array a = info[1].As<Napi::Array>();
+    for (uint32_t i = 0; i < a.Length(); i++) [paths addObject:BToNSString(a.Get(i))];
+  } else if (kind != "reopen" && kind != "quit") {
+    Napi::TypeError::New(env, "postAppleEvent: unknown kind '" + kind + "'")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  __block OSErr err = noErr;
+  CALOnUI(^{
+    BEnsureApp();
+    @autoreleasepool {
+      NSAppleEventDescriptor* target =
+          [NSAppleEventDescriptor currentProcessDescriptor];
+      AEEventClass cls = kCoreEventClass;
+      AEEventID id = kAEQuitApplication;
+      NSAppleEventDescriptor* direct = nil;
+      if (url) {
+        cls = kInternetEventClass;
+        id = kAEGetURL;
+        direct = [NSAppleEventDescriptor descriptorWithString:url];
+      } else if (paths) {
+        id = kAEOpenDocuments;
+        direct = [NSAppleEventDescriptor listDescriptor];
+        for (NSString* p in paths) {
+          NSURL* u = [NSURL fileURLWithPath:p];
+          [direct insertDescriptor:[NSAppleEventDescriptor descriptorWithFileURL:u]
+                           atIndex:0];  // 0 appends
+        }
+      } else if (kind == "reopen") {
+        id = kAEReopenApplication;
+      }
+      NSAppleEventDescriptor* ev =
+          [NSAppleEventDescriptor appleEventWithEventClass:cls
+                                                   eventID:id
+                                          targetDescriptor:target
+                                                  returnID:kAutoGenerateReturnID
+                                             transactionID:kAnyTransactionID];
+      if (direct) [ev setParamDescriptor:direct forKeyword:keyDirectObject];
+      AppleEvent reply = {typeNull, NULL};
+      // the refCon reaches raw C handlers only; AppKit's are Objective-C
+      // methods looked up by class and id, but the parameter is non-null
+      static char refCon;
+      err = [[NSAppleEventManager sharedAppleEventManager]
+          dispatchRawAppleEvent:ev.aeDesc
+                   withRawReply:&reply
+                  handlerRefCon:(SRefCon)&refCon];
+      AEDisposeDesc(&reply);
+    }
+  });
+  if (pthread_main_np() && err != noErr) {
+    Napi::Error::New(env, "postAppleEvent: dispatch failed (" +
+                              std::to_string((int)err) + ")")
+        .ThrowAsJavaScriptException();
   }
   return env.Undefined();
 }
@@ -1345,6 +1352,12 @@ void CALReplayHeldEvents() {
 
 static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!pthread_main_np()) {
+    Napi::Error::New(env, "pump2: the main thread's — in threaded mode [NSApp run] "
+                          "dispatches, and a worker listens through connect()")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   BEnsureApp();
   CALReplayHeldEvents();
   @autoreleasepool {
@@ -2964,14 +2977,17 @@ static Napi::Value AppInfoFn(const Napi::CallbackInfo& info) {
 // behalf so nothing is dropped the way AppleScript's `of type` dropped MIME.
 // ---------------------------------------------------------------------------
 
-// What a presented panel owes JS: the callback and the env to call it with.
-// Hung on the panel itself so cancelPanel can tell an open panel from one
-// that has already answered.
+// What a presented panel owes JS: pump mode's callback and the env to call
+// it with, or a worker's threadsafe function. Hung on the panel itself so
+// cancelPanel can tell an open panel from one that has already answered.
 @interface CALPanelPending : NSObject {
  @public
   napi_env env_;
   Napi::FunctionReference cb_;
-  bool open_;  // NSOpenPanel answers paths[], NSSavePanel answers a path
+  bool threaded_;
+  Napi::ThreadSafeFunction tsfn_;
+  bool open_;   // NSOpenPanel answers paths[], NSSavePanel answers a path
+  bool modal_;  // app-modal (runModal) rather than a sheet
 }
 @end
 @implementation CALPanelPending
@@ -2979,19 +2995,26 @@ static Napi::Value AppInfoFn(const Napi::CallbackInfo& info) {
 
 static char kPanelPendingKey;
 
-static Napi::Value PanelResult(Napi::Env env, NSSavePanel* panel, bool open,
-                               NSModalResponse r) {
-  if (r != NSModalResponseOK) return env.Null();
+// The answer, read off the panel on the UI thread: paths[] for an open
+// panel, a path for a save panel, null for a cancel.
+static CALValueBlock PanelAnswer(NSSavePanel* panel, bool open, NSModalResponse r) {
+  if (r != NSModalResponseOK) return ^Napi::Value(Napi::Env e) { return e.Null(); };
   if (open) {
-    NSArray<NSURL*>* urls = ((NSOpenPanel*)panel).URLs;
-    Napi::Array a = Napi::Array::New(env, urls.count);
-    for (NSUInteger i = 0; i < urls.count; i++)
-      a.Set((uint32_t)i, Napi::String::New(env, urls[i].path.UTF8String));
-    return a;
+    std::vector<std::string> paths;
+    for (NSURL* u in ((NSOpenPanel*)panel).URLs) paths.push_back(u.path.UTF8String);
+    return ^Napi::Value(Napi::Env e) {
+      Napi::Array a = Napi::Array::New(e, paths.size());
+      for (size_t i = 0; i < paths.size(); i++)
+        a.Set((uint32_t)i, Napi::String::New(e, paths[i]));
+      return a;
+    };
   }
   NSURL* u = panel.URL;
-  return u ? Napi::Value(Napi::String::New(env, u.path.UTF8String))
-           : Napi::Value(env.Null());
+  bool has = u != nil;
+  std::string path = has ? u.path.UTF8String : "";
+  return ^Napi::Value(Napi::Env e) {
+    return has ? Napi::Value(Napi::String::New(e, path)) : Napi::Value(e.Null());
+  };
 }
 
 // The one place a panel answers. The pending record comes off first, so a
@@ -3001,9 +3024,14 @@ static void FinishPanel(NSSavePanel* panel, NSModalResponse r) {
   if (!p) return;
   objc_setAssociatedObject(panel, &kPanelPendingKey, nil,
                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  CALValueBlock answer = PanelAnswer(panel, p->open_, r);
+  if (p->threaded_) {
+    CALReply(p->tsfn_, answer);
+    return;
+  }
   Napi::Env env(p->env_);
   Napi::HandleScope scope(env);
-  Napi::Value result = PanelResult(env, panel, p->open_, r);
+  Napi::Value result = answer(env);
   Napi::FunctionReference cb = std::move(p->cb_);
   cb.Call({result});
 }
@@ -3016,34 +3044,74 @@ static NSURL* PanelURLArg(Napi::Value v) {
   return s.length ? [NSURL fileURLWithPath:s] : nil;
 }
 
-// The spec keys both panels share.
-static void ConfigurePanel(NSSavePanel* panel, Napi::Object o) {
+// A panel's spec, read on the calling thread; the panel itself is made on
+// the UI thread (MakePanel).
+struct PanelSpec {
+  NSString *title = nil, *message = nil, *prompt = nil, *name = nil;
+  NSURL* directoryURL = nil;
+  int canCreateDirectories = -1;  // -1: AppKit's default
+  NSArray<NSString*>* typeIds = nil;
+  bool directory = false, multiple = false;
+};
+
+static PanelSpec ParsePanelSpec(Napi::Object o, bool open) {
+  PanelSpec s;
   if (o.Has("title") && o.Get("title").IsString())
-    panel.title = BToNSString(o.Get("title"));
+    s.title = BToNSString(o.Get("title"));
   if (o.Has("message") && o.Get("message").IsString())
-    panel.message = BToNSString(o.Get("message"));
+    s.message = BToNSString(o.Get("message"));
   if (o.Has("prompt") && o.Get("prompt").IsString())
-    panel.prompt = BToNSString(o.Get("prompt"));
-  if (o.Has("directoryURL")) {
-    NSURL* u = PanelURLArg(o.Get("directoryURL"));
-    if (u) panel.directoryURL = u;
-  }
-  if (o.Has("canCreateDirectories"))
-    panel.canCreateDirectories =
-        BBoolOr(o, "canCreateDirectories", panel.canCreateDirectories);
+    s.prompt = BToNSString(o.Get("prompt"));
+  if (o.Has("directoryURL")) s.directoryURL = PanelURLArg(o.Get("directoryURL"));
+  if (o.Has("canCreateDirectories") && o.Get("canCreateDirectories").IsBoolean())
+    s.canCreateDirectories = o.Get("canCreateDirectories").As<Napi::Boolean>().Value();
   if (o.Has("allowedContentTypes") && o.Get("allowedContentTypes").IsArray()) {
     Napi::Array ids = o.Get("allowedContentTypes").As<Napi::Array>();
-    NSMutableArray<UTType*>* types = [NSMutableArray array];
+    NSMutableArray<NSString*>* strs = [NSMutableArray array];
     for (uint32_t i = 0; i < ids.Length(); i++) {
       Napi::Value v = ids.Get(i);
-      if (!v.IsString()) continue;
-      UTType* t = [UTType typeWithIdentifier:BToNSString(v)];
+      if (v.IsString()) [strs addObject:BToNSString(v)];
+    }
+    s.typeIds = strs;
+  }
+  if (open) {
+    s.directory = BBoolOr(o, "directory", false);
+    s.multiple = BBoolOr(o, "multiple", false);
+  } else if (o.Has("nameFieldStringValue") && o.Get("nameFieldStringValue").IsString()) {
+    s.name = BToNSString(o.Get("nameFieldStringValue"));
+  }
+  return s;
+}
+
+// On the UI thread.
+static NSSavePanel* MakePanel(const PanelSpec& s, bool open) {
+  NSSavePanel* panel;
+  if (open) {
+    NSOpenPanel* op = [NSOpenPanel openPanel];
+    op.canChooseDirectories = s.directory;
+    op.canChooseFiles = !s.directory;
+    op.allowsMultipleSelection = s.multiple;
+    panel = op;
+  } else {
+    panel = [NSSavePanel savePanel];
+    if (s.name) panel.nameFieldStringValue = s.name;
+  }
+  if (s.title) panel.title = s.title;
+  if (s.message) panel.message = s.message;
+  if (s.prompt) panel.prompt = s.prompt;
+  if (s.directoryURL) panel.directoryURL = s.directoryURL;
+  if (s.canCreateDirectories >= 0) panel.canCreateDirectories = s.canCreateDirectories;
+  if (s.typeIds) {
+    NSMutableArray<UTType*>* types = [NSMutableArray array];
+    for (NSString* id in s.typeIds) {
+      UTType* t = [UTType typeWithIdentifier:id];
       if (t) [types addObject:t];
     }
     // A list the OS recognises nothing of is no filter at all, the same as
     // passing none: a panel that admits nothing helps nobody.
     if (types.count) panel.allowedContentTypes = types;
   }
+  return panel;
 }
 
 // openPanel(spec, cb) / savePanel(spec, cb) -> panel handle
@@ -3064,52 +3132,78 @@ static Napi::Value PresentPanel(const Napi::CallbackInfo& info, bool open) {
     return env.Undefined();
   }
   Napi::Object o = info[0].As<Napi::Object>();
-  NSWindow* owner = nil;
+  id owner = nil;
   if (o.Has("window")) {
     Napi::Value w = o.Get("window");
     if (w.IsExternal()) {
-      owner = BDeref<NSWindow*>(w);
+      owner = CALHandleTarget(w);
     } else if (!w.IsNull() && !w.IsUndefined()) {
       Napi::TypeError::New(env, "window must be a window handle")
           .ThrowAsJavaScriptException();
       return env.Undefined();
     }
   }
-  BEnsureApp();
+  PanelSpec spec = ParsePanelSpec(o, open);
 
-  NSSavePanel* panel;
-  if (open) {
-    NSOpenPanel* op = [NSOpenPanel openPanel];
-    bool dirs = BBoolOr(o, "directory", false);
-    op.canChooseDirectories = dirs;
-    op.canChooseFiles = !dirs;
-    op.allowsMultipleSelection = BBoolOr(o, "multiple", false);
-    panel = op;
-  } else {
-    panel = [NSSavePanel savePanel];
-    if (o.Has("nameFieldStringValue") &&
-        o.Get("nameFieldStringValue").IsString())
-      panel.nameFieldStringValue = BToNSString(o.Get("nameFieldStringValue"));
+  if (pthread_main_np()) {
+    BEnsureApp();
+    NSSavePanel* panel = MakePanel(spec, open);
+    CALPanelPending* p = [CALPanelPending new];
+    p->env_ = (napi_env)env;
+    p->cb_ = Napi::Persistent(info[1].As<Napi::Function>());
+    p->threaded_ = false;
+    p->open_ = open;
+    objc_setAssociatedObject(panel, &kPanelPendingKey, p,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    Napi::Value handle = BWrapRetained(env, panel);
+    NSWindow* ownerWin = owner ? CALResolve(owner) : nil;
+    p->modal_ = !ownerWin;
+    if (ownerWin) {
+      [panel beginSheetModalForWindow:ownerWin
+                    completionHandler:^(NSModalResponse r) {
+                      FinishPanel(panel, r);
+                    }];
+    } else {
+      NSModalResponse r = [panel runModal];
+      FinishPanel(panel, r);
+    }
+    return handle;
   }
-  ConfigurePanel(panel, o);
 
-  CALPanelPending* p = [CALPanelPending new];
-  p->env_ = (napi_env)env;
-  p->cb_ = Napi::Persistent(info[1].As<Napi::Function>());
-  p->open_ = open;
-  objc_setAssociatedObject(panel, &kPanelPendingKey, p,
-                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  Napi::Value handle = BWrapRetained(env, panel);
-
-  if (owner) {
-    [panel beginSheetModalForWindow:owner
+  // From a worker: the handle now, the panel from a command — an app-modal
+  // one from a callout of its own, runModal being a nested loop — and the
+  // answer through a threadsafe function in this environment.
+  CALHandle* h = CALNewHandle();
+  Napi::Value handle = CALWrapHandle(env, h, false);
+  Napi::ThreadSafeFunction tsfn = CALReplyTo(
+      env, info[1].As<Napi::Function>(), open ? "appkit:openPanel" : "appkit:savePanel");
+  dispatch_block_t present = ^{
+    BEnsureApp();
+    NSSavePanel* panel = MakePanel(spec, open);
+    CALPanelPending* p = [CALPanelPending new];
+    p->threaded_ = true;
+    p->tsfn_ = tsfn;
+    p->open_ = open;
+    objc_setAssociatedObject(panel, &kPanelPendingKey, p,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    h->object_ = panel;
+    p->modal_ = !owner;
+    if (!owner) {
+      FinishPanel(panel, [panel runModal]);
+      return;
+    }
+    NSWindow* ownerWin = CALResolve(owner);
+    if (!ownerWin) {  // the window it was to sit on is gone
+      FinishPanel(panel, NSModalResponseCancel);
+      return;
+    }
+    [panel beginSheetModalForWindow:ownerWin
                   completionHandler:^(NSModalResponse r) {
                     FinishPanel(panel, r);
                   }];
-  } else {
-    NSModalResponse r = [panel runModal];
-    FinishPanel(panel, r);
-  }
+  };
+  if (owner) CALOnUI(present);
+  else CALOnUIModal(present);
   return handle;
 }
 
@@ -3121,10 +3215,12 @@ static Napi::Value SavePanelFn(const Napi::CallbackInfo& info) {
   return PresentPanel(info, false);
 }
 
-// cancelPanel(panel) -> bool — dismiss a sheet that is still up; its
-// callback then gets null. False when the panel has already answered.
-// (An app-modal panel cannot be reached from here: the thread that would
-// call this is inside runModal.)
+// cancelPanel(panel) -> bool — dismiss a panel that is still up; its
+// callback then gets null. False when the panel has already answered. In
+// pump mode only a sheet can be reached (the thread that would call this
+// for an app-modal panel is inside runModal); from a worker either can, the
+// command queue draining inside runModal too — and there the answer is
+// undefined, the command not having run yet.
 static Napi::Value CancelPanelFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!info[0].IsExternal()) {
@@ -3132,11 +3228,24 @@ static Napi::Value CancelPanelFn(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  NSSavePanel* panel = BDeref<NSSavePanel*>(info[0]);
-  if (!objc_getAssociatedObject(panel, &kPanelPendingKey))
-    return Napi::Boolean::New(env, false);
-  [panel cancel:nil];
-  return Napi::Boolean::New(env, true);
+  id target = CALHandleTarget(info[0]);
+  __block bool ok = false;
+  CALOnUI(^{
+    NSSavePanel* panel = CALResolve(target);
+    CALPanelPending* p = panel ? objc_getAssociatedObject(panel, &kPanelPendingKey) : nil;
+    if (!p) return;
+    if (p->modal_) {
+      // the panel is hosted out of process, and its cancel: ends a sheet but
+      // not the modal session runModal is in: that is ended as its Cancel
+      // button would, and runModal answers the cancel
+      [NSApp stopModalWithCode:NSModalResponseCancel];
+      CALPostWakeEvent();
+    } else {
+      [panel cancel:nil];
+    }
+    ok = true;
+  });
+  return BCommandAnswer(env, ok);
 }
 
 // Every panel sheet still up on `win`, answered null. Called before the
@@ -5291,10 +5400,48 @@ static void WritePasteboardValue(NSPasteboardItem* item, NSString* type,
 // shape; a drag of three files is three entries of one public.file-url
 // each, which is how Finder reads them). A bare object is one item. null
 // promises the representation through `provide`; without a provider it is
-// dropped.
-static NSArray<NSPasteboardItem*>* BuildPasteboardItems(
-    Napi::Env env, Napi::Value spec, CALDragProvider* provider) {
-  NSMutableArray<NSPasteboardItem*>* items = [NSMutableArray array];
+// dropped. Read on the calling thread into plain data; the NSPasteboardItems
+// are made on the UI thread.
+struct PbRep {
+  NSString* type = nil;
+  NSString* string = nil;
+  NSData* data = nil;
+  bool lazy = false;
+};
+typedef std::vector<std::vector<PbRep>> PbItemsSpec;
+
+// WritePasteboardValue's reading half: false for null / undefined.
+static bool ParsePbValue(Napi::Value v, PbRep* r) {
+  if (v.IsNull() || v.IsUndefined()) return false;
+  if (v.IsString()) {
+    r->string = BToNSString(v);
+    return true;
+  }
+  const void* bytes = nullptr;
+  size_t len = 0;
+  if (v.IsBuffer()) {
+    Napi::Buffer<uint8_t> b = v.As<Napi::Buffer<uint8_t>>();
+    bytes = b.Data();
+    len = b.Length();
+  } else if (v.IsTypedArray()) {
+    Napi::TypedArray a = v.As<Napi::TypedArray>();
+    bytes = (const uint8_t*)a.ArrayBuffer().Data() + a.ByteOffset();
+    len = a.ByteLength();
+  } else if (v.IsArrayBuffer()) {
+    Napi::ArrayBuffer a = v.As<Napi::ArrayBuffer>();
+    bytes = a.Data();
+    len = a.ByteLength();
+  } else {
+    r->string = BToNSString(v.ToString());
+    return true;
+  }
+  r->data = [NSData dataWithBytes:bytes length:len];
+  return true;
+}
+
+static PbItemsSpec ParsePasteboardItems(Napi::Env env, Napi::Value spec,
+                                        bool lazyAllowed) {
+  PbItemsSpec out;
   Napi::Array arr;
   if (spec.IsArray()) {
     arr = spec.As<Napi::Array>();
@@ -5306,18 +5453,38 @@ static NSArray<NSPasteboardItem*>* BuildPasteboardItems(
     Napi::Value v = arr.Get(i);
     if (!v.IsObject()) continue;
     Napi::Object o = v.As<Napi::Object>();
-    NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
-    NSMutableArray<NSString*>* lazy = [NSMutableArray array];
+    std::vector<PbRep> reps;
     Napi::Array keys = o.GetPropertyNames();
     for (uint32_t k = 0; k < keys.Length(); k++) {
       Napi::Value key = keys.Get(k);
       if (!key.IsString()) continue;
-      NSString* type = BToNSString(key);
-      Napi::Value val = o.Get(key);
-      if (val.IsNull() || val.IsUndefined()) {
-        if (provider) [lazy addObject:type];
-      } else {
-        WritePasteboardValue(item, type, val);
+      PbRep r;
+      r.type = BToNSString(key);
+      if (!ParsePbValue(o.Get(key), &r)) {
+        if (!lazyAllowed) continue;
+        r.lazy = true;
+      }
+      reps.push_back(r);
+    }
+    out.push_back(std::move(reps));
+  }
+  return out;
+}
+
+// On the UI thread.
+static NSArray<NSPasteboardItem*>* BuildPasteboardItems(const PbItemsSpec& spec,
+                                                        CALDragProvider* provider) {
+  NSMutableArray<NSPasteboardItem*>* items = [NSMutableArray array];
+  for (const std::vector<PbRep>& reps : spec) {
+    NSPasteboardItem* item = [[NSPasteboardItem alloc] init];
+    NSMutableArray<NSString*>* lazy = [NSMutableArray array];
+    for (const PbRep& r : reps) {
+      if (r.lazy) {
+        if (provider) [lazy addObject:r.type];
+      } else if (r.string) {
+        [item setString:r.string forType:r.type];
+      } else if (r.data) {
+        [item setData:r.data forType:r.type];
       }
     }
     if (lazy.count) [item setDataProvider:provider forTypes:lazy];
@@ -5327,22 +5494,27 @@ static NSArray<NSPasteboardItem*>* BuildPasteboardItems(
 }
 
 // The drag image, from either bitmap this addon deals in: `surface`, a
-// surface handle (the renderer's own paint, its scale known), or `image`, a
-// CGImage External — or the {image, width, height, scale} object
-// text.render / controls.render answer, taken whole.
-static NSImage* DragImageFrom(Napi::Object o, double* w, double* h) {
+// surface handle (the renderer's own paint, its scale known, its pixels
+// copied as they are at the call), or `image`, a CGImage External — or the
+// {image, width, height, scale} object text.render / controls.render
+// answer, taken whole. False with an error pending.
+struct DragImageSpec {
+  id image = nil;  // a CGImage, owned by ARC through the bridge
+  double w = 0, h = 0;
+};
+
+static bool ParseDragImage(Napi::Object o, DragImageSpec* d) {
   Napi::Value sv = o.Get("surface");
   if (sv.IsExternal()) {
     CALSurface* s = SurfaceFrom(sv);  // a released handle throws, as everywhere
-    if (!s) return nil;
+    if (!s) return false;
     double scale = s->scale > 0 ? s->scale : 1;
     CGImageRef cg = CGBitmapContextCreateImage(s->ctx);
-    if (!cg) return nil;
-    *w = s->width / scale;
-    *h = s->height / scale;
-    NSImage* img = [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(*w, *h)];
-    CGImageRelease(cg);
-    return img;
+    if (!cg) return true;
+    d->image = (__bridge_transfer id)cg;
+    d->w = s->width / scale;
+    d->h = s->height / scale;
+    return true;
   }
   Napi::Value iv = o.Get("image");
   double scale = BNumOr(o, "imageScale", 1);
@@ -5351,11 +5523,33 @@ static NSImage* DragImageFrom(Napi::Object o, double* w, double* h) {
     scale = BNumOr(r, "scale", scale);
     iv = r.Get("image");
   }
-  if (!iv.IsExternal()) return nil;
+  if (!iv.IsExternal()) return true;
   CGImageRef cg = (CGImageRef)iv.As<Napi::External<void>>().Data();
-  *w = CGImageGetWidth(cg) / scale;
-  *h = CGImageGetHeight(cg) / scale;
-  return [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(*w, *h)];
+  d->image = (__bridge id)cg;
+  d->w = CGImageGetWidth(cg) / scale;
+  d->h = CGImageGetHeight(cg) / scale;
+  return true;
+}
+
+// With threaded mode's channel open, the drop carries the cheap forms of
+// its payload itself — each item's types, and the strings of its text and
+// URL types — since a worker cannot read the drag pasteboard back inside
+// the destination callback, and after it the source may withdraw it.
+static std::string DragItemsJson(NSPasteboard* pb) {
+  NSMutableArray* out = [NSMutableArray array];
+  for (NSPasteboardItem* item in pb.pasteboardItems) {
+    NSMutableDictionary* strings = [NSMutableDictionary dictionary];
+    for (NSString* t in item.types) {
+      UTType* ut = [UTType typeWithIdentifier:t];
+      if (!ut || !([ut conformsToType:UTTypeText] || [ut conformsToType:UTTypeURL]))
+        continue;
+      NSString* s = [item stringForType:t];
+      if (s) strings[t] = s;
+    }
+    [out addObject:@{@"types" : item.types ?: @[], @"strings" : strings}];
+  }
+  NSData* d = [NSJSONSerialization dataWithJSONObject:out options:0 error:nil];
+  return d ? std::string((const char*)d.bytes, d.length) : "[]";
 }
 
 // The shared payload of the destination events: where (content view,
@@ -5393,6 +5587,8 @@ static void EmitDragInfo(CALBackendView* view, const char* type,
       ev.Num("sourceWindowNumber",
              (double)((CALBackendView*)src).window.windowNumber);
     ev.Num("sequence", (double)info.draggingSequenceNumber);
+    if (CALChannelOpen() && strcmp(type, "drag-perform") == 0)
+      ev.Json("items", DragItemsJson(pb));
   }
   CALEmit(std::move(ev));
 }
@@ -5487,19 +5683,51 @@ static void EmitDragSession(CALBackendView* view, const char* type,
 // view; an empty list unregisters. Until this is called a window takes no
 // drops and sees no drag events: AppKit routes a drag only to views
 // registered for a type it carries.
+// The hosting view of a verb's window, for a command: pump mode's checked
+// in the call (a TypeError for anything else, as always), a worker's when
+// its command runs (skipped then if it is not a createWindow2 window).
+static bool OnBackendView(Napi::Value v, const char* fn,
+                          void (^body)(CALBackendView* view)) {
+  if (pthread_main_np()) {
+    CALBackendView* view = BackendViewArg(v, fn);
+    if (!view) return false;
+    body(view);
+    return true;
+  }
+  if (!v.IsExternal()) {
+    Napi::TypeError::New(v.Env(), std::string(fn) + ": expected a createWindow2 window")
+        .ThrowAsJavaScriptException();
+    return false;
+  }
+  id target = CALHandleTarget(v);
+  CALOnUI(^{
+    NSWindow* win = CALResolve(target);
+    if ([win.contentView isKindOfClass:[CALBackendView class]])
+      body((CALBackendView*)win.contentView);
+  });
+  return true;
+}
+
+// The same resolution inside a command already on the UI thread.
+static CALBackendView* BackendViewOf(id target) {
+  NSWindow* win = CALResolve(target);
+  return [win.contentView isKindOfClass:[CALBackendView class]]
+             ? (CALBackendView*)win.contentView
+             : nil;
+}
+
 static Napi::Value RegisterDropTypes(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  CALBackendView* view = BackendViewArg(info[0], "registerDropTypes");
-  if (!view) return env.Undefined();
   NSMutableArray<NSString*>* types = [NSMutableArray array];
   if (info[1].IsArray()) {
     Napi::Array a = info[1].As<Napi::Array>();
     for (uint32_t i = 0; i < a.Length(); i++)
       if (a.Get(i).IsString()) [types addObject:BToNSString(a.Get(i))];
   }
-  [view unregisterDraggedTypes];  // replace, never accumulate
-  if (types.count) [view registerForDraggedTypes:types];
-  return env.Undefined();
+  OnBackendView(info[0], "registerDropTypes", ^(CALBackendView* view) {
+    [view unregisterDraggedTypes];  // replace, never accumulate
+    if (types.count) [view registerForDraggedTypes:types];
+  });
+  return info.Env().Undefined();
 }
 
 // setDropResponse(win, { accept, operation? }) — the view's answer for the
@@ -5509,15 +5737,20 @@ static Napi::Value RegisterDropTypes(const Napi::CallbackInfo& info) {
 // drag-perform, `accept: false` withdraws the drop. `operation` is one of
 // copy | move | link | generic | private | delete; absent, the conventional
 // choice among what the source allows.
+// From a worker it is a command, so it cannot answer the draggingEntered:
+// that is running as the event crosses: it is the standing answer for the
+// drag-over questions that follow (the rule for what AppKit asks
+// synchronously: push it ahead).
 static Napi::Value SetDropResponse(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  CALBackendView* view = BackendViewArg(info[0], "setDropResponse");
-  if (!view) return env.Undefined();
   Napi::Object o = info[1].IsObject() ? info[1].As<Napi::Object>()
                                       : Napi::Object::New(env);
-  view->dropAccept_ = BBoolOr(o, "accept", false);
+  bool accept = BBoolOr(o, "accept", false);
   NSString* op = BStrOr(o, "operation", nil);
-  view->dropOp_ = op.length ? op : nil;
+  OnBackendView(info[0], "setDropResponse", ^(CALBackendView* view) {
+    view->dropAccept_ = accept;
+    view->dropOp_ = op.length ? op : nil;
+  });
   return env.Undefined();
 }
 
@@ -5532,45 +5765,68 @@ static NSPasteboard* CurrentDragPasteboard() {
 // type) -> string | null read one. Read during the drag-perform callback:
 // the payload is the source's promise, and a source is free to withdraw it
 // once its session has ended.
+// Off the main thread each takes a callback (its last argument); in
+// threaded mode the drop's own `items` usually makes the call unnecessary.
 static Napi::Value DragItems(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  Napi::Array out = Napi::Array::New(env);
-  uint32_t n = 0;
-  for (NSPasteboardItem* item in CurrentDragPasteboard().pasteboardItems) {
-    Napi::Object o = Napi::Object::New(env);
-    Napi::Array types = Napi::Array::New(env);
-    uint32_t k = 0;
-    for (NSString* t in item.types) types.Set(k++, t.UTF8String);
-    o.Set("types", types);
-    out.Set(n++, o);
-  }
-  return out;
+  return CALAnswer(info, "dragItems", ^CALValueBlock {
+    std::vector<std::vector<std::string>> all;
+    for (NSPasteboardItem* item in CurrentDragPasteboard().pasteboardItems) {
+      std::vector<std::string> types;
+      for (NSString* t in item.types) types.push_back(t.UTF8String);
+      all.push_back(std::move(types));
+    }
+    return ^Napi::Value(Napi::Env e) {
+      Napi::Array out = Napi::Array::New(e);
+      uint32_t n = 0;
+      for (const std::vector<std::string>& types : all) {
+        Napi::Object o = Napi::Object::New(e);
+        Napi::Array ta = Napi::Array::New(e);
+        uint32_t k = 0;
+        for (const std::string& t : types) ta.Set(k++, t);
+        o.Set("types", ta);
+        out.Set(n++, o);
+      }
+      return out;
+    };
+  });
 }
 
-static NSPasteboardItem* DragItemArg(Napi::Value v) {
+// On the UI thread: the item at an index read on the calling thread.
+static NSPasteboardItem* DragItemAt(double i) {
   NSArray<NSPasteboardItem*>* items = CurrentDragPasteboard().pasteboardItems;
-  if (!v.IsNumber()) return nil;
-  double i = v.As<Napi::Number>().DoubleValue();
   if (!(i >= 0 && i < (double)items.count)) return nil;
   return items[(NSUInteger)i];
 }
 
+static double DragIndexArg(Napi::Value v) {
+  return v.IsNumber() ? v.As<Napi::Number>().DoubleValue() : -1;
+}
+
 static Napi::Value DragItemData(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSPasteboardItem* item = DragItemArg(info[0]);
-  if (!item || !info[1].IsString()) return env.Null();
-  NSData* d = [item dataForType:BToNSString(info[1])];
-  if (!d) return env.Null();
-  return Napi::Buffer<uint8_t>::Copy(env, (const uint8_t*)d.bytes, d.length);
+  double index = DragIndexArg(info[0]);
+  NSString* type = info[1].IsString() ? BToNSString(info[1]) : nil;
+  return CALAnswer(info, "dragItemData", ^CALValueBlock {
+    NSPasteboardItem* item = DragItemAt(index);
+    NSData* d = item && type ? [item dataForType:type] : nil;
+    return ^Napi::Value(Napi::Env e) {
+      return d ? Napi::Value(Napi::Buffer<uint8_t>::Copy(e, (const uint8_t*)d.bytes, d.length))
+               : Napi::Value(e.Null());
+    };
+  });
 }
 
 static Napi::Value DragItemString(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSPasteboardItem* item = DragItemArg(info[0]);
-  if (!item || !info[1].IsString()) return env.Null();
-  NSString* s = [item stringForType:BToNSString(info[1])];
-  if (!s) return env.Null();
-  return Napi::String::New(env, s.UTF8String);
+  double index = DragIndexArg(info[0]);
+  NSString* type = info[1].IsString() ? BToNSString(info[1]) : nil;
+  return CALAnswer(info, "dragItemString", ^CALValueBlock {
+    NSPasteboardItem* item = DragItemAt(index);
+    NSString* s = item && type ? [item stringForType:type] : nil;
+    bool has = s != nil;
+    std::string text = has ? s.UTF8String : "";
+    return ^Napi::Value(Napi::Env e) {
+      return has ? Napi::Value(Napi::String::New(e, text)) : Napi::Value(e.Null());
+    };
+  });
 }
 
 // beginDrag(win, { x, y, items, provide?, operations?, operationsOutside?,
@@ -5592,94 +5848,141 @@ static Napi::Value DragItemString(const Napi::CallbackInfo& info) {
 // hears drag-session-began / -moved / -ended, and the pointer's own
 // mousemove/mouseup do not arrive while it runs — the ended event is the
 // release.
+//
+// From a worker the session is begun by a modal command and the call
+// answers undefined: the answer is the drag-session-began event, or a
+// drag-session-ended with nothing dropped when no session began (no press
+// in flight and no x/y given included). `provide` answers AppKit
+// synchronously, which a worker cannot: there it is a TypeError, and every
+// representation's value is given up front.
 static Napi::Value BeginDrag(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  CALBackendView* view = BackendViewArg(info[0], "beginDrag");
-  if (!view) return env.Undefined();
+  bool main = pthread_main_np();
+  if (main) {
+    if (!BackendViewArg(info[0], "beginDrag")) return env.Undefined();
+  } else if (!info[0].IsExternal()) {
+    Napi::TypeError::New(env, "beginDrag: expected a createWindow2 window")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (!info[1].IsObject()) {
     Napi::TypeError::New(env, "beginDrag: expected an options object")
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
   Napi::Object o = info[1].As<Napi::Object>();
-
-  NSEvent* press = view->lastPress_;
-  if (press && press.window != view.window) press = nil;
   double x = BNumOr(o, "x", NAN), y = BNumOr(o, "y", NAN);
-  if (std::isnan(x) || std::isnan(y)) {
-    if (!press) {
-      Napi::TypeError::New(env, "beginDrag: x and y are required without a press in flight")
-          .ThrowAsJavaScriptException();
-      return env.Undefined();
-    }
-    NSPoint p = [view convertPoint:press.locationInWindow fromView:nil];
-    x = p.x;
-    y = p.y;
-  }
-  if (!press) {
-    NSPoint wp = [view convertPoint:NSMakePoint(x, y) toView:nil];
-    press = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
-                               location:wp
-                          modifierFlags:0
-                              timestamp:NSProcessInfo.processInfo.systemUptime
-                           windowNumber:view.window.windowNumber
-                                context:nil
-                            eventNumber:0
-                             clickCount:1
-                               pressure:1];
-  }
 
   CALDragProvider* provider = nil;
   Napi::Value provide = o.Get("provide");
   if (provide.IsFunction()) {
+    if (!main) {
+      Napi::TypeError::New(env, "beginDrag: `provide` answers AppKit synchronously, "
+                                "which a worker cannot — give every value up front")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
     provider = [[CALDragProvider alloc] init];
     provider->env_ = env;
     provider->fn_ = Napi::Persistent(provide.As<Napi::Function>());
   }
-  NSArray<NSPasteboardItem*>* pbItems =
-      BuildPasteboardItems(env, o.Get("items"), provider);
-  if (provider) provider->items_ = pbItems;
-  if (pbItems.count == 0) {
+  PbItemsSpec items = ParsePasteboardItems(env, o.Get("items"), provider != nil);
+  if (items.empty()) {
     Napi::TypeError::New(env, "beginDrag: items must name at least one item")
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  DragImageSpec image;
+  if (!ParseDragImage(o, &image)) return env.Undefined();
+  double imageW = o.Has("imageWidth") ? BNumOr(o, "imageWidth", NAN) : NAN;
+  double imageH = o.Has("imageHeight") ? BNumOr(o, "imageHeight", NAN) : NAN;
+  double imageX = BNumOr(o, "imageX", NAN), imageY = BNumOr(o, "imageY", NAN);
+  NSDragOperation mask = DragMaskFrom(o.Get("operations"));
+  NSDragOperation maskOutside =
+      o.Has("operationsOutside") ? DragMaskFrom(o.Get("operationsOutside")) : mask;
+  bool ignoreModifiers = BBoolOr(o, "ignoreModifiers", false);
+  bool slideBack = BBoolOr(o, "slideBack", true);
+  id target = CALHandleTarget(info[0]);
 
-  double w = 0, h = 0;
-  NSImage* img = DragImageFrom(o, &w, &h);
-  if (env.IsExceptionPending()) return env.Undefined();
-  if (o.Has("imageWidth")) w = BNumOr(o, "imageWidth", w);
-  if (o.Has("imageHeight")) h = BNumOr(o, "imageHeight", h);
-  double ix = BNumOr(o, "imageX", x - w / 2), iy = BNumOr(o, "imageY", y - h / 2);
-  if (!img) {
-    img = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
-    w = h = 1;
-    ix = x;
-    iy = y;
+  __block bool began = false, needXY = false;
+  CALOnUIModal(^{
+    CALBackendView* view = BackendViewOf(target);
+    if (!view) return;
+    NSEvent* press = view->lastPress_;
+    if (press && press.window != view.window) press = nil;
+    double px = x, py = y;
+    if (std::isnan(px) || std::isnan(py)) {
+      if (!press) {
+        needXY = true;
+        if (!main)
+          EmitDragSession(view, "drag-session-ended", NSEvent.mouseLocation, "none");
+        return;
+      }
+      NSPoint p = [view convertPoint:press.locationInWindow fromView:nil];
+      px = p.x;
+      py = p.y;
+    }
+    if (!press) {
+      NSPoint wp = [view convertPoint:NSMakePoint(px, py) toView:nil];
+      press = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown
+                                 location:wp
+                            modifierFlags:0
+                                timestamp:NSProcessInfo.processInfo.systemUptime
+                             windowNumber:view.window.windowNumber
+                                  context:nil
+                              eventNumber:0
+                               clickCount:1
+                                 pressure:1];
+    }
+    NSArray<NSPasteboardItem*>* pbItems = BuildPasteboardItems(items, provider);
+    if (provider) provider->items_ = pbItems;
+
+    double w = image.w, h = image.h;
+    NSImage* img = image.image ? [[NSImage alloc] initWithCGImage:(__bridge CGImageRef)image.image
+                                                             size:NSMakeSize(w, h)]
+                               : nil;
+    if (!std::isnan(imageW)) w = imageW;
+    if (!std::isnan(imageH)) h = imageH;
+    double ix = std::isnan(imageX) ? px - w / 2 : imageX;
+    double iy = std::isnan(imageY) ? py - h / 2 : imageY;
+    if (!img) {
+      img = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
+      w = h = 1;
+      ix = px;
+      iy = py;
+    }
+    // the view is flipped, so a top-left frame is what setDraggingFrame: takes
+    NSRect frame = NSMakeRect(ix, iy, w, h);
+    NSMutableArray<NSDraggingItem*>* dragItems = [NSMutableArray array];
+    for (NSPasteboardItem* item in pbItems) {
+      NSDraggingItem* di = [[NSDraggingItem alloc] initWithPasteboardWriter:item];
+      [di setDraggingFrame:frame contents:img];
+      [dragItems addObject:di];
+    }
+
+    view->sourceMask_ = mask;
+    view->sourceMaskOutside_ = maskOutside;
+    view->ignoreModifiers_ = ignoreModifiers;
+    view->dragProvider_ = provider;  // alive for as long as the pasteboard may ask
+
+    NSDraggingSession* session = [view beginDraggingSessionWithItems:dragItems
+                                                               event:press
+                                                              source:view];
+    if (!session) {
+      if (!main)
+        EmitDragSession(view, "drag-session-ended", NSEvent.mouseLocation, "none");
+      return;
+    }
+    session.animatesToStartingPositionsOnCancelOrFail = slideBack;
+    began = true;
+  });
+  if (!main) return env.Undefined();
+  if (needXY) {
+    Napi::TypeError::New(env, "beginDrag: x and y are required without a press in flight")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
   }
-  // the view is flipped, so a top-left frame is what setDraggingFrame: takes
-  NSRect frame = NSMakeRect(ix, iy, w, h);
-  NSMutableArray<NSDraggingItem*>* dragItems = [NSMutableArray array];
-  for (NSPasteboardItem* item in pbItems) {
-    NSDraggingItem* di = [[NSDraggingItem alloc] initWithPasteboardWriter:item];
-    [di setDraggingFrame:frame contents:img];
-    [dragItems addObject:di];
-  }
-
-  view->sourceMask_ = DragMaskFrom(o.Get("operations"));
-  view->sourceMaskOutside_ = o.Has("operationsOutside")
-                                 ? DragMaskFrom(o.Get("operationsOutside"))
-                                 : view->sourceMask_;
-  view->ignoreModifiers_ = BBoolOr(o, "ignoreModifiers", false);
-  view->dragProvider_ = provider;  // alive for as long as the pasteboard may ask
-
-  NSDraggingSession* session = [view beginDraggingSessionWithItems:dragItems
-                                                             event:press
-                                                            source:view];
-  if (!session) return Napi::Boolean::New(env, false);
-  session.animatesToStartingPositionsOnCancelOrFail =
-      BBoolOr(o, "slideBack", true);
-  return Napi::Boolean::New(env, true);
+  return Napi::Boolean::New(env, began);
 }
 
 // A dragging info of our own, for postDragEvent: what AppKit would build
@@ -5748,55 +6051,74 @@ static Napi::Value BeginDrag(const Napi::CallbackInfo& info) {
 // again on any later phase that names it), `operations` is the pretend
 // source's mask (copy default), and `local: true` names this window's own
 // view as the source.
+// Off the main thread: postDragEvent(win, phase, opts, cb), the answer
+// through cb.
+static NSInteger gPostedDragSequence = 0;  // the UI thread's
+
 static Napi::Value PostDragEvent(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  CALBackendView* view = BackendViewArg(info[0], "postDragEvent");
-  if (!view) return env.Undefined();
+  if (pthread_main_np()) {
+    if (!BackendViewArg(info[0], "postDragEvent")) return env.Undefined();
+  } else if (!info[0].IsExternal()) {
+    Napi::TypeError::New(env, "postDragEvent: expected a createWindow2 window")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   std::string phase = info[1].IsString() ? info[1].As<Napi::String>().Utf8Value() : "";
+  if (phase != "enter" && phase != "over" && phase != "exit" && phase != "drop") {
+    Napi::TypeError::New(env, "postDragEvent: phase must be enter | over | exit | drop")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   Napi::Object o = info.Length() > 2 && info[2].IsObject()
                        ? info[2].As<Napi::Object>()
                        : Napi::Object::New(env);
+  bool hasItems = o.Has("items");
+  PbItemsSpec items = ParsePasteboardItems(env, o.Get("items"), false);
+  double x = BNumOr(o, "x", 0), y = BNumOr(o, "y", 0);
+  NSDragOperation mask = DragMaskFrom(o.Get("operations"));
+  bool local = BBoolOr(o, "local", false);
+  id target = CALHandleTarget(info[0]);
 
-  // one pasteboard per drag: a new one on enter, its contents whatever
-  // `items` the latest phase named (a drag's payload is fixed in AppKit,
-  // but a test may want to say it once, at the drop)
-  static NSInteger sequence = 0;
-  if (phase == "enter" || !gPostedPasteboard) {
-    if (gPostedPasteboard) [gPostedPasteboard releaseGlobally];
-    gPostedPasteboard = [NSPasteboard pasteboardWithUniqueName];
-    sequence++;
-  }
-  if (phase == "enter" || o.Has("items")) {
-    [gPostedPasteboard clearContents];
-    [gPostedPasteboard writeObjects:BuildPasteboardItems(env, o.Get("items"), nil)];
-  }
-  CALPostedDragInfo* di = [[CALPostedDragInfo alloc] init];
-  di->window_ = view.window;
-  di->pasteboard_ = gPostedPasteboard;
-  di->location_ = [view convertPoint:NSMakePoint(BNumOr(o, "x", 0), BNumOr(o, "y", 0)) toView:nil];
-  di->mask_ = DragMaskFrom(o.Get("operations"));
-  di->source_ = BBoolOr(o, "local", false) ? view : nil;
-  di->sequence_ = sequence;
-  di->formation_ = NSDraggingFormationDefault;
-  di->valid_ = (NSInteger)gPostedPasteboard.pasteboardItems.count;
+  return CALAnswer(info, "postDragEvent", ^CALValueBlock {
+    CALBackendView* view = BackendViewOf(target);
+    if (!view) return ^Napi::Value(Napi::Env e) { return e.Undefined(); };
+    // one pasteboard per drag: a new one on enter, its contents whatever
+    // `items` the latest phase named (a drag's payload is fixed in AppKit,
+    // but a test may want to say it once, at the drop)
+    if (phase == "enter" || !gPostedPasteboard) {
+      if (gPostedPasteboard) [gPostedPasteboard releaseGlobally];
+      gPostedPasteboard = [NSPasteboard pasteboardWithUniqueName];
+      gPostedDragSequence++;
+    }
+    if (phase == "enter" || hasItems) {
+      [gPostedPasteboard clearContents];
+      [gPostedPasteboard writeObjects:BuildPasteboardItems(items, nil)];
+    }
+    CALPostedDragInfo* di = [[CALPostedDragInfo alloc] init];
+    di->window_ = view.window;
+    di->pasteboard_ = gPostedPasteboard;
+    di->location_ = [view convertPoint:NSMakePoint(x, y) toView:nil];
+    di->mask_ = mask;
+    di->source_ = local ? view : nil;
+    di->sequence_ = gPostedDragSequence;
+    di->formation_ = NSDraggingFormationDefault;
+    di->valid_ = (NSInteger)gPostedPasteboard.pasteboardItems.count;
 
-  if (phase == "enter")
-    return Napi::String::New(env, DragOpName([view draggingEntered:di]));
-  if (phase == "over")
-    return Napi::String::New(env, DragOpName([view draggingUpdated:di]));
-  if (phase == "exit") {
-    [view draggingExited:di];
-    return env.Undefined();
-  }
-  if (phase == "drop") {
+    if (phase == "enter" || phase == "over") {
+      std::string op = DragOpName(phase == "enter" ? [view draggingEntered:di]
+                                                   : [view draggingUpdated:di]);
+      return ^Napi::Value(Napi::Env e) { return Napi::String::New(e, op); };
+    }
+    if (phase == "exit") {
+      [view draggingExited:di];
+      return ^Napi::Value(Napi::Env e) { return e.Undefined(); };
+    }
     bool taken = [view prepareForDragOperation:di] && [view performDragOperation:di];
     if (taken && [view respondsToSelector:@selector(concludeDragOperation:)])
       [view concludeDragOperation:di];
-    return Napi::Boolean::New(env, taken);
-  }
-  Napi::TypeError::New(env, "postDragEvent: phase must be enter | over | exit | drop")
-      .ThrowAsJavaScriptException();
-  return env.Undefined();
+    return BoolAnswer(taken);
+  });
 }
 
 // pasteboardTypeForMIME(mime) -> UTI — the OS's own MIME <-> UTI table

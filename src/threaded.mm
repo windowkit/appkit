@@ -605,6 +605,8 @@ static void PostWakeEvent() {
   [NSApp postEvent:e atStart:YES];
 }
 
+void CALPostWakeEvent() { PostWakeEvent(); }
+
 // On the UI thread. [NSApp stop:] ends the innermost loop only, and inside
 // runModal it ends the modal session instead of the app, so any nested loop
 // is ended first and the stop waits for the default mode — the main run.

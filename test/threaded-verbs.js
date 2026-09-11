@@ -177,4 +177,56 @@ async function run() {
   native.removeStatusItem(item); // once
   assert.strictEqual(await answer((cb) => native.statusItemInfo(item, cb)), null, 'gone after removeStatusItem');
   say('status item: ok');
+
+  // --- panels -----------------------------------------------------------------
+
+  const w2 = native.createWindow2({ width: 320, height: 240, title: 'drops', x: 140, y: 160 });
+  await until((ev) => ev.type === 'window-created' && ev.handle === w2, 'the second window');
+  native.showWindow(w2, false);
+  const cancelled = (open, spec) =>
+    new Promise((resolve, reject) => {
+      const kind = spec.window ? 'sheet' : 'app-modal panel';
+      const timer = setTimeout(() => reject(new Error(`the ${kind} never answered`)), 5000);
+      const done = (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      };
+      const panel = open ? native.openPanel(spec, done) : native.savePanel(spec, done);
+      assert.strictEqual(typeof panel, 'object', 'a panel handle at the call');
+      setTimeout(() => native.cancelPanel(panel), 300);
+    });
+  assert.strictEqual(await cancelled(false, { window: w2, nameFieldStringValue: 'x.txt' }), null, 'a sheet cancelled from the worker');
+  // pump mode cannot reach an app-modal panel (runModal holds the thread
+  // that would call cancelPanel); a worker's command drains inside it
+  assert.strictEqual(await cancelled(true, { title: 'threaded-verbs' }), null, 'an app-modal panel cancelled from the worker');
+  say('panels: ok');
+
+  // --- drag and drop, test posts -------------------------------------------------
+
+  const T = 'public.utf8-plain-text';
+  native.registerDropTypes(w2, [T]);
+  const drag = (phase, opts) => answer((cb) => native.postDragEvent(w2, phase, opts, cb));
+  assert.strictEqual(await drag('enter', { x: 30, y: 30, items: [{ [T]: 'dropped text' }] }), 'none', 'refused until the renderer answers');
+  const enter = await until((ev) => ev.type === 'drag-enter' && ev.handle === w2, 'drag-enter');
+  assert(enter.types.includes(T), 'drag-enter carries the types');
+  native.setDropResponse(w2, { accept: true });
+  assert.strictEqual(await drag('over', { x: 40, y: 40 }), 'copy', 'the standing answer set from the worker');
+  assert.strictEqual(await drag('drop', { x: 40, y: 40 }), true, 'the drop is taken');
+  const perform = await until((ev) => ev.type === 'drag-perform' && ev.handle === w2, 'drag-perform');
+  assert.strictEqual(perform.items.length, 1, 'the drop carries its items');
+  assert.strictEqual(perform.items[0].strings[T], 'dropped text', 'and their text, read in');
+  assert.strictEqual(await answer((cb) => native.dragItemString(0, T, cb)), 'dropped text', 'dragItemString through a callback');
+
+  const endedBefore = count('drag-session-ended');
+  assert.strictEqual(native.beginDrag(w2, { items: [{ 'dyn.appkit-threaded-verbs': 'x' }] }), undefined, 'beginDrag answers through events');
+  const ended = await until((ev) => ev.type === 'drag-session-ended' && count('drag-session-ended') > endedBefore, 'no press: a session that ended');
+  assert.strictEqual(ended.dropped, false, 'with nothing dropped');
+  assert.throws(() => native.beginDrag(w2, { items: [{ [T]: null }], provide: () => 'x' }), TypeError, '`provide` from a worker');
+
+  native.postAppleEvent('open-url', 'appkit-test://from-a-worker');
+  const opened = await until((ev) => ev.type === 'app-open-urls', 'app-open-urls');
+  assert.deepStrictEqual(opened.urls, ['appkit-test://from-a-worker'], 'postAppleEvent as a command');
+  assert.throws(() => native.pump2(), /main thread/, 'pump2 is the main thread\'s');
+  native.destroyWindow2(w2);
+  say('drag and drop, posts: ok');
 }

@@ -111,6 +111,11 @@ void CALOnUI(void (^block)(void));
 // thread outside a drain it runs inline, as today.
 void CALOnUIModal(void (^block)(void));
 
+// On the UI thread: an application-defined event for a loop waiting in
+// nextEventMatchingMask: to wake on — after a stopModal from a command, say,
+// which the modal loop only notices on its next event.
+void CALPostWakeEvent();
+
 // Windows and status items alive — the objects a person can act on. The
 // channel's threadsafe function holds the connected environment's loop open
 // while any exist and lets it go when none do, so an app with nothing on

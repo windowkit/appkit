@@ -47,9 +47,11 @@ async function run() {
     native.setLayerProps(box, { frame: [0, 0, w, h] });
     native.txCommit({ width: w, height: h });
   };
+  const liveReads = []; // the published liveResize, read inside each live resize tick
   native.connect((batch) => {
     for (const ev of batch) {
       events.push(ev);
+      if (ev.type === 'window-resize' && ev.handle === win && ev.live) liveReads.push(native.getWindowFrame(win).liveResize);
       // the renderer: a frame at every size the window reports
       if (ev.type === 'window-resize' && ev.handle === win && box) {
         if (lateMs) {
@@ -150,6 +152,20 @@ async function run() {
     (live.length ? `; waited p50 ${q(live.map((ev) => ev.waited), 0.5).toFixed(2)} ms` : ''));
   assert(live.length > 0, 'the posted drag became a live resize');
   assert(live.every((ev) => ev.met), 'every live frame came inside the budget');
+
+  // #63: the live resize is bracketed by window-live-resize begin / end, the
+  // published state says liveResize inside it, and not after
+  const after = events.slice(from);
+  const phases = after.filter((ev) => ev.type === 'window-live-resize' && ev.handle === win);
+  assert.deepStrictEqual(phases.map((ev) => ev.phase), ['begin', 'end'], 'one begin, one end');
+  const at = (pred) => after.findIndex(pred);
+  const iBegin = at((ev) => ev.type === 'window-live-resize' && ev.phase === 'begin');
+  const iEnd = at((ev) => ev.type === 'window-live-resize' && ev.phase === 'end');
+  const liveTicks = after.map((ev, i) => [ev, i]).filter(([ev]) => ev.type === 'window-resize' && ev.handle === win && ev.live);
+  assert(liveTicks.length && liveTicks.every(([, i]) => i > iBegin && i < iEnd), 'every live tick between begin and end');
+  assert(liveReads.length && liveReads.every((v) => v === true), 'published liveResize is true inside the drag');
+  assert.strictEqual(native.getWindowFrame(win).liveResize, false, 'and false once it ended');
+  say(`live resize bracketed: begin, ${liveTicks.length} live ticks, end`);
 
   native.destroyWindow2(win);
 }

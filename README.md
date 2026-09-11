@@ -191,7 +191,7 @@ Measured by `test/threaded-resize.js` on an M1 Pro, with 3 ms of layout per fram
 | --- | --- | --- |
 | 20 `setWindowFrame` steps | 20 of 20 | 3.07 ms |
 | a live resize (AppKit's own tracking, driven by posted mouse events) | 28 of 28 | 3.11 ms |
-| a 45 ms layout against a 15 ms budget | no | stopped at 16 ms |
+| a frame 60 ms late against a 15 ms budget | no | stopped at the deadline, ~16 ms |
 
 Not routed yet: control bezels (windowkit/appkit#54).
 

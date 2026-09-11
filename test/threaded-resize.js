@@ -37,19 +37,30 @@ async function run() {
   const events = [];
   let waiters = [];
   let win = null, box = null;
-  let layoutMs = 3;
+  let layoutMs = 3; // spent on this thread, as layout would be
+  let lateMs = 0; // a renderer slower than the budget, off the CPU while late
   const busy = (ms) => {
     for (const t = performance.now(); performance.now() - t < ms; );
+  };
+  const paint = (w, h) => {
+    native.txBegin({ disableActions: true });
+    native.setLayerProps(box, { frame: [0, 0, w, h] });
+    native.txCommit({ width: w, height: h });
   };
   native.connect((batch) => {
     for (const ev of batch) {
       events.push(ev);
       // the renderer: a frame at every size the window reports
       if (ev.type === 'window-resize' && ev.handle === win && box) {
-        busy(layoutMs);
-        native.txBegin({ disableActions: true });
-        native.setLayerProps(box, { frame: [0, 0, ev.width, ev.height] });
-        native.txCommit({ width: ev.width, height: ev.height });
+        if (lateMs) {
+          // Late by a timer rather than a busy loop: a spinning thread can
+          // keep a small CI VM from scheduling the UI thread whose deadline
+          // is being tested (it then wakes when the spin ends, frame in hand)
+          setTimeout(() => paint(ev.width, ev.height), lateMs);
+        } else {
+          busy(layoutMs);
+          paint(ev.width, ev.height);
+        }
       }
     }
     waiters = waiters.filter((check) => !check());
@@ -99,16 +110,16 @@ async function run() {
 
   // 2. a renderer slower than the budget: the deadline, not a hang
   native.setResizeHandshake(win, { waitMs: 15 });
-  layoutMs = 45;
+  lateMs = 60;
   from = events.length;
   native.setWindowFrame(win, null, null, 320, 230);
   await until(() => acks(from).length >= 1, 'the missed handshake');
   a = acks(from)[0];
-  say(`missed: met ${a.met}, waited ${a.waited.toFixed(2)} ms of a 15 ms budget`);
+  say(`missed: met ${a.met}, waited ${a.waited.toFixed(2)} ms of a 15 ms budget for a frame ${lateMs} ms late`);
   assert.strictEqual(a.met, false, 'the frame missed');
-  assert(a.waited >= 14 && a.waited < 30 * slack, 'the wait stopped at the deadline');
-  layoutMs = 3;
-  await sleep(100);
+  assert(a.waited >= 14 && a.waited < lateMs, 'the wait stopped at the deadline, not at the frame');
+  lateMs = 0;
+  await sleep(150);
 
   // 3. off: no wait, no report
   native.setResizeHandshake(win, { waitMs: 0 });

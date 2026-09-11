@@ -168,6 +168,17 @@ id CALHandleTarget(Napi::Value v);
 // made and after it is gone.
 id CALResolve(id target);
 
+// A frame batch from a worker's outermost txCommit: queued like any
+// command, tagged with the size it was painted at when the renderer said
+// (txCommit({ width, height })) — what a resize handshake waits for.
+void CALPostFrame(void (^block)(void), bool sized, double width, double height);
+
+// On the UI thread, from windowDidResize: (windowkit/appkit#53): wait at
+// most waitMs for a queued frame painted at width × height (not at all with
+// nobody connected), then drain the queue inline. True when the frame came
+// in time; *waitedMs is how long the wait took.
+bool CALAwaitFrame(double width, double height, double waitMs, double* waitedMs);
+
 // A layer verb's work (windowkit/appkit#52): run in the call on the main
 // thread; from any other, recorded into that thread's open frame batch
 // (txBegin … txCommit) or, outside one, queued as a command of its own.

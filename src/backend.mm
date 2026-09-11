@@ -624,7 +624,10 @@ static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info
 // window's number attached, and windowShouldClose needs to answer NO while
 // telling JS. One delegate class serves every window.
 
-@interface CALBackendDelegate : NSObject <NSWindowDelegate>
+@interface CALBackendDelegate : NSObject <NSWindowDelegate> {
+ @public
+  double handshakeMs_;  // setResizeHandshake's budget; 0 is off
+}
 @end
 
 // A worker's window carries its handle's id (createWindow2 off the main
@@ -658,10 +661,29 @@ static void EmitWindowGeometry(NSWindow* win, const char* type, bool live) {
   CALEmit(std::move(ev));
 }
 
+// The live-resize handshake (windowkit/appkit#53), after window-resize has
+// gone out: wait, bounded, for the renderer's frame at the new size and
+// apply it before AppKit commits the resize, then say how it went —
+// resize-handshake { windowNumber, handle?, width, height, live, waited
+// (ms), met } — which is the renderer's measure of whether its frames keep
+// up with the edge.
+static void AwaitFrameForResize(NSWindow* win, double waitMs) {
+  NSSize size = ContentViewScreenRect(win).size;
+  double waited = 0;
+  bool met = CALAwaitFrame(size.width, size.height, waitMs, &waited);
+  CALEvent ev = WindowEvent(win, "resize-handshake");
+  ev.Num("width", size.width).Num("height", size.height);
+  ev.Bool("live", win.inLiveResize).Num("waited", waited).Bool("met", met);
+  CALEmit(std::move(ev));
+}
+
 @implementation CALBackendDelegate
 - (void)windowDidResize:(NSNotification*)n {
   NSWindow* win = n.object;
   EmitWindowGeometry(win, "window-resize", win.inLiveResize);
+  // threaded mode's: in pump mode the event above ran the renderer inside
+  // this very call, and its frame is already in this transaction
+  if (handshakeMs_ > 0 && CALThreaded()) AwaitFrameForResize(win, handshakeMs_);
 }
 - (void)windowDidMove:(NSNotification*)n {
   EmitWindowGeometry((NSWindow*)n.object, "window-move", false);
@@ -1073,6 +1095,32 @@ static Napi::Value SetWindowMinMax(const Napi::CallbackInfo& info) {
     if (setMax) win.contentMaxSize = max;
   });
   return info.Env().Undefined();
+}
+
+// setResizeHandshake(win, { waitMs }) — the live-resize handshake
+// (windowkit/appkit#53). When the window's size changes, by a live resize or
+// a setWindowFrame, the UI thread sends window-resize and then waits, never
+// longer than waitMs, for a frame batch committed with that size
+// (txCommit({ width, height })), applying it in the same transaction as the
+// new size; resize-handshake reports each wait. 0 turns it off, the
+// default. Pump mode needs none — its window-resize runs the renderer inside
+// windowDidResize: itself — so it acts only while runMain runs.
+static Napi::Value SetResizeHandshake(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Value v = info[1].IsObject() ? info[1].As<Napi::Object>().Get("waitMs")
+                                     : env.Undefined();
+  double ms = v.IsNumber() ? v.As<Napi::Number>().DoubleValue() : NAN;
+  if (!(ms >= 0) || !std::isfinite(ms)) {
+    Napi::TypeError::New(env, "setResizeHandshake(win, { waitMs }): waitMs is a "
+                              "number of milliseconds, 0 for off")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  OnWindow(info[0], ^(NSWindow* win) {
+    CALBackendDelegate* d = objc_getAssociatedObject(win, &kDelegateKey);
+    if (d) d->handshakeMs_ = ms;
+  });
+  return env.Undefined();
 }
 
 static void CancelPanelSheetsOn(NSWindow* win);
@@ -6195,6 +6243,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("getWindowFrame", GetWindowFrame);
   BFN("windowState", WindowStateFn);
   BFN("setWindowMinMax", SetWindowMinMax);
+  BFN("setResizeHandshake", SetResizeHandshake);
   BFN("destroyWindow2", DestroyWindow2);
   BFN("invalidateWindowShadow", InvalidateWindowShadow);
   BFN("activateApp", ActivateApp);

@@ -1244,16 +1244,29 @@ static Napi::Value TxCommit(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
   }
   if (tlFrame.depth == 0) return info.Env().Undefined();  // nothing open
+  // txCommit({ width, height }) on the outermost commit: the size this frame
+  // was painted at, which a window's resize handshake waits for
+  // (setResizeHandshake, windowkit/appkit#53)
+  bool sized = false;
+  double width = 0, height = 0;
+  if (info.Length() > 0 && info[0].IsObject()) {
+    Napi::Object o = info[0].As<Napi::Object>();
+    if (o.Get("width").IsNumber() && o.Get("height").IsNumber()) {
+      sized = true;
+      width = NumOr(o, "width", 0);
+      height = NumOr(o, "height", 0);
+    }
+  }
   tlFrame.ops.push_back(^{ [CATransaction commit]; });
   if (--tlFrame.depth > 0) return info.Env().Undefined();
   std::vector<dispatch_block_t> ops = std::move(tlFrame.ops);
   tlFrame.ops.clear();
-  CALOnUI(^{
+  CALPostFrame(^{
     gApplyingWorkerFrame = true;
     for (dispatch_block_t op : ops) RunLayerOp(op);
     gApplyingWorkerFrame = false;
     FlushReleasedSurfaces();
-  });
+  }, sized, width, height);
   return info.Env().Undefined();
 }
 

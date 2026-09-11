@@ -71,6 +71,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
@@ -175,8 +178,17 @@ Napi::Object CALEvent::ToObject(Napi::Env env) const {
 // UserNotifications or EventKit queue) must not find them destroyed — the
 // #49 probe's "mutex lock failed: Invalid argument" abort.
 static std::mutex& gCmdMu = *new std::mutex;
-static std::vector<dispatch_block_t>& gCmdQ =
-    *new std::vector<dispatch_block_t>;  // gCmdMu
+// A queued command. A frame batch committed with txCommit({ width, height })
+// is tagged with the size it was painted at: what a window's resize
+// handshake waits for (CALAwaitFrame).
+struct Command {
+  dispatch_block_t block = nil;
+  bool sized = false;
+  double width = 0, height = 0;
+};
+static std::vector<Command>& gCmdQ = *new std::vector<Command>;  // gCmdMu
+// signalled on every post, for the handshake's bounded wait
+static std::condition_variable& gCmdCv = *new std::condition_variable;
 static CFRunLoopSourceRef gCmdSrc = nullptr;
 static int gDrainDepth = 0;  // the UI thread only
 
@@ -197,7 +209,7 @@ static void RunGuarded(dispatch_block_t b) {
 }
 
 static void DrainCommands(void*) {
-  std::vector<dispatch_block_t> batch;
+  std::vector<Command> batch;
   {
     std::lock_guard<std::mutex> l(gCmdMu);
     batch.swap(gCmdQ);
@@ -207,7 +219,7 @@ static void DrainCommands(void*) {
   @autoreleasepool {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    for (dispatch_block_t b : batch) RunGuarded(b);
+    for (const Command& c : batch) RunGuarded(c.block);
     [CATransaction commit];
   }
   gDrainDepth--;
@@ -226,14 +238,21 @@ static void EnsureCommandSource() {
   });
 }
 
-static void Post(dispatch_block_t b) {
+static void PostCommand(Command c) {
   EnsureCommandSource();
   {
     std::lock_guard<std::mutex> l(gCmdMu);
-    gCmdQ.push_back(b);
+    gCmdQ.push_back(std::move(c));
   }
+  gCmdCv.notify_all();
   CFRunLoopSourceSignal(gCmdSrc);
   CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+static void Post(dispatch_block_t b) {
+  Command c;
+  c.block = b;
+  PostCommand(std::move(c));
 }
 
 // A block of its own on the main run loop, in the default mode: after the
@@ -263,6 +282,19 @@ void CALOnUIModal(dispatch_block_t block) {
   } else {
     block();
   }
+}
+
+void CALPostFrame(dispatch_block_t block, bool sized, double width, double height) {
+  if (pthread_main_np()) {
+    block();
+    return;
+  }
+  Command c;
+  c.block = block;
+  c.sized = sized;
+  c.width = width;
+  c.height = height;
+  PostCommand(std::move(c));
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +584,49 @@ Napi::Value CALAnswer(const Napi::CallbackInfo& info, const char* name,
   if (nested) CALOnUIModal(work);
   else CALOnUI(work);
   return env.Undefined();
+}
+
+// ---------------------------------------------------------------------------
+// the live-resize handshake (windowkit/appkit#53)
+// ---------------------------------------------------------------------------
+//
+// windowDidResize: asks, on the UI thread, with the new content size: is a
+// frame painted at this size queued? It waits on the queue's condition
+// variable, never longer than `waitMs`, and then drains the queue inline —
+// not through the run-loop source, which AppKit's resize tracking would not
+// fire until the resize had committed without its frame (it calls the
+// delegate outside any run-loop pass: the #49 probe read a NULL mode
+// there). Drained inline, the frame lands in the same transaction as the
+// window's new size. JS never waits on the UI thread, so this cannot
+// deadlock: the worst case is the deadline, and then the last frame shows at
+// the new size, the root layer's background filling the exposed edge.
+
+static bool QueuedFrameAt(double w, double h) {  // gCmdMu held
+  for (const Command& c : gCmdQ)
+    if (c.sized && std::fabs(c.width - w) < 0.5 && std::fabs(c.height - h) < 0.5)
+      return true;
+  return false;
+}
+
+bool CALAwaitFrame(double width, double height, double waitMs, double* waitedMs) {
+  auto t0 = std::chrono::steady_clock::now();
+  bool connected;
+  {
+    std::lock_guard<std::mutex> l(gEvMu);
+    connected = gTsfn != nullptr;
+  }
+  bool met = false;
+  if (connected && waitMs > 0) {
+    std::unique_lock<std::mutex> l(gCmdMu);
+    met = gCmdCv.wait_until(
+        l, t0 + std::chrono::microseconds((long long)(waitMs * 1000)),
+        [&] { return QueuedFrameAt(width, height); });
+  }
+  *waitedMs = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+  DrainCommands(nullptr);
+  return met;
 }
 
 // ---------------------------------------------------------------------------

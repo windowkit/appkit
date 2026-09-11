@@ -105,7 +105,10 @@ worker busy for 200 ms gets what it missed together. Consecutive `mousemove` in 
 folds to the latest position before it crosses. Whatever is emitted before `connect` —
 the launch's URL, input that arrived while the worker started — is the first batch. A
 delivery runs in a callback scope, so a microtask queued inside `onEvents` runs right
-after it. The channel holds the worker's loop open while any window or status item
+after it. An exception thrown from `onEvents`, or from any callback the bridge answers
+through, is that environment's uncaught exception: `process.on('uncaughtException')` sees
+it, and with no handler the worker ends, and with it the run. The channel holds the
+worker's loop open while any window or status item
 exists, and lets it go when none does, so an app with nothing on screen can end.
 
 **Commands in.** The command queue is a version-0 `CFRunLoopSource` on the main run loop, in
@@ -179,6 +182,10 @@ handshake the edge moves first while the content catches up a frame or more behi
 - It applies that batch inline, so the frame lands in the same transaction as the new
   window size.
 - Each wait is reported as `resize-handshake { width, height, live, waited, met }`.
+- A live resize is bracketed by `window-live-resize { phase: 'begin' | 'end' }`, in both
+  modes (windowkit/appkit#63). AppKit calls nothing when the pointer stops or lifts, so the
+  end is how a renderer knows to run the measured layout it deferred during the drag. The
+  published window state (`getWindowFrame`, `windowState`) carries `liveResize` too.
 
 JS never waits on the UI thread, so the worst case is the deadline. A frame that misses it
 shows the last frame at the new size, with the root layer's `backgroundColor` in the newly

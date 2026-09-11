@@ -370,11 +370,27 @@ bool CALCanCallIntoJS(napi_env env) {
   return napi_set_named_property(env, o, "probe", v) == napi_ok;
 }
 
+// Left pending, an exception a threadsafe function's callback threw would
+// not be the environment's uncaught exception: under Node's default N-API
+// policy it is reported as a warning and the error dropped — and a worker
+// whose parent is parked in runMain went on running with its window up
+// (windowkit/appkit#62). Handed to napi_fatal_exception it is the uncaught
+// exception under either policy: process.on('uncaughtException') sees it,
+// and with no handler the environment ends, which ends the run.
+void CALRaiseUncaughtIfPending(napi_env env) {
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return;
+  napi_value err;
+  if (napi_get_and_clear_last_exception(env, &err) == napi_ok)
+    napi_fatal_exception(env, err);
+}
+
 void CALCallJS(napi_env env, napi_value cb,
                std::initializer_list<napi_value> args) {
   napi_value undefined;
   if (napi_get_undefined(env, &undefined) != napi_ok) return;
   napi_call_function(env, undefined, cb, args.size(), args.begin(), nullptr);
+  CALRaiseUncaughtIfPending(env);
 }
 
 // On the connected environment's thread.

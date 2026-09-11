@@ -807,6 +807,9 @@ static void CallJsChanged(Napi::Env env, Napi::Function, void*, void*) {
   if ((napi_env)env == nullptr) return;  // the function is being torn down
   if (!CALCanCallIntoJS(env)) return;    // or the environment is (channel.h)
   EmitOrHoldChange();
+  // pump mode's inline delivery leaves a listener's exception pending; from
+  // a threadsafe function's callback it is the uncaught exception (#62)
+  CALRaiseUncaughtIfPending(env);
 }
 
 // permissions.mm calls this the once, as it creates the process's store: the

@@ -187,13 +187,19 @@ static bool HasBackendCb() { return !gBackendCb.IsEmpty(); }
 // is closed: the record materialized in the callback's own environment and
 // handed over inline, as every event always was. Producers everywhere build
 // a CALEvent and call CALEmit (channel.h); nothing calls the callback
-// directly any more. The call is raw (channel.h): the notification and
-// calendar-change hops reach here from a threadsafe function's callback.
+// directly any more. The call is raw, so a failed call is a status rather
+// than node-addon-api's fatal error; an exception the callback throws is
+// left pending. Inside pump2 (a JS call frame) it rethrows to pump2's
+// caller, as it always has; the notification and calendar-change hops,
+// which reach here from a threadsafe function's callback, make it the
+// uncaught exception themselves (CALRaiseUncaughtIfPending).
 void CALPumpDeliver(const CALEvent& ev) {
   if (!HasBackendCb()) return;
   Napi::Env env = gBackendCb.Env();
   Napi::HandleScope scope(env);
-  CALCallJS(env, gBackendCb.Value(), {ev.ToObject(env)});
+  napi_value undefined, arg = ev.ToObject(env);
+  if (napi_get_undefined(env, &undefined) != napi_ok) return;
+  napi_call_function(env, undefined, gBackendCb.Value(), 1, &arg, nullptr);
 }
 
 bool CALHasBackendCb() { return HasBackendCb(); }
@@ -217,6 +223,7 @@ bool CALHasBackendCb() { return HasBackendCb(); }
 struct PubWindow {
   double x = 0, y = 0, width = 0, height = 0, scale = 1;
   bool visible = false, occluded = false, key = false, ignoresMouseEvents = false;
+  bool liveResize = false;  // inside a live resize (windowkit/appkit#63)
 };
 
 struct PubScreen {
@@ -283,6 +290,7 @@ static PubWindow WindowStateOf(NSWindow* win) {
   s.occluded = win.isVisible && !WindowOnGlass(win);
   s.key = win.isKeyWindow;
   s.ignoresMouseEvents = win.ignoresMouseEvents;
+  s.liveResize = win.inLiveResize;
   return s;
 }
 
@@ -298,11 +306,23 @@ static Napi::Object WindowStateObject(Napi::Env env, const PubWindow& s) {
   r.Set("occluded", s.occluded);
   r.Set("key", s.key);
   r.Set("ignoresMouseEvents", s.ignoresMouseEvents);
+  r.Set("liveResize", s.liveResize);
   return r;
 }
 
 static void PublishWindow(NSWindow* win) {
   PubWindow s = WindowStateOf(win);
+  long number = (long)win.windowNumber;
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubWindows[number] = s;
+}
+
+// At a live resize's two ends, where the flag is said rather than read back:
+// the notifications bracket the resize, and inLiveResize at exactly those
+// instants is AppKit's to decide.
+static void PublishWindowLiveResize(NSWindow* win, bool live) {
+  PubWindow s = WindowStateOf(win);
+  s.liveResize = live;
   long number = (long)win.windowNumber;
   std::lock_guard<std::mutex> l(gPubMu);
   gPubWindows[number] = s;
@@ -722,6 +742,25 @@ static void AwaitFrameForResize(NSWindow* win, double waitMs) {
 }
 - (void)windowDidMove:(NSNotification*)n {
   EmitWindowGeometry((NSWindow*)n.object, "window-move", false);
+}
+// A live resize's two ends (windowkit/appkit#63). AppKit's tracking loop
+// calls windowDidResize: once per pointer move and nothing when the pointer
+// stops or lifts, so a renderer that defers its measured layout until the
+// drag is over has to be told when it is: window-live-resize { phase:
+// 'begin' | 'end' }, in both modes, and liveResize in the published state.
+- (void)windowWillStartLiveResize:(NSNotification*)n {
+  NSWindow* win = n.object;
+  PublishWindowLiveResize(win, true);
+  CALEvent ev = WindowEvent(win, "window-live-resize");
+  ev.Str("phase", "begin");
+  CALEmit(std::move(ev));
+}
+- (void)windowDidEndLiveResize:(NSNotification*)n {
+  NSWindow* win = n.object;
+  PublishWindowLiveResize(win, false);
+  CALEvent ev = WindowEvent(win, "window-live-resize");
+  ev.Str("phase", "end");
+  CALEmit(std::move(ev));
 }
 - (BOOL)windowShouldClose:(NSWindow*)sender {
   if (CALListening()) CALEmit(WindowEvent(sender, "window-close-request"));

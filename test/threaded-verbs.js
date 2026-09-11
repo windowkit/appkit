@@ -229,4 +229,45 @@ async function run() {
   assert.throws(() => native.pump2(), /main thread/, 'pump2 is the main thread\'s');
   native.destroyWindow2(w2);
   say('drag and drop, posts: ok');
+
+  // --- control bezels (windowkit/appkit#54) ----------------------------------
+  // Measured and drawn on the UI thread into the worker's surface; the same
+  // bezels drawn by pump mode in a child process come out pixel for pixel
+  // the same. (From a worker these used to draw, then crash at exit: this
+  // test ending with status 0 is part of the check.)
+
+  assert.throws(() => native.measureControl({ kind: 'checkbox' }), TypeError, 'a bezel off the main thread without a callback');
+  assert.throws(() => native.measureControl({ kind: 'dial' }, () => {}), /unknown control kind/, 'an unknown kind, at the call');
+  const { createHash } = require('crypto');
+  const { spawnSync } = require('child_process');
+  const jobs = [];
+  for (const kind of ['push', 'checkbox', 'switch', 'slider']) {
+    const spec = { kind, controlSize: 'regular', state: 1, value: 0.5, enabled: true, appearance: 'light', title: kind === 'push' ? 'OK' : '' };
+    const m = await answer((cb) => native.measureControl(spec, cb));
+    assert(m.width > 0 && m.height > 0, `${kind}: measured`);
+    const pw = Math.round(m.width * 2), ph = Math.round(m.height * 2);
+    const s = native.createSurface(pw, ph, 2);
+    assert.strictEqual(await answer((cb) => native.drawControlIntoSurface(s, spec, cb)), undefined, `${kind}: drawn`);
+    const px = native.ctxGetImageData(s, 0, 0, pw, ph);
+    let ink = 0;
+    for (let i = 3; i < px.length; i += 4) if (px[i]) ink++;
+    assert(ink > 0, `${kind}: pixels inked`);
+    jobs.push({ kind, spec, pw, ph, hash: createHash('sha1').update(px).digest('hex') });
+  }
+  const pump = spawnSync(process.execPath, ['-e', `
+    const { native } = require(${JSON.stringify(path.join(__dirname, '..'))});
+    const { createHash } = require('crypto');
+    native.initApp();
+    const out = {};
+    for (const j of ${JSON.stringify(jobs)}) {
+      const s = native.createSurface(j.pw, j.ph, 2);
+      native.drawControlIntoSurface(s, j.spec);
+      out[j.kind] = createHash('sha1').update(native.ctxGetImageData(s, 0, 0, j.pw, j.ph)).digest('hex');
+    }
+    process.stdout.write(JSON.stringify(out));
+  `], { encoding: 'utf8', timeout: 20000 });
+  assert.strictEqual(pump.status, 0, `the pump-mode child: ${pump.stderr}`);
+  const pumped = JSON.parse(pump.stdout);
+  for (const j of jobs) assert.strictEqual(j.hash, pumped[j.kind], `${j.kind}: the same pixels as pump mode`);
+  say(`bezels: ok (${jobs.map((j) => j.kind).join(', ')} identical to pump mode)`);
 }

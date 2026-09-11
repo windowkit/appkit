@@ -196,7 +196,16 @@ Measured by `test/threaded-resize.js` on an M1 Pro, with 3 ms of layout per fram
 | a live resize (AppKit's own tracking, driven by posted mouse events) | 28 of 28 | 3.11 ms |
 | a frame 60 ms late against a 15 ms budget | no | stopped at the deadline, ~16 ms |
 
-Not routed yet: control bezels (windowkit/appkit#54).
+**Control bezels** (windowkit/appkit#54). The NSCell or NSControl behind a bezel is made
+on the UI thread. Called from a worker, they used to draw correct pixels and then crash the
+process at exit.
+- `measureControl(params, cb)` answers `cb({ width, height })`.
+- `drawControlIntoSurface(surface, params, cb)` draws straight into the worker's surface,
+  with nothing copied, and `cb()` says it is done; until then the renderer leaves the
+  surface alone.
+
+On the main thread without a callback both answer in the call, as before. Off it, a call
+without a callback is a TypeError.
 
 **Published state.** The UI thread keeps a copy, under a lock, of what a renderer reads
 back synchronously: each window's content rect, visibility, occlusion, key state and

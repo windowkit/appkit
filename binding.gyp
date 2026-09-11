@@ -8,7 +8,8 @@
         "src/permissions.mm",
         "src/notifications.mm",
         "src/calendars.mm",
-        "src/screencolor.mm"
+        "src/screencolor.mm",
+        "src/threaded.mm"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"

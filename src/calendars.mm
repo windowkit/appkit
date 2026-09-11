@@ -92,9 +92,8 @@
 #include <utility>
 #include <vector>
 
-// backend.mm: the one backend event callback
-bool CALHasBackendCb();
-void CALEmitBackendEvent(Napi::Env env, Napi::Object ev);
+// backend.mm / threaded.mm: the one backend event path
+#include "channel.h"
 
 // permissions.mm: the process's one EKEventStore — created by the first
 // EventKit verb and never before, since creating one never prompts — and
@@ -782,35 +781,34 @@ static ChangedTsfn gChanged;
 // framework coalesces, so what is held is that a change happened at all.
 static bool gHeldChange = false;
 
-static void EmitOrHoldChange(Napi::Env env) {
-  if (!CALHasBackendCb()) {
+static void EmitOrHoldChange() {
+  if (!CALListening()) {
     gHeldChange = true;
     return;
   }
-  Napi::HandleScope scope(env);
-  Napi::Object ev = Napi::Object::New(env);
-  ev.Set("type", "calendar-store-changed");
-  CALEmitBackendEvent(env, ev);
+  CALEmit(CALEvent("calendar-store-changed"));
 }
 
-// Called at the start of pump2 (backend.mm): a change from before the
-// listener existed goes out ahead of that tick's input.
-void CALCalendarsReplayHeld(Napi::Env env) {
-  if (!gHeldChange || !CALHasBackendCb()) return;
+// Called at the start of pump2, and as runMain opens the channel
+// (backend.mm): a change from before the listener existed goes out ahead of
+// that tick's input.
+void CALCalendarsReplayHeld() {
+  if (!gHeldChange || !CALListening()) return;
   gHeldChange = false;
-  EmitOrHoldChange(env);
+  EmitOrHoldChange();
 }
 
 static void CallJsChanged(Napi::Env env, Napi::Function, void*, void*) {
   if ((napi_env)env == nullptr) return;  // the function is being torn down
-  EmitOrHoldChange(env);
+  EmitOrHoldChange();
 }
 
 // permissions.mm calls this the once, as it creates the process's store: the
 // observer is in place from the store's first moment, whichever verb made it.
 // EKEventStoreChangedNotification carries no guarantee about its thread, so
 // the crossing to node's loop is the same hand-off a notification response
-// takes.
+// takes — in pump mode. With threaded mode's channel open the record goes
+// straight into it from whichever thread this is.
 void CALCalendarsObserveStore(EKEventStore* store) {
   static id observer = nil;
   if (observer) return;
@@ -818,7 +816,12 @@ void CALCalendarsObserveStore(EKEventStore* store) {
       addObserverForName:EKEventStoreChangedNotification
                   object:store
                    queue:nil
-              usingBlock:^(NSNotification*) { gChanged.NonBlockingCall(); }];
+              usingBlock:^(NSNotification*) {
+                if (CALChannelOpen())
+                  CALEmit(CALEvent("calendar-store-changed"));
+                else
+                  gChanged.NonBlockingCall();
+              }];
 }
 
 // --- the natives ------------------------------------------------------------

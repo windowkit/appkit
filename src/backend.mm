@@ -23,10 +23,16 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <objc/runtime.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
+#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include "channel.h"
 
 // --- helpers (self-contained: addon.mm keeps its own copies) ---------------
 
@@ -91,6 +97,7 @@ static NSMenu* gDockMenu = nil;  // applicationDockMenu: answer; setDockMenu
 
 static void BInstallAppDelegate();  // the app lifecycle section, below
 static void BInstallAccessibilityObserver();  // the accessibility section, below
+static void BPublishAppState();  // the published state section, below
 
 void BEnsureApp() {
   if (gAppLaunched) return;
@@ -110,6 +117,7 @@ void BEnsureApp() {
     [NSApp finishLaunching];
   }
   gAppLaunched = true;
+  BPublishAppState();
 }
 
 // The top of the primary screen, for global coordinate flips. The primary
@@ -142,15 +150,227 @@ static Napi::FunctionReference gBackendCb;
 // The guard only protects against dispatching with no callback installed.
 static bool HasBackendCb() { return !gBackendCb.IsEmpty(); }
 
-static void EmitToJS(Napi::Env env, Napi::Object ev) {
+// Pump mode's delivery, which threaded.mm's CALEmit calls while the channel
+// is closed: the record materialized in the callback's own environment and
+// handed over inline, as every event always was. Producers everywhere build
+// a CALEvent and call CALEmit (channel.h); nothing calls the callback
+// directly any more.
+void CALPumpDeliver(const CALEvent& ev) {
   if (!HasBackendCb()) return;
-  gBackendCb.Call({ev});
+  Napi::Env env = gBackendCb.Env();
+  Napi::HandleScope scope(env);
+  gBackendCb.Call({ev.ToObject(env)});
 }
 
-// The same callback, for the faces in other files: notifications.mm hands
-// the UNUserNotificationCenter delegate's responses through here.
 bool CALHasBackendCb() { return HasBackendCb(); }
-void CALEmitBackendEvent(Napi::Env env, Napi::Object ev) { EmitToJS(env, ev); }
+
+// ---------------------------------------------------------------------------
+// published state: what JS on a worker reads without a hop
+// ---------------------------------------------------------------------------
+//
+// In threaded mode (threaded.mm) the renderer's JS never waits on the UI
+// thread, so what it reads back synchronously is a copy the UI thread keeps
+// as things change, under one lock: each window's content rect, visibility,
+// occlusion, key state and scale; the screen list; the accessibility display
+// options; the activation policy; the pasteboard's change count (polled, as
+// nothing announces another app's write). listScreens,
+// accessibilityDisplayOptions and pasteboardChangeCount answer from it when
+// called off the main thread while runMain runs, and windowState and
+// activationPolicy read it in either mode. The copies are kept in pump mode
+// too — a few doubles per change — but every query pump mode already makes
+// still asks AppKit, live, on the main thread.
+
+struct PubWindow {
+  double x = 0, y = 0, width = 0, height = 0, scale = 1;
+  bool visible = false, occluded = false, key = false, ignoresMouseEvents = false;
+};
+
+struct PubScreen {
+  double x, y, width, height;           // the whole screen
+  double vx, vy, vwidth, vheight;       // less the menu bar and the Dock
+  double scale, fps;
+  bool primary;
+};
+
+struct A11yOptions {
+  bool reduceMotion, reduceTransparency, increaseContrast,
+      differentiateWithoutColor, invertColors;
+};
+
+// leaked, like threaded.mm's queues: a worker may still read while the
+// process exits, after static destructors have begun
+static std::mutex& gPubMu = *new std::mutex;
+static std::unordered_map<long, PubWindow>& gPubWindows =
+    *new std::unordered_map<long, PubWindow>;  // by windowNumber
+static std::vector<PubScreen>& gPubScreens = *new std::vector<PubScreen>;
+static A11yOptions gPubA11y = {};
+static std::atomic<int> gPubPolicy{(int)NSApplicationActivationPolicyRegular};
+static std::atomic<long> gPubPasteboardCount{0};
+
+// A worker's call while the main thread is AppKit's: answer from the copy.
+static bool ReadPublished() { return CALThreaded() && !pthread_main_np(); }
+
+static bool WindowOnGlass(NSWindow* win) {
+  return (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
+}
+
+// The content rect, top-left global coordinates, points.
+static PubWindow WindowStateOf(NSWindow* win) {
+  NSRect content = ContentViewScreenRect(win);
+  PubWindow s;
+  s.x = content.origin.x;
+  s.y = PrimaryScreenTop() - (content.origin.y + content.size.height);
+  s.width = content.size.width;
+  s.height = content.size.height;
+  s.scale = win.backingScaleFactor;
+  s.visible = win.isVisible;
+  // visible but with no pixel on glass: fully behind another app's window
+  s.occluded = win.isVisible && !WindowOnGlass(win);
+  s.key = win.isKeyWindow;
+  s.ignoresMouseEvents = win.ignoresMouseEvents;
+  return s;
+}
+
+// getWindowFrame's shape.
+static Napi::Object WindowStateObject(Napi::Env env, const PubWindow& s) {
+  Napi::Object r = Napi::Object::New(env);
+  r.Set("x", s.x);
+  r.Set("y", s.y);
+  r.Set("width", s.width);
+  r.Set("height", s.height);
+  r.Set("scale", s.scale);
+  r.Set("visible", s.visible);
+  r.Set("occluded", s.occluded);
+  r.Set("key", s.key);
+  r.Set("ignoresMouseEvents", s.ignoresMouseEvents);
+  return r;
+}
+
+static void PublishWindow(NSWindow* win) {
+  PubWindow s = WindowStateOf(win);
+  long number = (long)win.windowNumber;
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubWindows[number] = s;
+}
+
+static void ForgetWindow(long number) {
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubWindows.erase(number);
+}
+
+static std::vector<PubScreen> ScreensNow() {
+  CGFloat top = PrimaryScreenTop();
+  std::vector<PubScreen> out;
+  NSArray<NSScreen*>* screens = NSScreen.screens;
+  for (NSUInteger i = 0; i < screens.count; i++) {
+    NSScreen* s = screens[i];
+    NSRect f = s.frame, v = s.visibleFrame;
+    // the panel's own refresh rate, so a renderer paces frames on the
+    // display's period instead of assuming 60Hz on a 120Hz ProMotion
+    // panel; 0 where the OS cannot say (before macOS 12)
+    double fps = 0;
+    if (@available(macOS 12.0, *)) fps = (double)s.maximumFramesPerSecond;
+    out.push_back({f.origin.x, top - (f.origin.y + f.size.height), f.size.width,
+                   f.size.height, v.origin.x, top - (v.origin.y + v.size.height),
+                   v.size.width, v.size.height, s.backingScaleFactor, fps, i == 0});
+  }
+  return out;
+}
+
+// listScreens' shape.
+static Napi::Array ScreensArray(Napi::Env env, const std::vector<PubScreen>& screens) {
+  Napi::Array out = Napi::Array::New(env, screens.size());
+  for (size_t i = 0; i < screens.size(); i++) {
+    const PubScreen& s = screens[i];
+    Napi::Object o = Napi::Object::New(env);
+    o.Set("x", s.x);
+    o.Set("y", s.y);
+    o.Set("width", s.width);
+    o.Set("height", s.height);
+    Napi::Object work = Napi::Object::New(env);
+    work.Set("x", s.vx);
+    work.Set("y", s.vy);
+    work.Set("width", s.vwidth);
+    work.Set("height", s.vheight);
+    o.Set("visible", work);
+    o.Set("scale", s.scale);
+    o.Set("fps", s.fps);
+    o.Set("primary", s.primary);
+    out.Set((uint32_t)i, o);
+  }
+  return out;
+}
+
+static void PublishScreens() {
+  std::vector<PubScreen> screens = ScreensNow();
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubScreens = std::move(screens);
+}
+
+static A11yOptions A11yOptionsNow() {
+  NSWorkspace* ws = NSWorkspace.sharedWorkspace;
+  return {(bool)ws.accessibilityDisplayShouldReduceMotion,
+          (bool)ws.accessibilityDisplayShouldReduceTransparency,
+          (bool)ws.accessibilityDisplayShouldIncreaseContrast,
+          (bool)ws.accessibilityDisplayShouldDifferentiateWithoutColor,
+          (bool)ws.accessibilityDisplayShouldInvertColors};
+}
+
+static void A11yFields(CALEvent& r, const A11yOptions& a) {
+  r.Bool("reduceMotion", a.reduceMotion);
+  r.Bool("reduceTransparency", a.reduceTransparency);
+  r.Bool("increaseContrast", a.increaseContrast);
+  r.Bool("differentiateWithoutColor", a.differentiateWithoutColor);
+  r.Bool("invertColors", a.invertColors);
+}
+
+static void PublishA11y(const A11yOptions& a) {
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubA11y = a;
+}
+
+static void PublishPasteboardCount() {
+  gPubPasteboardCount = (long)NSPasteboard.generalPasteboard.changeCount;
+}
+
+// Everything the app as a whole publishes, once it is launched (BEnsureApp);
+// the screen list again whenever the arrangement or a resolution changes.
+static id gScreensObserver = nil;
+
+static void BPublishAppState() {
+  PublishScreens();
+  PublishA11y(A11yOptionsNow());
+  gPubPolicy = (int)NSApp.activationPolicy;
+  PublishPasteboardCount();
+  if (gScreensObserver) return;
+  gScreensObserver = [NSNotificationCenter.defaultCenter
+      addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                  object:NSApp
+                   queue:nil
+              usingBlock:^(NSNotification*) { PublishScreens(); }];
+}
+
+// windowState(windowNumber) -> { x, y, width, height, scale, visible,
+// occluded, key, ignoresMouseEvents } — getWindowFrame's answer for a
+// createWindow2 window, as the UI thread last published it; null for a
+// number this bridge has no window for. Any thread.
+static Napi::Value WindowStateFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsNumber()) {
+    Napi::TypeError::New(env, "windowState(windowNumber): a number is required")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  long number = (long)info[0].As<Napi::Number>().Int64Value();
+  PubWindow s;
+  {
+    std::lock_guard<std::mutex> l(gPubMu);
+    auto it = gPubWindows.find(number);
+    if (it == gPubWindows.end()) return env.Null();
+    s = it->second;
+  }
+  return WindowStateObject(env, s);
+}
 
 // ---------------------------------------------------------------------------
 // app lifecycle: what the OS asks the application as a whole
@@ -174,8 +394,8 @@ void CALEmitBackendEvent(Napi::Env env, Napi::Object ev) { EmitToJS(env, ev); }
 // event inside finishLaunching, so the delegate goes in before that call
 // (BEnsureApp). And initApp() runs before setBackendEventCallback(), so
 // whatever arrives with nobody listening is held here and replayed on the
-// first pump that has a listener, in arrival order, ahead of that pump's
-// NSEvents. Registering the scheme itself (CFBundleURLTypes) is an
+// first pump that has a listener — or as runMain opens the channel — in
+// arrival order, ahead of that pump's NSEvents. Registering the scheme itself (CFBundleURLTypes) is an
 // Info.plist matter for the app bundle, not runtime code.
 
 enum class AppEventKind { OpenURLs, Reopen, QuitRequest };
@@ -188,48 +408,40 @@ struct PendingAppEvent {
 };
 static std::vector<PendingAppEvent> gPendingAppEvents;
 
-static Napi::Object AppEventObject(Napi::Env env, const PendingAppEvent& p) {
-  Napi::Object ev = Napi::Object::New(env);
+static CALEvent AppEventRecord(const PendingAppEvent& p) {
   switch (p.kind) {
     case AppEventKind::OpenURLs: {
-      ev.Set("type", "app-open-urls");
-      Napi::Array urls = Napi::Array::New(env, p.urls.size());
-      for (size_t i = 0; i < p.urls.size(); i++)
-        urls.Set((uint32_t)i, p.urls[i]);
-      ev.Set("urls", urls);
-      break;
+      CALEvent ev("app-open-urls");
+      ev.Strs("urls", p.urls);
+      return ev;
     }
-    case AppEventKind::Reopen:
-      ev.Set("type", "app-reopen");
-      ev.Set("hasVisibleWindows", p.hasVisibleWindows);
-      break;
+    case AppEventKind::Reopen: {
+      CALEvent ev("app-reopen");
+      ev.Bool("hasVisibleWindows", p.hasVisibleWindows);
+      return ev;
+    }
     case AppEventKind::QuitRequest:
-      ev.Set("type", "app-quit-request");
       break;
   }
-  return ev;
+  return CALEvent("app-quit-request");
 }
 
-// Now if JS is listening, else held for the pump that finds it listening.
+// Now if anyone is listening, else held for the pump (or the run) that
+// finds a listener.
 static void EmitAppEvent(PendingAppEvent&& p) {
-  if (!HasBackendCb()) {
+  if (!CALListening()) {
     gPendingAppEvents.push_back(std::move(p));
     return;
   }
-  Napi::Env env = gBackendCb.Env();
-  Napi::HandleScope scope(env);
-  EmitToJS(env, AppEventObject(env, p));
+  CALEmit(AppEventRecord(p));
 }
 
-static void FlushPendingAppEvents(Napi::Env env) {
-  if (gPendingAppEvents.empty() || !HasBackendCb()) return;
+static void FlushPendingAppEvents() {
+  if (gPendingAppEvents.empty() || !CALListening()) return;
   // moved out first: a handler may pump, and pumping may hold more
   std::vector<PendingAppEvent> held = std::move(gPendingAppEvents);
   gPendingAppEvents.clear();
-  for (const PendingAppEvent& p : held) {
-    Napi::HandleScope scope(env);
-    EmitToJS(env, AppEventObject(env, p));
-  }
+  for (const PendingAppEvent& p : held) CALEmit(AppEventRecord(p));
 }
 
 @interface CALAppDelegate : NSObject <NSApplicationDelegate>
@@ -258,12 +470,13 @@ static void FlushPendingAppEvents(Napi::Env env) {
 }
 // With nobody listening the OS default stands and the process ends here,
 // as it always has. With a listener the request is theirs to act on, and
-// quitting is a process.exit on their side. Never NSTerminateLater: AppKit
-// would spin its own run loop waiting for the reply, and this process is
-// pumped from JS, not run by AppKit.
+// quitting is a process.exit on their side (in threaded mode, requestExit
+// and the main thread's process.exit). Never NSTerminateLater: AppKit would
+// spin its own run loop waiting for the reply, and in pump mode this
+// process is pumped from JS, not run by AppKit.
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
   (void)app;
-  if (!HasBackendCb()) return NSTerminateNow;
+  if (!CALListening()) return NSTerminateNow;
   EmitAppEvent(PendingAppEvent(AppEventKind::QuitRequest));
   return NSTerminateCancel;
 }
@@ -297,22 +510,19 @@ static void BInstallAppDelegate() {
 // reduceMotion (react-x11: loops never start, transitions still run) is its
 // own call.
 
-static Napi::Object AccessibilityDisplayOptions(Napi::Env env) {
-  NSWorkspace* ws = NSWorkspace.sharedWorkspace;
-  Napi::Object o = Napi::Object::New(env);
-  o.Set("reduceMotion", (bool)ws.accessibilityDisplayShouldReduceMotion);
-  o.Set("reduceTransparency", (bool)ws.accessibilityDisplayShouldReduceTransparency);
-  o.Set("increaseContrast", (bool)ws.accessibilityDisplayShouldIncreaseContrast);
-  o.Set("differentiateWithoutColor",
-        (bool)ws.accessibilityDisplayShouldDifferentiateWithoutColor);
-  o.Set("invertColors", (bool)ws.accessibilityDisplayShouldInvertColors);
-  return o;
-}
-
 // accessibilityDisplayOptions() -> { reduceMotion, reduceTransparency,
 // increaseContrast, differentiateWithoutColor, invertColors }
 static Napi::Value AccessibilityDisplayOptionsFn(const Napi::CallbackInfo& info) {
-  return AccessibilityDisplayOptions(info.Env());
+  A11yOptions a;
+  if (ReadPublished()) {
+    std::lock_guard<std::mutex> l(gPubMu);
+    a = gPubA11y;
+  } else {
+    a = A11yOptionsNow();
+  }
+  CALEvent r;
+  A11yFields(r, a);
+  return r.ToObject(info.Env());
 }
 
 // The observer is installed once, with the app (BEnsureApp), so it is in
@@ -329,12 +539,13 @@ static void BInstallAccessibilityObserver() {
                    queue:NSOperationQueue.mainQueue
               usingBlock:^(NSNotification* n) {
                 (void)n;
-                if (!HasBackendCb()) return;
-                Napi::Env env = gBackendCb.Env();
-                Napi::HandleScope scope(env);
-                Napi::Object ev = AccessibilityDisplayOptions(env);
-                ev.Set("type", "accessibility-display-changed");
-                EmitToJS(env, ev);
+                A11yOptions a = A11yOptionsNow();
+                PublishA11y(a);
+                if (!CALListening()) return;
+                CALEvent ev;
+                A11yFields(ev, a);
+                ev.Str("type", "accessibility-display-changed");
+                CALEmit(std::move(ev));
               }];
 }
 
@@ -342,11 +553,16 @@ static void BInstallAccessibilityObserver() {
 // posted from here through the same centre, so the observer path can be
 // exercised without touching the user's settings. Test-only, like
 // postAppleEvent; the values it carries are whatever the settings are.
+// A command: the centre calls its observers on the posting thread, and
+// AppKit's own (the menu bar's) rebuilds the main menu there — from a
+// worker that is an NSInternalInconsistencyException abort.
 static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info) {
-  BEnsureApp();
-  [NSWorkspace.sharedWorkspace.notificationCenter
-      postNotificationName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
-                    object:NSWorkspace.sharedWorkspace];
+  CALOnUI(^{
+    BEnsureApp();
+    [NSWorkspace.sharedWorkspace.notificationCenter
+        postNotificationName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                      object:NSWorkspace.sharedWorkspace];
+  });
   return info.Env().Undefined();
 }
 
@@ -354,64 +570,49 @@ static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info
 // window's number attached, and windowShouldClose needs to answer NO while
 // telling JS. One delegate class serves every window.
 
-@interface CALBackendDelegate : NSObject <NSWindowDelegate> {
- @public
-  napi_env env_;
-}
+@interface CALBackendDelegate : NSObject <NSWindowDelegate>
 @end
 
-static bool WindowOnGlass(NSWindow* win) {
-  return (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
-}
-
-static Napi::Object WindowEvent(Napi::Env env, NSWindow* win,
-                                const char* type) {
-  Napi::Object ev = Napi::Object::New(env);
-  ev.Set("type", type);
-  ev.Set("windowNumber", (double)win.windowNumber);
+static CALEvent WindowEvent(NSWindow* win, const char* type) {
+  CALEvent ev(type);
+  ev.Num("windowNumber", (double)win.windowNumber);
   return ev;
 }
 
-static void EmitWindowGeometry(Napi::Env env, NSWindow* win, const char* type,
-                               bool live) {
-  if (!HasBackendCb()) return;
-  Napi::HandleScope scope(env);
-  Napi::Object ev = WindowEvent(env, win, type);
+static void EmitWindowGeometry(NSWindow* win, const char* type, bool live) {
+  PublishWindow(win);
+  if (!CALListening()) return;
+  CALEvent ev = WindowEvent(win, type);
   NSRect content = ContentViewScreenRect(win);
-  ev.Set("width", content.size.width);
-  ev.Set("height", content.size.height);
-  ev.Set("x", content.origin.x);
-  ev.Set("y", PrimaryScreenTop() - (content.origin.y + content.size.height));
-  ev.Set("live", live);
-  EmitToJS(env, ev);
+  ev.Num("width", content.size.width);
+  ev.Num("height", content.size.height);
+  ev.Num("x", content.origin.x);
+  ev.Num("y", PrimaryScreenTop() - (content.origin.y + content.size.height));
+  ev.Bool("live", live);
+  CALEmit(std::move(ev));
 }
 
 @implementation CALBackendDelegate
 - (void)windowDidResize:(NSNotification*)n {
   NSWindow* win = n.object;
-  EmitWindowGeometry(Napi::Env(env_), win, "window-resize", win.inLiveResize);
+  EmitWindowGeometry(win, "window-resize", win.inLiveResize);
 }
 - (void)windowDidMove:(NSNotification*)n {
-  EmitWindowGeometry(Napi::Env(env_), (NSWindow*)n.object, "window-move",
-                     false);
+  EmitWindowGeometry((NSWindow*)n.object, "window-move", false);
 }
 - (BOOL)windowShouldClose:(NSWindow*)sender {
-  if (HasBackendCb()) {
-    Napi::Env env(env_);
-    Napi::HandleScope scope(env);
-    EmitToJS(env, WindowEvent(env, sender, "window-close-request"));
-  }
+  if (CALListening()) CALEmit(WindowEvent(sender, "window-close-request"));
   return NO;  // closing is the renderer's decision, never AppKit's
 }
 - (void)windowDidBecomeKey:(NSNotification*)n {
-  Napi::Env env(env_);
-  Napi::HandleScope scope(env);
-  EmitToJS(env, WindowEvent(env, (NSWindow*)n.object, "window-focus"));
+  NSWindow* win = n.object;
+  PublishWindow(win);
+  CALEmit(WindowEvent(win, "window-focus"));
 }
 - (void)windowDidResignKey:(NSNotification*)n {
-  Napi::Env env(env_);
-  Napi::HandleScope scope(env);
-  EmitToJS(env, WindowEvent(env, (NSWindow*)n.object, "window-blur"));
+  NSWindow* win = n.object;
+  PublishWindow(win);
+  CALEmit(WindowEvent(win, "window-blur"));
 }
 // A window entirely behind another application's window is still visible
 // by isVisible's measure and still costs every frame its tree produces.
@@ -419,19 +620,17 @@ static void EmitWindowGeometry(Napi::Env env, NSWindow* win, const char* type,
 // window is on glass, so a renderer can hold its frames until one is.
 - (void)windowDidChangeOcclusionState:(NSNotification*)n {
   NSWindow* win = n.object;
-  Napi::Env env(env_);
-  Napi::HandleScope scope(env);
-  Napi::Object ev = WindowEvent(env, win, "window-occlusion");
-  ev.Set("visible", WindowOnGlass(win));
-  EmitToJS(env, ev);
+  PublishWindow(win);
+  CALEvent ev = WindowEvent(win, "window-occlusion");
+  ev.Bool("visible", WindowOnGlass(win));
+  CALEmit(std::move(ev));
 }
 - (void)windowDidChangeBackingProperties:(NSNotification*)n {
   NSWindow* win = n.object;
-  Napi::Env env(env_);
-  Napi::HandleScope scope(env);
-  Napi::Object ev = WindowEvent(env, win, "window-scale");
-  ev.Set("scale", win.backingScaleFactor);
-  EmitToJS(env, ev);
+  PublishWindow(win);
+  CALEvent ev = WindowEvent(win, "window-scale");
+  ev.Num("scale", win.backingScaleFactor);
+  CALEmit(std::move(ev));
 }
 @end
 
@@ -445,10 +644,9 @@ static char kDelegateKey;
 @interface CALBackendView : NSView {
  @public
   NSTrackingArea* tracking_;
-  // drag and drop (its own section below): the env the callbacks run in,
-  // the destination's standing answer, the source's masks and provider,
-  // and the press a session is begun from
-  napi_env env_;
+  // drag and drop (its own section below): the destination's standing
+  // answer, the source's masks and provider, and the press a session is
+  // begun from
   bool dropAccept_;
   NSString* dropOp_;  // nil: the conventional operation for the source's mask
   NSDragOperation sourceMask_, sourceMaskOutside_;
@@ -570,7 +768,6 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
       win.ignoresMouseEvents = BBoolOr(o, "ignoresMouseEvents", false);
 
     CALBackendView* view = [[CALBackendView alloc] initWithFrame:rect];
-    view->env_ = (napi_env)env;
     CALayer* root = [CALayer layer];
     root.geometryFlipped = YES;
     [view setLayer:root];
@@ -597,12 +794,13 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     }
 
     CALBackendDelegate* delegate = [[CALBackendDelegate alloc] init];
-    delegate->env_ = (napi_env)env;
     win.delegate = delegate;
     objc_setAssociatedObject(win, &kDelegateKey, delegate,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [win makeFirstResponder:view];
+    PublishWindow(win);
   }
+  CALUIObjectsChanged(+1);
   return BWrapRetained(env, win);
 }
 
@@ -616,12 +814,14 @@ static Napi::Value ShowWindowFn(const Napi::CallbackInfo& info) {
   } else {
     [win orderFrontRegardless];
   }
+  PublishWindow(win);
   return info.Env().Undefined();
 }
 
 static Napi::Value HideWindowFn(const Napi::CallbackInfo& info) {
   NSWindow* win = BDeref<NSWindow*>(info[0]);
   [win orderOut:nil];
+  PublishWindow(win);
   return info.Env().Undefined();
 }
 
@@ -637,6 +837,7 @@ static Napi::Value SetWindowTitle(const Napi::CallbackInfo& info) {
 static Napi::Value SetWindowIgnoresMouseEvents(const Napi::CallbackInfo& info) {
   NSWindow* win = BDeref<NSWindow*>(info[0]);
   win.ignoresMouseEvents = info.Length() > 1 && info[1].ToBoolean().Value();
+  PublishWindow(win);
   return info.Env().Undefined();
 }
 
@@ -657,27 +858,15 @@ static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
   NSRect newContent =
       NSMakeRect(x, PrimaryScreenTop() - y - h, w, h);
   [win setFrame:[win frameRectForContentRect:newContent] display:YES];
+  PublishWindow(win);
   return info.Env().Undefined();
 }
 
 // -> { x, y, width, height, scale, visible, occluded, key, ignoresMouseEvents }
-// — content rect, top-left global coordinates, points.
+// — content rect, top-left global coordinates, points. (windowState reads
+// the same shape from the published copy, by window number.)
 static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  NSRect content = ContentViewScreenRect(win);
-  Napi::Object r = Napi::Object::New(env);
-  r.Set("x", content.origin.x);
-  r.Set("y", PrimaryScreenTop() - (content.origin.y + content.size.height));
-  r.Set("width", content.size.width);
-  r.Set("height", content.size.height);
-  r.Set("scale", win.backingScaleFactor);
-  r.Set("visible", (bool)win.isVisible);
-  // visible but with no pixel on glass: fully behind another app's window
-  r.Set("occluded", win.isVisible && !WindowOnGlass(win));
-  r.Set("key", (bool)win.isKeyWindow);
-  r.Set("ignoresMouseEvents", (bool)win.ignoresMouseEvents);
-  return r;
+  return WindowStateObject(info.Env(), WindowStateOf(BDeref<NSWindow*>(info[0])));
 }
 
 // windowNumberAtPoint(x, y, belowWindowNumber?) -> number — the window the
@@ -722,6 +911,9 @@ static void CancelPanelSheetsOn(NSWindow* win);
 
 static Napi::Value DestroyWindow2(const Napi::CallbackInfo& info) {
   NSWindow* win = BDeref<NSWindow*>(info[0]);
+  long number = (long)win.windowNumber;
+  // a second destroy of the same window counts nothing
+  bool live = objc_getAssociatedObject(win, &kDelegateKey) != nil;
   // A sheet whose owner goes away ends without telling its completion
   // handler; answer it as a cancel first so no callback is left waiting.
   CancelPanelSheetsOn(win);
@@ -730,6 +922,8 @@ static Napi::Value DestroyWindow2(const Napi::CallbackInfo& info) {
                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   [win orderOut:nil];
   [win close];
+  ForgetWindow(number);
+  if (live) CALUIObjectsChanged(-1);
   return info.Env().Undefined();
 }
 
@@ -834,8 +1028,14 @@ static Napi::Value PostAppleEvent(const Napi::CallbackInfo& info) {
 
 static bool StatusWindowEvent(NSEvent* e);
 
-static void DispatchEvent2(Napi::Env env, NSEvent* e) {
-  if (!HasBackendCb()) return;
+// One NSEvent as a backend event. In pump mode pump2 calls this for each
+// event it dequeues, before [NSApp sendEvent:]; in threaded mode [NSApp run]
+// dequeues, and a local event monitor calls it from the top of that same
+// sendEvent: (measured: a monitor fires inside sendEvent:, not at dequeue).
+// So both modes see the events AppKit dispatches, and neither sees what a
+// nested tracking loop dequeues for itself.
+static void DispatchEvent2(NSEvent* e) {
+  if (!CALListening()) return;
   const char* type = nullptr;
   bool mouse = false, key = false, wheel = false, crossing = false;
   switch (e.type) {
@@ -867,30 +1067,30 @@ static void DispatchEvent2(Napi::Env env, NSEvent* e) {
     ((CALBackendView*)e.window.contentView)->lastPress_ = e;
   }
 
-  Napi::HandleScope scope(env);
-  Napi::Object ev = Napi::Object::New(env);
-  ev.Set("type", type);
-  if (e.window) ev.Set("windowNumber", (double)e.window.windowNumber);
-  ev.Set("time", e.timestamp * 1000.0);
+  CALEvent ev(type);
+  if (e.window) ev.Num("windowNumber", (double)e.window.windowNumber);
+  ev.Num("time", e.timestamp * 1000.0);
+  // queued behind another move in the same window, it replaces it
+  if (strcmp(type, "mousemove") == 0) ev.FoldBy((double)e.window.windowNumber);
 
   NSEventModifierFlags f = e.modifierFlags;
-  ev.Set("shift", (bool)(f & NSEventModifierFlagShift));
-  ev.Set("control", (bool)(f & NSEventModifierFlagControl));
-  ev.Set("option", (bool)(f & NSEventModifierFlagOption));
-  ev.Set("command", (bool)(f & NSEventModifierFlagCommand));
-  ev.Set("capsLock", (bool)(f & NSEventModifierFlagCapsLock));
+  ev.Bool("shift", (bool)(f & NSEventModifierFlagShift));
+  ev.Bool("control", (bool)(f & NSEventModifierFlagControl));
+  ev.Bool("option", (bool)(f & NSEventModifierFlagOption));
+  ev.Bool("command", (bool)(f & NSEventModifierFlagCommand));
+  ev.Bool("capsLock", (bool)(f & NSEventModifierFlagCapsLock));
 
   if ((mouse || crossing) && e.window) {
     NSView* v = e.window.contentView;
     NSPoint p = [v convertPoint:e.locationInWindow fromView:nil];
-    ev.Set("x", p.x);
-    ev.Set("y", v.isFlipped ? p.y : v.bounds.size.height - p.y);
+    ev.Num("x", p.x);
+    ev.Num("y", v.isFlipped ? p.y : v.bounds.size.height - p.y);
     // and the same point in global top-left coordinates, for popups
     NSRect r = [e.window
         convertRectToScreen:NSMakeRect(e.locationInWindow.x,
                                        e.locationInWindow.y, 0, 0)];
-    ev.Set("gx", r.origin.x);
-    ev.Set("gy", PrimaryScreenTop() - r.origin.y);
+    ev.Num("gx", r.origin.x);
+    ev.Num("gy", PrimaryScreenTop() - r.origin.y);
   }
   if (mouse && !wheel && !crossing) {
     // 0 left, 1 right, 2 middle in AppKit; X buttons are 1 left, 2 middle,
@@ -903,35 +1103,35 @@ static void DispatchEvent2(Napi::Env env, NSEvent* e) {
         e.type == NSEventTypeOtherMouseDragged) {
       xbutton = 0;
     }
-    ev.Set("button", (double)xbutton);
+    ev.Num("button", (double)xbutton);
     if (e.type == NSEventTypeLeftMouseDown ||
         e.type == NSEventTypeRightMouseDown ||
         e.type == NSEventTypeOtherMouseDown ||
         e.type == NSEventTypeLeftMouseUp ||
         e.type == NSEventTypeRightMouseUp ||
         e.type == NSEventTypeOtherMouseUp) {
-      ev.Set("clickCount", (double)e.clickCount);
+      ev.Num("clickCount", (double)e.clickCount);
     }
   }
   if (wheel) {
-    ev.Set("dx", e.scrollingDeltaX);
-    ev.Set("dy", e.scrollingDeltaY);
-    ev.Set("precise", (bool)e.hasPreciseScrollingDeltas);
-    ev.Set("momentum", e.momentumPhase != NSEventPhaseNone);
+    ev.Num("dx", e.scrollingDeltaX);
+    ev.Num("dy", e.scrollingDeltaY);
+    ev.Bool("precise", (bool)e.hasPreciseScrollingDeltas);
+    ev.Bool("momentum", e.momentumPhase != NSEventPhaseNone);
   }
   if (key && e.type != NSEventTypeFlagsChanged) {
-    ev.Set("keyCode", (double)e.keyCode);
+    ev.Num("keyCode", (double)e.keyCode);
     NSString* chars = e.characters;
     NSString* ignoring = e.charactersIgnoringModifiers;
-    if (chars) ev.Set("chars", chars.UTF8String);
-    if (ignoring) ev.Set("charsShifted", ignoring.UTF8String);
+    if (chars) ev.Str("chars", chars.UTF8String);
+    if (ignoring) ev.Str("charsShifted", ignoring.UTF8String);
     if (@available(macOS 10.15, *)) {
       NSString* base = [e charactersByApplyingModifiers:0];
-      if (base) ev.Set("charsBase", base.UTF8String);
+      if (base) ev.Str("charsBase", base.UTF8String);
     }
-    ev.Set("repeat", (bool)e.isARepeat);
+    ev.Bool("repeat", (bool)e.isARepeat);
   }
-  EmitToJS(env, ev);
+  CALEmit(std::move(ev));
 }
 
 static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
@@ -949,20 +1149,25 @@ static Napi::Value SetBackendEventCallback(const Napi::CallbackInfo& info) {
 }
 
 // notifications.mm: responses that arrived before a listener was installed
-void CALNotificationsReplayHeld(Napi::Env env);
+void CALNotificationsReplayHeld();
 // calendars.mm: an EventKit store change from before there was a listener
-void CALCalendarsReplayHeld(Napi::Env env);
+void CALCalendarsReplayHeld();
+
+// What came before anyone listened, ahead of the input that follows so the
+// renderer hears of it first: the launch's URL (or a Dock click), then a
+// notification acted on before the callback existed (one that launched the
+// app, say), then a calendar store that changed under it. pump2 calls this
+// at the top of every tick; runMain as it opens the channel.
+void CALReplayHeldEvents() {
+  FlushPendingAppEvents();
+  CALNotificationsReplayHeld();
+  CALCalendarsReplayHeld();
+}
 
 static Napi::Value Pump2(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
-  // what came before the callback did, ahead of this tick's input so the
-  // renderer hears of it first: the launch's URL (or a Dock click), then a
-  // notification acted on before the callback existed (one that launched
-  // the app, say), then a calendar store that changed under it
-  FlushPendingAppEvents(env);
-  CALNotificationsReplayHeld(env);
-  CALCalendarsReplayHeld(env);
+  CALReplayHeldEvents();
   @autoreleasepool {
     while (true) {
       NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -970,12 +1175,43 @@ static Napi::Value Pump2(const Napi::CallbackInfo& info) {
                                          inMode:NSDefaultRunLoopMode
                                         dequeue:YES];
       if (!e) break;
-      DispatchEvent2(env, e);
+      DispatchEvent2(e);
       [NSApp sendEvent:e];
     }
     [CATransaction flush];
   }
   return env.Undefined();
+}
+
+// Threaded mode's side of the same stream (threaded.mm's runMain brackets
+// [NSApp run] with these): the local monitor that hands each dispatched
+// event to DispatchEvent2, and the pasteboard's change count polled into the
+// published state, since nothing announces another app's write. Neither is
+// installed in pump mode, where pump2's own loop dispatches.
+static id gEventMonitor = nil;
+static NSTimer* gPasteboardPoll = nil;
+
+void CALBeginRunMode() {
+  gEventMonitor =
+      [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskAny
+                                            handler:^NSEvent*(NSEvent* e) {
+                                              DispatchEvent2(e);
+                                              return e;
+                                            }];
+  gPasteboardPoll = [NSTimer timerWithTimeInterval:0.25
+                                           repeats:YES
+                                             block:^(NSTimer*) {
+                                               PublishPasteboardCount();
+                                             }];
+  gPasteboardPoll.tolerance = 0.1;
+  [NSRunLoop.mainRunLoop addTimer:gPasteboardPoll forMode:NSRunLoopCommonModes];
+}
+
+void CALEndRunMode() {
+  if (gEventMonitor) [NSEvent removeMonitor:gEventMonitor];
+  gEventMonitor = nil;
+  [gPasteboardPoll invalidate];
+  gPasteboardPoll = nil;
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,21 +1617,17 @@ static NSString* BStrOr(Napi::Object o, const char* k, NSString* d);
 
 @interface CALMenuTarget : NSObject {
  @public
-  napi_env env_;
-  const char* source_;  // "main" | "dock": which menu tree the item is in
+  const char* source_;  // "main" | "dock" | "status": which menu tree the item is in
 }
 - (void)activate:(NSMenuItem*)sender;
 @end
 @implementation CALMenuTarget
 - (void)activate:(NSMenuItem*)sender {
-  Napi::Env env(env_);
-  Napi::HandleScope scope(env);
-  Napi::Object ev = Napi::Object::New(env);
-  ev.Set("type", "menu-activate");
-  ev.Set("id", (double)sender.tag);
-  // ids are the caller's; the two trees may allocate them independently
-  ev.Set("menu", source_);
-  EmitToJS(env, ev);
+  CALEvent ev("menu-activate");
+  ev.Num("id", (double)sender.tag);
+  // ids are the caller's; the trees may allocate them independently
+  ev.Str("menu", source_);
+  CALEmit(std::move(ev));
 }
 @end
 
@@ -1404,11 +1636,9 @@ static CALMenuTarget* gMenuTarget = nil;      // NSApp.mainMenu
 static CALMenuTarget* gDockMenuTarget = nil;  // the Dock menu
 static CALMenuTarget* gStatusMenuTarget = nil;  // status-item (tray) menus
 
-static CALMenuTarget* MenuTargetFor(Napi::Env env,
-                                    CALMenuTarget* __strong* slot,
+static CALMenuTarget* MenuTargetFor(CALMenuTarget* __strong* slot,
                                     const char* source) {
   if (!*slot) *slot = [CALMenuTarget new];
-  (*slot)->env_ = env;
   (*slot)->source_ = source;
   return *slot;
 }
@@ -1491,7 +1721,7 @@ static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items,
 static Napi::Value SetMainMenuFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   BEnsureApp();
-  CALMenuTarget* target = MenuTargetFor(env, &gMenuTarget, "main");
+  CALMenuTarget* target = MenuTargetFor(&gMenuTarget, "main");
   Napi::Array spec = info[0].As<Napi::Array>();
   NSMenu* main = [[NSMenu alloc] initWithTitle:@"MainMenu"];
   main.autoenablesItems = NO;
@@ -1590,7 +1820,6 @@ static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
 
 @interface CALStatusItemTarget : NSObject {
  @public
-  napi_env env_;
   // the JS handle: events carry this very object, so `ev.statusItem ===
   // item` holds and a renderer can key a Map on it
   Napi::Reference<Napi::Value> handle_;
@@ -1616,35 +1845,55 @@ static void RememberStatusWindow(NSWindow* win, NSStatusItem* item) {
   [gStatusWindows setObject:item forKey:@(win.windowNumber)];
 }
 
-// The button's rect in global top-left coordinates, points.
-static void SetStatusButtonFrame(Napi::Object ev, NSStatusBarButton* btn) {
-  if (!btn.window) return;
+// The button's rect in global top-left coordinates, points: x, y, width,
+// height. False while the button has no window.
+static bool StatusButtonFrame(NSStatusBarButton* btn, double out[4]) {
+  if (!btn.window) return false;
   NSRect r = [btn.window convertRectToScreen:[btn convertRect:btn.bounds
                                                         toView:nil]];
-  ev.Set("x", r.origin.x);
-  ev.Set("y", PrimaryScreenTop() - (r.origin.y + r.size.height));
-  ev.Set("width", r.size.width);
-  ev.Set("height", r.size.height);
+  out[0] = r.origin.x;
+  out[1] = PrimaryScreenTop() - (r.origin.y + r.size.height);
+  out[2] = r.size.width;
+  out[3] = r.size.height;
+  return true;
+}
+
+static void SetStatusButtonFrame(Napi::Object ev, NSStatusBarButton* btn) {
+  double r[4];
+  if (!StatusButtonFrame(btn, r)) return;
+  ev.Set("x", r[0]);
+  ev.Set("y", r[1]);
+  ev.Set("width", r[2]);
+  ev.Set("height", r[3]);
 }
 
 static void EmitStatusItemClick(CALStatusItemTarget* t, const char* kind,
                                 NSEvent* e) {
   NSStatusItem* item = t->item_;
-  if (!item || !HasBackendCb()) return;
-  Napi::Env env(t->env_);
-  Napi::HandleScope scope(env);
-  Napi::Object ev = Napi::Object::New(env);
-  ev.Set("type", "status-item-click");
-  ev.Set("statusItem", t->handle_.Value());
-  ev.Set("kind", kind);
+  if (!item || !CALListening()) return;
+  CALEvent ev("status-item-click");
+  // The item's own handle, looked up as the event is materialized, so
+  // `ev.statusItem === item` holds in the environment that created it.
+  // Weak: an event still in flight never keeps a removed item's target.
+  __weak CALStatusItemTarget* weak = t;
+  ev.Handle("statusItem", ^Napi::Value(Napi::Env env) {
+    CALStatusItemTarget* target = weak;
+    if (!target || target->handle_.IsEmpty() ||
+        (napi_env)target->handle_.Env() != (napi_env)env)
+      return env.Null();
+    return target->handle_.Value();
+  });
+  ev.Str("kind", kind);
   NSEventModifierFlags f = e ? e.modifierFlags : NSEvent.modifierFlags;
-  ev.Set("shift", (bool)(f & NSEventModifierFlagShift));
-  ev.Set("control", (bool)(f & NSEventModifierFlagControl));
-  ev.Set("option", (bool)(f & NSEventModifierFlagOption));
-  ev.Set("command", (bool)(f & NSEventModifierFlagCommand));
-  ev.Set("clickCount", (double)(e ? e.clickCount : 1));
-  SetStatusButtonFrame(ev, item.button);
-  EmitToJS(env, ev);
+  ev.Bool("shift", (bool)(f & NSEventModifierFlagShift));
+  ev.Bool("control", (bool)(f & NSEventModifierFlagControl));
+  ev.Bool("option", (bool)(f & NSEventModifierFlagOption));
+  ev.Bool("command", (bool)(f & NSEventModifierFlagCommand));
+  ev.Num("clickCount", (double)(e ? e.clickCount : 1));
+  double r[4];
+  if (StatusButtonFrame(item.button, r))
+    ev.Num("x", r[0]).Num("y", r[1]).Num("width", r[2]).Num("height", r[3]);
+  CALEmit(std::move(ev));
 }
 
 // Called by the pump for every mouse event that has a window: true when
@@ -1760,7 +2009,6 @@ static Napi::Value CreateStatusItem(const Napi::CallbackInfo& info) {
                       : NSVariableStatusItemLength;
     item = [[NSStatusBar systemStatusBar] statusItemWithLength:len];
     CALStatusItemTarget* target = [CALStatusItemTarget new];
-    target->env_ = (napi_env)env;
     target->item_ = item;
     objc_setAssociatedObject(item, &kStatusTargetKey, target,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1778,6 +2026,7 @@ static Napi::Value CreateStatusItem(const Napi::CallbackInfo& info) {
     handle = BWrapRetained(env, item);
     target->handle_ = Napi::Reference<Napi::Value>::New(handle, 1);
   }
+  CALUIObjectsChanged(+1);
   return handle;
 }
 
@@ -1817,8 +2066,7 @@ static Napi::Value SetStatusItemMenu(const Napi::CallbackInfo& info) {
   Napi::Value spec = info.Length() > 1 ? info[1] : env.Null();
   @autoreleasepool {
     if (spec.IsArray()) {
-      CALMenuTarget* target =
-          MenuTargetFor(env, &gStatusMenuTarget, "status");
+      CALMenuTarget* target = MenuTargetFor(&gStatusMenuTarget, "status");
       item.menu = BuildMenuFrom(env, spec.As<Napi::Array>(), target);
     } else {
       item.menu = nil;
@@ -1842,6 +2090,7 @@ static Napi::Value RemoveStatusItem(const Napi::CallbackInfo& info) {
     target->item_ = nil;
     target->handle_.Reset();  // the handle may now be collected
   }
+  CALUIObjectsChanged(-1);
   return env.Undefined();
 }
 
@@ -2008,7 +2257,7 @@ static Napi::Value SetDockMenuFn(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  CALMenuTarget* target = MenuTargetFor(env, &gDockMenuTarget, "dock");
+  CALMenuTarget* target = MenuTargetFor(&gDockMenuTarget, "dock");
   gDockMenu = BuildMenuFrom(env, v.As<Napi::Array>(), target);
   return env.Undefined();
 }
@@ -2069,10 +2318,12 @@ static const char* PolicyName(NSApplicationActivationPolicy p) {
 static bool ApplyActivationPolicy(NSApplicationActivationPolicy p) {
   if (!gAppLaunched) {
     gActivationPolicy = p;
-    BEnsureApp();
+    BEnsureApp();  // publishes it
     return true;
   }
-  return [NSApp setActivationPolicy:p];
+  bool ok = [NSApp setActivationPolicy:p];
+  gPubPolicy = (int)NSApp.activationPolicy;
+  return ok;
 }
 
 // Reads `activationPolicy` off an options object; throws on an unknown name.
@@ -2122,6 +2373,13 @@ static Napi::Value SetActivationPolicyFn(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   return Napi::Boolean::New(env, ApplyActivationPolicy(p));
+}
+
+// activationPolicy() -> 'regular' | 'accessory' | 'prohibited' — as the UI
+// thread last published it (the published state section). Any thread.
+static Napi::Value ActivationPolicyFn(const Napi::CallbackInfo& info) {
+  return Napi::String::New(
+      info.Env(), PolicyName((NSApplicationActivationPolicy)gPubPolicy.load()));
 }
 
 // setDockBadge(label | null) — NSDockTile.badgeLabel: the red pill on the
@@ -4314,6 +4572,7 @@ static Napi::Value PbWriteTextFn(const Napi::CallbackInfo& info) {
   NSPasteboard* pb = NSPasteboard.generalPasteboard;
   [pb clearContents];
   [pb setString:BToNSString(info[0]) forType:NSPasteboardTypeString];
+  PublishPasteboardCount();
   return info.Env().Undefined();
 }
 
@@ -4326,10 +4585,13 @@ static Napi::Value PbReadTextFn(const Napi::CallbackInfo& info) {
 
 static Napi::Value PbClearFn(const Napi::CallbackInfo& info) {
   [NSPasteboard.generalPasteboard clearContents];
+  PublishPasteboardCount();
   return info.Env().Undefined();
 }
 
 static Napi::Value PbChangeCountFn(const Napi::CallbackInfo& info) {
+  if (ReadPublished())
+    return Napi::Number::New(info.Env(), (double)gPubPasteboardCount.load());
   return Napi::Number::New(info.Env(),
                            (double)NSPasteboard.generalPasteboard.changeCount);
 }
@@ -4340,35 +4602,16 @@ static Napi::Value PbChangeCountFn(const Napi::CallbackInfo& info) {
 
 static Napi::Value ListScreens(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
-  CGFloat top = PrimaryScreenTop();
-  NSArray<NSScreen*>* screens = NSScreen.screens;
-  Napi::Array out = Napi::Array::New(env, screens.count);
-  for (NSUInteger i = 0; i < screens.count; i++) {
-    NSScreen* s = screens[i];
-    Napi::Object o = Napi::Object::New(env);
-    NSRect f = s.frame, v = s.visibleFrame;
-    o.Set("x", f.origin.x);
-    o.Set("y", top - (f.origin.y + f.size.height));
-    o.Set("width", f.size.width);
-    o.Set("height", f.size.height);
-    Napi::Object work = Napi::Object::New(env);
-    work.Set("x", v.origin.x);
-    work.Set("y", top - (v.origin.y + v.size.height));
-    work.Set("width", v.size.width);
-    work.Set("height", v.size.height);
-    o.Set("visible", work);
-    o.Set("scale", s.backingScaleFactor);
-    // the panel's own refresh rate, so a renderer paces frames on the
-    // display's period instead of assuming 60Hz on a 120Hz ProMotion
-    // panel; 0 where the OS cannot say (before macOS 12)
-    double fps = 0;
-    if (@available(macOS 12.0, *)) fps = (double)s.maximumFramesPerSecond;
-    o.Set("fps", fps);
-    o.Set("primary", i == 0);
-    out.Set((uint32_t)i, o);
+  if (ReadPublished()) {
+    std::vector<PubScreen> screens;
+    {
+      std::lock_guard<std::mutex> l(gPubMu);
+      screens = gPubScreens;
+    }
+    return ScreensArray(env, screens);
   }
-  return out;
+  BEnsureApp();
+  return ScreensArray(env, ScreensNow());
 }
 
 static Napi::Value SetCursorFn(const Napi::CallbackInfo& info) {
@@ -4480,11 +4723,10 @@ static NSDragOperation DragMaskFrom(Napi::Value v) {
   return mask;
 }
 
-static Napi::Array DragOpsOfMask(Napi::Env env, NSDragOperation mask) {
-  Napi::Array out = Napi::Array::New(env);
-  uint32_t n = 0;
+static std::vector<std::string> DragOpsOfMask(NSDragOperation mask) {
+  std::vector<std::string> out;
   for (const auto& d : kDragOps)
-    if (mask & d.op) out.Set(n++, d.name);
+    if (mask & d.op) out.push_back(d.name);
   return out;
 }
 
@@ -4668,56 +4910,52 @@ static NSImage* DragImageFrom(Napi::Object o, double* w, double* h) {
 // a Finder drag of three files is three items of one public.file-url each,
 // read per item through dragItemString. `local` is a drag begun by one of
 // our own windows (beginDrag), whose number then follows.
-static void EmitDragInfo(Napi::Env env, CALBackendView* view,
-                         const char* type, id<NSDraggingInfo> info) {
-  if (!HasBackendCb()) return;
-  Napi::HandleScope scope(env);
+static void EmitDragInfo(CALBackendView* view, const char* type,
+                         id<NSDraggingInfo> info) {
+  if (!CALListening()) return;
   NSWindow* win = view.window;
-  Napi::Object ev = WindowEvent(env, win, type);
+  CALEvent ev = WindowEvent(win, type);
   if (info) {
     NSPoint loc = info.draggingLocation;
     NSPoint p = [view convertPoint:loc fromView:nil];  // the view is flipped
-    ev.Set("x", p.x);
-    ev.Set("y", p.y);
+    ev.Num("x", p.x);
+    ev.Num("y", p.y);
     NSRect r = [win convertRectToScreen:NSMakeRect(loc.x, loc.y, 0, 0)];
-    ev.Set("gx", r.origin.x);
-    ev.Set("gy", PrimaryScreenTop() - r.origin.y);
+    ev.Num("gx", r.origin.x);
+    ev.Num("gy", PrimaryScreenTop() - r.origin.y);
     NSPasteboard* pb = info.draggingPasteboard;
-    Napi::Array types = Napi::Array::New(env);
-    uint32_t n = 0;
-    for (NSString* t in pb.types) types.Set(n++, t.UTF8String);
-    ev.Set("types", types);
-    ev.Set("itemCount", (double)pb.pasteboardItems.count);
+    std::vector<std::string> types;
+    for (NSString* t in pb.types) types.push_back(t.UTF8String);
+    ev.Strs("types", std::move(types));
+    ev.Num("itemCount", (double)pb.pasteboardItems.count);
     NSDragOperation mask = info.draggingSourceOperationMask;
-    ev.Set("sourceMask", (double)mask);
-    ev.Set("operations", DragOpsOfMask(env, mask));
+    ev.Num("sourceMask", (double)mask);
+    ev.Strs("operations", DragOpsOfMask(mask));
     id src = info.draggingSource;
     bool local = [src isKindOfClass:[CALBackendView class]];
-    ev.Set("local", local);
+    ev.Bool("local", local);
     if (local)
-      ev.Set("sourceWindowNumber",
+      ev.Num("sourceWindowNumber",
              (double)((CALBackendView*)src).window.windowNumber);
-    ev.Set("sequence", (double)info.draggingSequenceNumber);
+    ev.Num("sequence", (double)info.draggingSequenceNumber);
   }
-  EmitToJS(env, ev);
+  CALEmit(std::move(ev));
 }
 
 // The source side's events: the pointer in global top-left coordinates,
 // and for the end, the operation the destination performed ('none' when
 // nothing took the drop) with `dropped` as its boolean.
-static void EmitDragSession(Napi::Env env, CALBackendView* view,
-                            const char* type, NSPoint screenPoint,
-                            const char* operation) {
-  if (!HasBackendCb()) return;
-  Napi::HandleScope scope(env);
-  Napi::Object ev = WindowEvent(env, view.window, type);
-  ev.Set("x", screenPoint.x);
-  ev.Set("y", PrimaryScreenTop() - screenPoint.y);
+static void EmitDragSession(CALBackendView* view, const char* type,
+                            NSPoint screenPoint, const char* operation) {
+  if (!CALListening()) return;
+  CALEvent ev = WindowEvent(view.window, type);
+  ev.Num("x", screenPoint.x);
+  ev.Num("y", PrimaryScreenTop() - screenPoint.y);
   if (operation) {
-    ev.Set("operation", operation);
-    ev.Set("dropped", strcmp(operation, "none") != 0);
+    ev.Str("operation", operation);
+    ev.Bool("dropped", strcmp(operation, "none") != 0);
   }
-  EmitToJS(env, ev);
+  CALEmit(std::move(ev));
 }
 
 @interface CALBackendView (DragAndDrop) <NSDraggingSource>
@@ -4736,16 +4974,16 @@ static void EmitDragSession(Napi::Env env, CALBackendView* view,
   // a yes left over from the previous drag must not answer this one
   dropAccept_ = false;
   dropOp_ = nil;
-  EmitDragInfo(Napi::Env(env_), self, "drag-enter", sender);
+  EmitDragInfo(self, "drag-enter", sender);
   return [self dropAnswer:sender];
 }
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
   gDragPasteboard = sender.draggingPasteboard;
-  EmitDragInfo(Napi::Env(env_), self, "drag-over", sender);
+  EmitDragInfo(self, "drag-over", sender);
   return [self dropAnswer:sender];
 }
 - (void)draggingExited:(nullable id<NSDraggingInfo>)sender {
-  EmitDragInfo(Napi::Env(env_), self, "drag-exit", sender);
+  EmitDragInfo(self, "drag-exit", sender);
 }
 - (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
   (void)sender;
@@ -4753,7 +4991,7 @@ static void EmitDragSession(Napi::Env env, CALBackendView* view,
 }
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
   gDragPasteboard = sender.draggingPasteboard;
-  EmitDragInfo(Napi::Env(env_), self, "drag-perform", sender);
+  EmitDragInfo(self, "drag-perform", sender);
   return dropAccept_;  // JS may withdraw it, having looked at the payload
 }
 // One drag-over per pointer position, not a timer's worth.
@@ -4774,20 +5012,18 @@ static void EmitDragSession(Napi::Env env, CALBackendView* view,
 - (void)draggingSession:(NSDraggingSession*)session
        willBeginAtPoint:(NSPoint)screenPoint {
   (void)session;
-  EmitDragSession(Napi::Env(env_), self, "drag-session-began", screenPoint,
-                  nullptr);
+  EmitDragSession(self, "drag-session-began", screenPoint, nullptr);
 }
 - (void)draggingSession:(NSDraggingSession*)session
            movedToPoint:(NSPoint)screenPoint {
   (void)session;
-  EmitDragSession(Napi::Env(env_), self, "drag-session-moved", screenPoint,
-                  nullptr);
+  EmitDragSession(self, "drag-session-moved", screenPoint, nullptr);
 }
 - (void)draggingSession:(NSDraggingSession*)session
            endedAtPoint:(NSPoint)screenPoint
               operation:(NSDragOperation)operation {
   (void)session;
-  EmitDragSession(Napi::Env(env_), self, "drag-session-ended", screenPoint,
+  EmitDragSession(self, "drag-session-ended", screenPoint,
                   DragOpName(operation));
 }
 @end
@@ -4800,7 +5036,6 @@ static Napi::Value RegisterDropTypes(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CALBackendView* view = BackendViewArg(info[0], "registerDropTypes");
   if (!view) return env.Undefined();
-  view->env_ = env;
   NSMutableArray<NSString*>* types = [NSMutableArray array];
   if (info[1].IsArray()) {
     Napi::Array a = info[1].As<Napi::Array>();
@@ -4912,7 +5147,6 @@ static Napi::Value BeginDrag(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   Napi::Object o = info[1].As<Napi::Object>();
-  view->env_ = env;
 
   NSEvent* press = view->lastPress_;
   if (press && press.window != view.window) press = nil;
@@ -5063,7 +5297,6 @@ static Napi::Value PostDragEvent(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CALBackendView* view = BackendViewArg(info[0], "postDragEvent");
   if (!view) return env.Undefined();
-  view->env_ = env;
   std::string phase = info[1].IsString() ? info[1].As<Napi::String>().Utf8Value() : "";
   Napi::Object o = info.Length() > 2 && info[2].IsObject()
                        ? info[2].As<Napi::Object>()
@@ -5164,6 +5397,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("windowNumberAtPoint", WindowNumberAtPoint);
   BFN("setWindowFrame", SetWindowFrame);
   BFN("getWindowFrame", GetWindowFrame);
+  BFN("windowState", WindowStateFn);
   BFN("setWindowMinMax", SetWindowMinMax);
   BFN("destroyWindow2", DestroyWindow2);
   BFN("invalidateWindowShadow", InvalidateWindowShadow);
@@ -5266,6 +5500,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("cancelUserAttention", CancelUserAttentionFn);
   BFN("setAppName", SetAppNameFn);
   BFN("appInfo", AppInfoFn);
+  BFN("activationPolicy", ActivationPolicyFn);
   BFN("measureControl", MeasureControl);
   BFN("drawControlIntoSurface", DrawControlIntoSurface);
   BFN("listScreens", ListScreens);

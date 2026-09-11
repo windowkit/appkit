@@ -250,6 +250,8 @@ jobs:
         run: node test/calendar-writes.js
       - name: The screen colour sampler's argument shapes (the sampler itself needs a person)
         run: node test/screencolor.js
+      - name: Threaded mode's core — runMain, commands through the common modes, batched events, exit and signals
+        run: node test/threaded.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

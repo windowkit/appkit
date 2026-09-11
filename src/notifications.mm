@@ -60,9 +60,8 @@
 #include <string>
 #include <vector>
 
-// backend.mm: the one backend event callback
-bool CALHasBackendCb();
-void CALEmitBackendEvent(Napi::Env env, Napi::Object ev);
+// backend.mm / threaded.mm: the one backend event path
+#include "channel.h"
 
 static NSString* const kDefaultCategory = @"appkit.default";
 static NSString* const kUserInfoKey = @"appkit.userInfo";
@@ -161,45 +160,37 @@ using EventTsfn = Napi::TypedThreadSafeFunction<void, NotifEvent, CallJsEvent>;
 static EventTsfn gEvents;
 static std::vector<NotifEvent*> gHeld;
 
-static Napi::Object EventObject(Napi::Env env, const NotifEvent& ev) {
-  Napi::Object o = Napi::Object::New(env);
-  o.Set("type", ev.type);
-  o.Set("identifier", ev.identifier);
-  if (!ev.actionId.empty()) o.Set("actionId", ev.actionId);
-  if (!ev.reason.empty()) o.Set("reason", ev.reason);
-  o.Set("categoryId", ev.categoryId.empty()
-                          ? env.Null()
-                          : Napi::String::New(env, ev.categoryId));
-  if (ev.hasUserInfo) {
-    Napi::Value v = JsonParse(env, [NSString stringWithUTF8String:ev.userInfoJson.c_str()]);
-    if (env.IsExceptionPending()) {
-      // not our own output after all; hand it over as it is rather than fail
-      (void)env.GetAndClearPendingException();
-      v = Napi::String::New(env, ev.userInfoJson);
-    }
-    o.Set("userInfo", v);
-  }
-  if (ev.hasUserText) o.Set("userText", ev.userText);
+static CALEvent EventRecord(const NotifEvent& ev) {
+  CALEvent o(ev.type.c_str());
+  o.Str("identifier", ev.identifier);
+  if (!ev.actionId.empty()) o.Str("actionId", ev.actionId);
+  if (!ev.reason.empty()) o.Str("reason", ev.reason);
+  if (ev.categoryId.empty()) o.Null("categoryId");
+  else o.Str("categoryId", ev.categoryId);
+  // parsed as it crosses; text that is not our own output after all is
+  // handed over as it is rather than fail
+  if (ev.hasUserInfo) o.Json("userInfo", ev.userInfoJson);
+  if (ev.hasUserText) o.Str("userText", ev.userText);
   return o;
 }
 
-static void EmitOrHold(Napi::Env env, NotifEvent* ev) {
-  if (!CALHasBackendCb()) {
+static void EmitOrHold(NotifEvent* ev) {
+  if (!CALListening()) {
     gHeld.push_back(ev);
     return;
   }
-  Napi::HandleScope scope(env);
-  CALEmitBackendEvent(env, EventObject(env, *ev));
+  CALEmit(EventRecord(*ev));
   delete ev;
 }
 
-// Called at the start of pump2 (backend.mm): what arrived before a listener
-// goes out ahead of that tick's input, in arrival order.
-void CALNotificationsReplayHeld(Napi::Env env) {
-  if (gHeld.empty() || !CALHasBackendCb()) return;
+// Called at the start of pump2, and as runMain opens the channel
+// (backend.mm): what arrived before a listener goes out ahead of that
+// tick's input, in arrival order.
+void CALNotificationsReplayHeld() {
+  if (gHeld.empty() || !CALListening()) return;
   std::vector<NotifEvent*> held;
   held.swap(gHeld);
-  for (NotifEvent* ev : held) EmitOrHold(env, ev);
+  for (NotifEvent* ev : held) EmitOrHold(ev);
 }
 
 static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev) {
@@ -207,12 +198,19 @@ static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev) {
     delete ev;
     return;
   }
-  CALNotificationsReplayHeld(env);  // keep order behind anything still held
-  EmitOrHold(env, ev);
+  CALNotificationsReplayHeld();  // keep order behind anything still held
+  EmitOrHold(ev);
 }
 
-// From any thread: onto node's loop, then to the listener or the held list.
+// From any thread: onto node's loop, then to the listener or the held list
+// — in pump mode. With threaded mode's channel open the record goes straight
+// into it from the centre's own thread.
 static void QueueEvent(NotifEvent* ev) {
+  if (CALChannelOpen()) {
+    CALEmit(EventRecord(*ev));
+    delete ev;
+    return;
+  }
   if (gEvents.NonBlockingCall(ev) != napi_ok) delete ev;
 }
 

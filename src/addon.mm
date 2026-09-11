@@ -545,9 +545,8 @@ static Napi::Value SetShapeProps(const Napi::CallbackInfo& info) {
 // waits; and the presentation value plus the completion event, which say
 // where an animation is and when it stopped.
 
-// backend.mm's event callback, for the completion event.
-bool CALHasBackendCb();
-void CALEmitBackendEvent(Napi::Env env, Napi::Object ev);
+// The completion event goes out through the backend's one event path.
+#include "channel.h"
 
 static bool ThrowType(Napi::Env env, const char* msg) {
   Napi::TypeError::New(env, msg).ThrowAsJavaScriptException();
@@ -616,12 +615,13 @@ static CAMediaTimingFunction* TimingFrom(Napi::Env env, Napi::Value v) {
 // The completion event. A delegate is set only when the caller passes an
 // `id`, so an animation nobody wants to hear about costs nothing; CAAnimation
 // holds its delegate strongly, so this lives exactly as long as the animation.
-// animationDidStop: arrives on the main thread from the run loop the pump
-// drives — inside pump2(), like a window delegate's methods — so it calls
-// into JS directly. `finished` is NO for an animation that was removed, or
-// whose layer left the tree, before it ran out.
+// animationDidStop: arrives on the main thread from the run loop — inside
+// pump2() in pump mode, like a window delegate's methods, where it reaches
+// JS inline; inside [NSApp run] in threaded mode, where it crosses to the
+// connected environment like every other event. `finished` is NO for an
+// animation that was removed, or whose layer left the tree, before it ran
+// out.
 @interface CALAnimationDelegate : NSObject <CAAnimationDelegate>
-@property(nonatomic, assign) napi_env env;
 @property(nonatomic, copy) NSString* animId;
 @property(nonatomic, copy) NSString* key;
 @property(nonatomic, copy) NSString* keyPath;
@@ -629,16 +629,13 @@ static CAMediaTimingFunction* TimingFrom(Napi::Env env, Napi::Value v) {
 
 @implementation CALAnimationDelegate
 - (void)animationDidStop:(CAAnimation*)anim finished:(BOOL)flag {
-  if (!CALHasBackendCb()) return;
-  Napi::Env env(self.env);
-  Napi::HandleScope scope(env);
-  Napi::Object ev = Napi::Object::New(env);
-  ev.Set("type", "animation-end");
-  ev.Set("id", self.animId.UTF8String);
-  ev.Set("key", self.key.UTF8String);
-  ev.Set("keyPath", self.keyPath.UTF8String);
-  ev.Set("finished", Napi::Boolean::New(env, flag));
-  CALEmitBackendEvent(env, ev);
+  if (!CALListening()) return;
+  CALEvent ev("animation-end");
+  ev.Str("id", self.animId.UTF8String);
+  ev.Str("key", self.key.UTF8String);
+  ev.Str("keyPath", self.keyPath.UTF8String);
+  ev.Bool("finished", flag);
+  CALEmit(std::move(ev));
 }
 @end
 
@@ -683,7 +680,6 @@ static bool ApplyTiming(Napi::Env env, CAPropertyAnimation* a, CALayer* L, Napi:
     Napi::Value idv = o.Get("id");
     if (!idv.IsString()) return ThrowType(env, "id: expected a string");
     CALAnimationDelegate* d = [CALAnimationDelegate new];
-    d.env = env;
     d.animId = ToNSString(idv);
     d.key = key;
     d.keyPath = a.keyPath;
@@ -1289,6 +1285,9 @@ void InitCalendars(Napi::Env env, Napi::Object exports);
 // src/screencolor.mm — the eyedropper: one colour off the screen through
 // NSColorSampler, the system's own out-of-process sampler.
 void InitScreenColor(Napi::Env env, Napi::Object exports);
+// src/threaded.mm — threaded mode: runMain parks the main thread in
+// [NSApp run], commands in through the main run loop, events out in batches.
+void InitThreaded(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1333,6 +1332,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitNotifications(env, exports);
   InitCalendars(env, exports);
   InitScreenColor(env, exports);
+  InitThreaded(env, exports);
   return exports;
 }
 

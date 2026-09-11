@@ -42,10 +42,12 @@ npm run demo  # hover/click the cards; press "q" to quit
 ## How it runs
 
 Node's main thread *is* the process main thread on macOS, so the addon owns
-`NSApplication` directly. Nobody calls `[NSApp run]`; instead JS drives an event pump
-(`nextEventMatchingMask:` with `distantPast`) off a `setInterval`. Core Animation
-animations execute in the render server, so their smoothness is independent of the pump
-cadence — the JS timer only affects input latency.
+`NSApplication` directly. In pump mode, the default, nobody calls `[NSApp run]`; instead JS
+drives an event pump (`nextEventMatchingMask:` with `distantPast`) off a `setInterval`.
+Core Animation animations execute in the render server, so their smoothness is
+independent of the pump cadence — the JS timer only affects input latency. Threaded mode
+(below) turns this around: the main thread stays in `[NSApp run]` and JS moves to a
+Worker.
 
 The window uses a **layer-hosting** `NSView` (we own the whole CALayer tree) with
 `isFlipped = YES`, which makes AppKit give the hosted layer a top-left origin
@@ -54,6 +56,94 @@ handled in native code: `hitTest:` still takes bottom-up points, and
 `renderInContext:` ignores `geometryFlipped` entirely (snapshots therefore capture the
 window's real composited pixels via `CGWindowListCreateImage`, which needs no
 screen-recording permission for the process's own windows).
+
+## Threaded mode: AppKit on the main thread, JS on a worker
+
+Pump mode has two costs. Input waits for the next tick, up to 8 ms. And every modal loop
+AppKit runs — live resize, menu tracking, a drag, `runModal` — runs *inside* `pump2()`,
+so timers, sockets and even microtasks wait for the gesture to end (a drag once held a
+25 ms interval for 31 s, sidorares/react-x11#484). Threaded mode (windowkit/appkit#49)
+swaps the roles: the process main thread parks in a real `[NSApp run]` for the life of the
+app, and the renderer's JS runs on a `worker_threads` Worker, which no AppKit loop can
+reach. Pump mode stays the default; calling `runMain()` is the switch.
+
+```js
+// main.js — the process main thread
+const { Worker } = require('node:worker_threads');
+const { native } = require('@windowkit/appkit');
+native.initApp();
+new Worker('./renderer.js');
+const code = native.runMain(); // returns when the run ends
+process.exit(code ?? 0);       // only this thread may end the process
+
+// renderer.js — the worker
+const { native } = require('@windowkit/appkit');
+native.connect((batch) => {
+  for (const ev of batch) {
+    if (ev.type === 'signal') process.emit(ev.signal); // SIGINT never reaches a Worker
+    else route(ev);
+  }
+});
+// ...and when the app is done:
+native.requestExit(0);
+```
+
+| verb | |
+| --- | --- |
+| `runMain()` | The process main thread only. Returns the code `requestExit` gave; `null` when the connected environment ended without asking (its own `process.exit`, which in a Worker ends only the worker, or an uncaught error); `128 + n` for a signal with nobody connected to hear it. |
+| `connect(onEvents)` | From the renderer's thread, one environment at a time. `onEvents(batch)` gets an array of the same event objects pump mode's callback gets one by one. |
+| `requestExit(code)` | Any thread. Ends the run; `runMain` returns `code`. |
+| `threaded()` | `runMain` is running. |
+| `windowState(windowNumber)` | `getWindowFrame`'s shape for a `createWindow2` window, from the published copy (below); `null` for no such window. Any thread, either mode. |
+| `activationPolicy()` | The published activation policy. |
+| `pingUI(tag)`, `postModalLoop('menu' \| 'modal', ms)` | Test hooks: a command answered by `ui-pong { tag, mode, drained }` from the UI thread, and a pop-up menu's tracking or an `NSAlert`'s `runModal`, ended by a timer and bracketed by `modal-loop-begin` / `modal-loop-end`. |
+
+**Events out.** Every producer builds a plain record (never a JS object off its thread).
+With the channel open, records are appended to one queue, and the first append after a
+delivery makes one threadsafe call. The worker takes the whole queue as one batch, so a
+worker busy for 200 ms gets what it missed together. Consecutive `mousemove` in one window
+folds to the latest position before it crosses. Whatever is emitted before `connect` —
+the launch's URL, input that arrived while the worker started — is the first batch. A
+delivery runs in a callback scope, so a microtask queued inside `onEvents` runs right
+after it. The channel holds the worker's loop open while any window or status item
+exists, and lets it go when none does, so an app with nothing on screen can end.
+
+**Commands in.** The command queue is a version-0 `CFRunLoopSource` on the main run loop, in
+`kCFRunLoopCommonModes`, so it is drained during menu tracking (`NSEventTrackingRunLoopMode`),
+`runModal` (`NSModalPanelRunLoopMode`) and live resize too. Each drain applies its
+batch inside one `CATransaction` with implicit actions off. A command that starts a modal
+loop runs from a run-loop callout of its own once its drain is done, so the rest of the
+batch never waits behind the gesture. Routing the AppKit verbs through the queue is
+windowkit/appkit#51. Until then, a window is made on the main thread before `runMain`
+(as `test/threaded.js` does), and a worker cannot yet use the verbs that touch AppKit.
+Surfaces, drawing and text work from a worker as they always have.
+
+**Published state.** The UI thread keeps a copy, under a lock, of what a renderer reads
+back synchronously: each window's content rect, visibility, occlusion, key state and
+scale; the screen list; the accessibility display options; the activation policy; and the
+pasteboard's change count, polled every 250 ms since another app's write announces
+nothing. While `runMain` runs, `listScreens`, `accessibilityDisplayOptions` and
+`pasteboardChangeCount` answer from it when called off the main thread. On the main
+thread they still ask AppKit live, as in pump mode.
+
+**Exit and signals.** Before the run stops, menu tracking is cancelled and an app-modal
+loop stopped, since `[NSApp stop:]` only ends the innermost loop. A drag session or a live
+resize cannot be ended from code, so the exit waits for the button to come up. While the run lasts,
+SIGINT, SIGTERM and SIGHUP are ignored as signals and read through a
+`DISPATCH_SOURCE_TYPE_SIGNAL`, each arriving as `signal { signal: 'SIGINT' }`.
+`applicationShouldTerminate:` answers Cancel and sends `app-quit-request`, as in pump mode.
+A worker's `console.log` and `process.stdout` are forwarded through the main thread's event
+loop, which is parked, so write with `fs.writeSync(1, …)` on the worker. `process.exit`
+there ends only the worker; ending the app is `requestExit`.
+
+Measured by `test/threaded.js` on an M1 Pro, macOS 15.2, Node 26:
+
+| | |
+| --- | --- |
+| command + event round trip | 0.06 ms p50, 0.10 ms p95 |
+| a microtask queued inside a delivery | ran 0.01 ms later, p50 |
+| commands sent during a pop-up menu's tracking | 65 of 65 applied inside `NSEventTrackingRunLoopMode`; the worker's 5 ms timer's worst gap 8.7 ms |
+| commands sent during an `NSAlert`'s `runModal` | 80 of 80 applied inside `NSModalPanelRunLoopMode`; worst gap 7.1 ms |
 
 ## API sketch
 
@@ -984,6 +1074,7 @@ only what changed.
 
 - The pump-on-a-timer model means live window resizing/dragging runs AppKit's internal
   modal loops; input during those is choppy (Core Animation itself is unaffected).
+  Threaded mode (above) is the way out.
 - No `NSWindowDelegate` wiring yet — window resize is observable only by polling
   `win.size`; sublayers don't autolayout (by design — the reconciler owns layout).
 - One shared event callback for all windows; per-window routing would need the window

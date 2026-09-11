@@ -73,6 +73,7 @@
 #include <atomic>
 #include <cstdio>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -275,6 +276,8 @@ static bool gWakePending = false;                  // gEvMu
 static int gUIObjects = 0;                         // gEvMu
 static std::atomic<bool> gConnected{false};
 static bool gRefed = true;  // the connected environment's thread only
+static napi_env gConnectedEnv = nullptr;  // gEvMu
+static pthread_t gConnectedThread;        // gEvMu, valid while gConnectedEnv is
 
 bool CALThreaded() { return gRunning.load(); }
 bool CALChannelOpen() { return gRunning.load() || gConnected.load(); }
@@ -307,7 +310,20 @@ void CALUIObjectsChanged(int delta) {
   std::lock_guard<std::mutex> l(gEvMu);
   bool before = gUIObjects > 0;
   gUIObjects = std::max(0, gUIObjects + delta);
-  if (before != (gUIObjects > 0)) WakeLocked();  // the delivery re-decides the ref
+  bool now = gUIObjects > 0;
+  if (before == now) return;
+  // On the connected environment's own thread (a worker's createWindow2 or
+  // destroyWindow2) the reference is that thread's to change, now: a worker
+  // whose script ends right after making a window must still be held.
+  if (gTsfn && gConnectedEnv && pthread_equal(pthread_self(), gConnectedThread)) {
+    if (now != gRefed) {
+      if (now) napi_ref_threadsafe_function(gConnectedEnv, gTsfn);
+      else napi_unref_threadsafe_function(gConnectedEnv, gTsfn);
+      gRefed = now;
+    }
+    return;
+  }
+  WakeLocked();  // elsewhere the next delivery re-decides it
 }
 
 // On the connected environment's thread.
@@ -344,6 +360,7 @@ static void ChannelFinalize(napi_env, void*, void*) {
     gTsfn = nullptr;
     gConnected = false;
     gWakePending = false;
+    gConnectedEnv = nullptr;
   }
   CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
     if (gRunning.load()) StopRun();
@@ -383,11 +400,157 @@ static Napi::Value Connect(const Napi::CallbackInfo& info) {
   gConnected = true;
   gWakePending = false;
   gRefed = true;
+  gConnectedEnv = env;
+  gConnectedThread = pthread_self();
   if (gUIObjects == 0) {
     napi_unref_threadsafe_function(env, tsfn);
     gRefed = false;
   }
   if (!gEvQ.empty()) WakeLocked();
+  return env.Undefined();
+}
+
+// ---------------------------------------------------------------------------
+// handles allocated at the call (windowkit/appkit#51)
+// ---------------------------------------------------------------------------
+
+@implementation CALHandle
+- (void)dealloc {
+  // The object is the UI thread's to let go of, whichever thread drops the
+  // last reference to its handle (a worker's collector, usually): an
+  // NSWindow or a CALayer deallocated off the main thread is AppKit misuse.
+  id o = object_;
+  object_ = nil;
+  if (o && !pthread_main_np()) dispatch_async(dispatch_get_main_queue(), ^{ (void)o; });
+}
+@end
+
+// id -> the weak reference an event's `handle` field resolves through, in
+// the environment that holds the External. Leaked like the queues above.
+struct RegisteredHandle {
+  napi_env env;
+  napi_ref ref;
+};
+static std::mutex& gHandleMu = *new std::mutex;
+static std::unordered_map<uint64_t, RegisteredHandle>& gHandles =
+    *new std::unordered_map<uint64_t, RegisteredHandle>;
+static std::atomic<uint64_t> gNextHandleId{1};
+
+CALHandle* CALNewHandle() {
+  CALHandle* h = [CALHandle new];
+  h->id_ = gNextHandleId++;
+  return h;
+}
+
+Napi::Value CALWrapHandle(Napi::Env env, CALHandle* h, bool registered) {
+  uint64_t id = h->id_;
+  Napi::External<void> ext = Napi::External<void>::New(
+      env, (void*)CFBridgingRetain(h), [id, registered](Napi::Env env, void* data) {
+        if (registered) {
+          napi_ref ref = nullptr;
+          {
+            std::lock_guard<std::mutex> l(gHandleMu);
+            auto it = gHandles.find(id);
+            if (it != gHandles.end() && it->second.env == (napi_env)env) {
+              ref = it->second.ref;
+              gHandles.erase(it);
+            }
+          }
+          if (ref) napi_delete_reference(env, ref);
+        }
+        CFRelease(data);
+      });
+  if (registered) {
+    napi_ref ref = nullptr;
+    if (napi_create_reference(env, ext, 0, &ref) == napi_ok) {
+      std::lock_guard<std::mutex> l(gHandleMu);
+      gHandles[id] = {env, ref};
+    }
+  }
+  return ext;
+}
+
+CALEvent& CALEvent::HandleRef(const char* key, uint64_t id) {
+  return Handle(key, ^Napi::Value(Napi::Env env) {
+    // looked up on the delivering environment's thread, the only one that
+    // registers or finalizes its handles, so the reference cannot go away
+    // between the lookup and the read
+    napi_ref ref = nullptr;
+    {
+      std::lock_guard<std::mutex> l(gHandleMu);
+      auto it = gHandles.find(id);
+      if (it != gHandles.end() && it->second.env == (napi_env)env) ref = it->second.ref;
+    }
+    napi_value v = nullptr;
+    if (ref) napi_get_reference_value(env, ref, &v);
+    return v ? Napi::Value(env, v) : env.Null();
+  });
+}
+
+void CALPinHandle(Napi::Env env, uint64_t id, bool pin) {
+  napi_ref ref = nullptr;
+  {
+    std::lock_guard<std::mutex> l(gHandleMu);
+    auto it = gHandles.find(id);
+    if (it != gHandles.end() && it->second.env == (napi_env)env) ref = it->second.ref;
+  }
+  if (!ref) return;
+  uint32_t count = 0;
+  if (pin) napi_reference_ref(env, ref, &count);
+  else napi_reference_unref(env, ref, &count);
+}
+
+id CALHandleTarget(Napi::Value v) {
+  if (!v.IsExternal()) return nil;
+  void* d = v.As<Napi::External<void>>().Data();
+  return d ? (__bridge id)d : nil;
+}
+
+id CALResolve(id target) {
+  if ([target isKindOfClass:[CALHandle class]]) return ((CALHandle*)target)->object_;
+  return target;
+}
+
+// --- one-shot replies ---------------------------------------------------------
+
+struct Reply {
+  CALValueBlock make;
+};
+
+Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
+                                    const char* name) {
+  return Napi::ThreadSafeFunction::New(env, cb, name, 0, 1);
+}
+
+void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make) {
+  Reply* r = new Reply{make};
+  napi_status st = tsfn.BlockingCall(r, [](Napi::Env env, Napi::Function cb, Reply* r) {
+    Napi::Value v = r->make(env);
+    delete r;
+    cb.Call({v});
+  });
+  if (st != napi_ok) delete r;
+  tsfn.Release();
+}
+
+Napi::Value CALAnswer(const Napi::CallbackInfo& info, const char* name,
+                      CALValueBlock (^compute)(void), bool nested) {
+  Napi::Env env = info.Env();
+  Napi::Value last = info.Length() ? info[info.Length() - 1] : env.Undefined();
+  if (!last.IsFunction()) {
+    if (!pthread_main_np()) {
+      Napi::TypeError::New(env, std::string(name) +
+                                    ": off the main thread it answers through a "
+                                    "callback, its last argument")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    return compute()(env);
+  }
+  Napi::ThreadSafeFunction tsfn = CALReplyTo(env, last.As<Napi::Function>(), name);
+  dispatch_block_t work = ^{ CALReply(tsfn, compute()); };
+  if (nested) CALOnUIModal(work);
+  else CALOnUI(work);
   return env.Undefined();
 }
 
@@ -441,6 +604,8 @@ static void PostWakeEvent() {
                                      data2:0];
   [NSApp postEvent:e atStart:YES];
 }
+
+void CALPostWakeEvent() { PostWakeEvent(); }
 
 // On the UI thread. [NSApp stop:] ends the innermost loop only, and inside
 // runModal it ends the modal session instead of the app, so any nested loop

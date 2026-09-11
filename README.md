@@ -145,8 +145,28 @@ A few verbs behave differently from a worker:
   `closeWindow`, `windowScale`, `windowContentSize`, `hitTest`, `drawControl`,
   `appearanceIsDark`) throw off the main thread.
 
-Not routed yet: the layer verbs (windowkit/appkit#52) and control bezels
-(windowkit/appkit#54).
+**Frames from a worker** (windowkit/appkit#52). Pixels stay on the renderer's thread:
+drawing into surfaces, CoreText and `ctxGetImageData` all work there. Layer changes go to
+the UI thread, a frame at a time (`test/threaded-frames.js`):
+
+- **One batch per frame.** Between `txBegin` and `txCommit` on a worker, the layer verbs
+  record into that thread's frame batch. These are `createLayer` and its kinds, `set*Props`,
+  `addSublayer`, `removeFromSuperlayer`, `addAnimation`, `removeAnimation` and
+  `removeAllAnimations`, `setContentsImage`, `setLayerContentsIOSurface` and `surfaceToLayer`.
+  The outermost `txCommit` posts the batch as one command. The UI thread applies it in the
+  order it was recorded, in one commit, with `txBegin`'s options (`disableActions`,
+  `duration`, `timing`) as pump mode would have them. A layer verb outside any `txBegin` is a
+  command of its own, with actions on, as in pump mode's implicit transaction.
+- **Layers are handles answered at the call.** The `CALayer` is made on the UI thread when
+  the frame applies, so no layer is touched by two threads. `addAnimation` still answers its
+  duration at the call, and `presentationValue` takes a callback.
+- **Buffers change hands by event.** `surfaceToLayer` takes the bitmap at the call, so later
+  drawing does not reach the frame already posted. `setLayerContentsIOSurface` flips when
+  the frame applies. The renderer must not draw into the buffer the flip replaced until
+  either `surface-released { id }` names it, sent once the frame has been committed, or
+  `surfaceIsInUse(surface)` answers false.
+
+Not routed yet: control bezels (windowkit/appkit#54).
 
 **Published state.** The UI thread keeps a copy, under a lock, of what a renderer reads
 back synchronously: each window's content rect, visibility, occlusion, key state and

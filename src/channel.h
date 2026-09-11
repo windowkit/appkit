@@ -168,6 +168,16 @@ id CALHandleTarget(Napi::Value v);
 // made and after it is gone.
 id CALResolve(id target);
 
+// A layer verb's work (windowkit/appkit#52): run in the call on the main
+// thread; from any other, recorded into that thread's open frame batch
+// (txBegin … txCommit) or, outside one, queued as a command of its own.
+void CALOnLayers(void (^op)(void));
+
+// On the UI thread, before a layer's contents are replaced: while a worker's
+// frame applies, an IOSurface taken off the layer is reported afterwards as
+// `surface-released { id }`.
+void CALNoteContentsReplaced(id layer, id next);
+
 // A one-shot callback in the calling environment, answered from any thread:
 // `make` runs there and builds the one argument cb gets. A pending reply
 // holds that environment's loop open, like I/O in flight.

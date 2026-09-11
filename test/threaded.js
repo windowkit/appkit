@@ -19,8 +19,10 @@
 //   - commands apply inside a menu's tracking and inside runModal, the
 //     worker's own 5 ms timer keeps firing through both, and a command
 //     queued behind the one that starts the loop does not wait for its end;
-//   - a producer on the main queue (the accessibility observer) reaches the
-//     worker; a SIGHUP arrives as an event and the process lives on;
+//   - a producer on the main queue (the accessibility observer, its
+//     notification posted by a command, since AppKit's own observer of it
+//     rebuilds the menu bar) reaches the worker; a SIGHUP arrives as an
+//     event and the process lives on;
 //   - requestExit ends the run with its code.
 // And in child processes, the ways a run ends without requestExit: the
 // connected worker returning with nothing on screen, calling process.exit,

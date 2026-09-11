@@ -553,11 +553,16 @@ static void BInstallAccessibilityObserver() {
 // posted from here through the same centre, so the observer path can be
 // exercised without touching the user's settings. Test-only, like
 // postAppleEvent; the values it carries are whatever the settings are.
+// A command: the centre calls its observers on the posting thread, and
+// AppKit's own (the menu bar's) rebuilds the main menu there — from a
+// worker that is an NSInternalInconsistencyException abort.
 static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info) {
-  BEnsureApp();
-  [NSWorkspace.sharedWorkspace.notificationCenter
-      postNotificationName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
-                    object:NSWorkspace.sharedWorkspace];
+  CALOnUI(^{
+    BEnsureApp();
+    [NSWorkspace.sharedWorkspace.notificationCenter
+        postNotificationName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+                      object:NSWorkspace.sharedWorkspace];
+  });
   return info.Env().Undefined();
 }
 

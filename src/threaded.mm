@@ -71,7 +71,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -175,8 +179,17 @@ Napi::Object CALEvent::ToObject(Napi::Env env) const {
 // UserNotifications or EventKit queue) must not find them destroyed — the
 // #49 probe's "mutex lock failed: Invalid argument" abort.
 static std::mutex& gCmdMu = *new std::mutex;
-static std::vector<dispatch_block_t>& gCmdQ =
-    *new std::vector<dispatch_block_t>;  // gCmdMu
+// A queued command. A frame batch committed with txCommit({ width, height })
+// is tagged with the size it was painted at: what a window's resize
+// handshake waits for (CALAwaitFrame).
+struct Command {
+  dispatch_block_t block = nil;
+  bool sized = false;
+  double width = 0, height = 0;
+};
+static std::vector<Command>& gCmdQ = *new std::vector<Command>;  // gCmdMu
+// signalled on every post, for the handshake's bounded wait
+static std::condition_variable& gCmdCv = *new std::condition_variable;
 static CFRunLoopSourceRef gCmdSrc = nullptr;
 static int gDrainDepth = 0;  // the UI thread only
 
@@ -197,7 +210,7 @@ static void RunGuarded(dispatch_block_t b) {
 }
 
 static void DrainCommands(void*) {
-  std::vector<dispatch_block_t> batch;
+  std::vector<Command> batch;
   {
     std::lock_guard<std::mutex> l(gCmdMu);
     batch.swap(gCmdQ);
@@ -207,7 +220,7 @@ static void DrainCommands(void*) {
   @autoreleasepool {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    for (dispatch_block_t b : batch) RunGuarded(b);
+    for (const Command& c : batch) RunGuarded(c.block);
     [CATransaction commit];
   }
   gDrainDepth--;
@@ -226,14 +239,21 @@ static void EnsureCommandSource() {
   });
 }
 
-static void Post(dispatch_block_t b) {
+static void PostCommand(Command c) {
   EnsureCommandSource();
   {
     std::lock_guard<std::mutex> l(gCmdMu);
-    gCmdQ.push_back(b);
+    gCmdQ.push_back(std::move(c));
   }
+  gCmdCv.notify_all();
   CFRunLoopSourceSignal(gCmdSrc);
   CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+static void Post(dispatch_block_t b) {
+  Command c;
+  c.block = b;
+  PostCommand(std::move(c));
 }
 
 // A block of its own on the main run loop, in the default mode: after the
@@ -263,6 +283,19 @@ void CALOnUIModal(dispatch_block_t block) {
   } else {
     block();
   }
+}
+
+void CALPostFrame(dispatch_block_t block, bool sized, double width, double height) {
+  if (pthread_main_np()) {
+    block();
+    return;
+  }
+  Command c;
+  c.block = block;
+  c.sized = sized;
+  c.width = width;
+  c.height = height;
+  PostCommand(std::move(c));
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +359,20 @@ void CALUIObjectsChanged(int delta) {
   WakeLocked();  // elsewhere the next delivery re-decides it
 }
 
+// Whether JS can still be called in `env`. A worker that is ending (an
+// uncaught error, its own process.exit) can still run a threadsafe
+// function's callback from its loop's last spin, and there every property
+// set fails — which node-addon-api, with C++ exceptions off, turns into a
+// fatal error, since it cannot throw either (Node 18 on CI: "FATAL ERROR:
+// Error::ThrowAsJavaScriptException napi_throw" from DeliverBatch). Asked
+// with a raw set on a scratch object, whose failure is only a status.
+static bool CanCallIntoJS(napi_env env) {
+  napi_value o, v;
+  if (napi_create_object(env, &o) != napi_ok) return false;
+  if (napi_get_boolean(env, true, &v) != napi_ok) return false;
+  return napi_set_named_property(env, o, "probe", v) == napi_ok;
+}
+
 // On the connected environment's thread.
 static void DeliverBatch(napi_env env, napi_value cb, void*, void*) {
   if (env == nullptr) return;  // the function is being torn down
@@ -341,14 +388,19 @@ static void DeliverBatch(napi_env env, napi_value cb, void*, void*) {
       gRefed = want;
     }
   }
-  if (batch.empty()) return;
+  // an environment on its way out gets nothing more: the batch goes with it
+  if (batch.empty() || !CanCallIntoJS(env)) return;
   Napi::Env e(env);
   Napi::HandleScope scope(e);
   Napi::Array arr = Napi::Array::New(e, batch.size());
   for (uint32_t i = 0; i < batch.size(); i++) arr.Set(i, batch[i].ToObject(e));
-  // an exception from onEvents is left pending: Node reports it as that
-  // environment's uncaught exception
-  Napi::Function(e, cb).Call({arr});
+  // Raw, so a failed call is a status rather than node-addon-api's fatal
+  // error. An exception from onEvents is left pending: Node reports it as
+  // that environment's uncaught exception.
+  napi_value argv[1] = {arr};
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  napi_call_function(env, undefined, cb, 1, argv, nullptr);
 }
 
 static void StopRun();
@@ -525,9 +577,16 @@ Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
 void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make) {
   Reply* r = new Reply{make};
   napi_status st = tsfn.BlockingCall(r, [](Napi::Env env, Napi::Function cb, Reply* r) {
-    Napi::Value v = r->make(env);
+    // an environment on its way out gets no answer (see DeliverBatch)
+    if (!CanCallIntoJS(env)) {
+      delete r;
+      return;
+    }
+    napi_value v = r->make(env);
     delete r;
-    cb.Call({v});
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    napi_call_function(env, undefined, cb, 1, &v, nullptr);
   });
   if (st != napi_ok) delete r;
   tsfn.Release();
@@ -552,6 +611,73 @@ Napi::Value CALAnswer(const Napi::CallbackInfo& info, const char* name,
   if (nested) CALOnUIModal(work);
   else CALOnUI(work);
   return env.Undefined();
+}
+
+// ---------------------------------------------------------------------------
+// the live-resize handshake (windowkit/appkit#53)
+// ---------------------------------------------------------------------------
+//
+// windowDidResize: asks, on the UI thread, with the new content size: is a
+// frame painted at this size queued? It waits on the queue's condition
+// variable, never longer than `waitMs`, and then drains the queue inline —
+// not through the run-loop source, which AppKit's resize tracking would not
+// fire until the resize had committed without its frame (it calls the
+// delegate outside any run-loop pass: the #49 probe read a NULL mode
+// there). Drained inline, the frame lands in the same transaction as the
+// window's new size. JS never waits on the UI thread, so this cannot
+// deadlock: the worst case is the deadline, and then the last frame shows at
+// the new size, the root layer's background filling the exposed edge.
+
+static bool QueuedFrameAt(double w, double h) {  // gCmdMu held
+  for (const Command& c : gCmdQ)
+    if (c.sized && std::fabs(c.width - w) < 0.5 && std::fabs(c.height - h) < 0.5)
+      return true;
+  return false;
+}
+
+bool CALAwaitFrame(double width, double height, double waitMs, double* waitedMs) {
+  auto t0 = std::chrono::steady_clock::now();
+  bool connected;
+  {
+    std::lock_guard<std::mutex> l(gEvMu);
+    connected = gTsfn != nullptr;
+  }
+  bool met = false;
+  if (connected && waitMs > 0) {
+    // The deadline is not the condition variable's own timeout: the kernel
+    // coalesces timers, and on a CI VM a 15 ms wait woke only as the worker's
+    // 60 ms setTimeout fired. A strict dispatch timer (zero leeway, the flag
+    // that asks the system not to coalesce it) ends the wait instead, and the
+    // timed wait below is only a backstop a second later.
+    auto expired = std::make_shared<std::atomic<bool>>(false);
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
+    dispatch_source_set_timer(
+        timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_MSEC)),
+        DISPATCH_TIME_FOREVER, 0);
+    dispatch_source_set_event_handler(timer, ^{
+      {
+        std::lock_guard<std::mutex> l(gCmdMu);
+        expired->store(true);
+      }
+      gCmdCv.notify_all();
+    });
+    dispatch_resume(timer);
+    {
+      std::unique_lock<std::mutex> l(gCmdMu);
+      gCmdCv.wait_until(
+          l, t0 + std::chrono::microseconds((long long)(waitMs * 1000)) + std::chrono::seconds(1),
+          [&] { return QueuedFrameAt(width, height) || expired->load(); });
+      met = QueuedFrameAt(width, height);
+    }
+    dispatch_source_cancel(timer);
+  }
+  *waitedMs = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+  DrainCommands(nullptr);
+  return met;
 }
 
 // ---------------------------------------------------------------------------

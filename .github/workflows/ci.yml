@@ -256,6 +256,8 @@ jobs:
         run: node test/threaded-verbs.js
       - name: Frames from a worker — one batch per frame, layer handles, IOSurface buffers handed back by event
         run: node test/threaded-frames.js
+      - name: The live-resize handshake — a bounded wait for a frame at the new size
+        run: node test/threaded-resize.js
 
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline

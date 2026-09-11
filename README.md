@@ -166,6 +166,36 @@ the UI thread, a frame at a time (`test/threaded-frames.js`):
   either `surface-released { id }` names it, sent once the frame has been committed, or
   `surfaceIsInUse(surface)` answers false.
 
+**The live-resize handshake** (windowkit/appkit#53). In pump mode a resize stays in step for
+free: `window-resize` runs the renderer inside `windowDidResize:` itself, so the new frame
+commits with the moved edge. From a worker the frame comes back later, and without a
+handshake the edge moves first while the content catches up a frame or more behind.
+`setResizeHandshake(win, { waitMs })` turns the handshake on (`0`, the default, is off):
+
+- When the window's size changes, whether by a live resize or `setWindowFrame`, the UI thread
+  sends `window-resize`.
+- It then waits, never longer than `waitMs`, for a frame batch committed with that size:
+  `txCommit({ width, height })`, the renderer echoing the event's size.
+- It applies that batch inline, so the frame lands in the same transaction as the new
+  window size.
+- Each wait is reported as `resize-handshake { width, height, live, waited, met }`.
+
+JS never waits on the UI thread, so the worst case is the deadline. A frame that misses it
+shows the last frame at the new size, with the root layer's `backgroundColor` in the newly
+exposed edge. The deadline is a strict dispatch timer (`DISPATCH_TIMER_STRICT`, zero
+leeway), not a plain timed wait. Under a lower-QoS task policy, as on a CI runner or under
+`taskpolicy -c utility`, the kernel coalesces timers: a 15 ms timed wait woke only when the
+worker's own 60 ms timer fired.
+
+Measured by `test/threaded-resize.js` on an M1 Pro, with 3 ms of layout per frame and a
+50 ms budget:
+
+| | met | waited, p50 |
+| --- | --- | --- |
+| 20 `setWindowFrame` steps | 20 of 20 | 3.07 ms |
+| a live resize (AppKit's own tracking, driven by posted mouse events) | 28 of 28 | 3.11 ms |
+| a frame 60 ms late against a 15 ms budget | no | stopped at the deadline, ~16 ms |
+
 Not routed yet: control bezels (windowkit/appkit#54).
 
 **Published state.** The UI thread keeps a copy, under a lock, of what a renderer reads

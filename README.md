@@ -1037,6 +1037,20 @@ native.setAppName('My App');
 native.appInfo(); // -> { activationPolicy, name, dockBadge, active }
 ```
 
+**Under a launcher** (windowkit/appkit#64), the app's own code may not have run when the app
+launches. A threaded-mode launcher calls `initApp()` and `runMain()` on the main thread
+before its worker has imported the app's entry, so the app's `initApp({ activationPolicy })`
+from the worker comes after `finishLaunching`, by which time an agent app has already shown
+its Dock tile. Two ways to set the policy before launch:
+- **`APPKIT_ACTIVATION_POLICY=regular|accessory|prohibited`** is read as the app launches,
+  whichever call launches it. An unknown name is reported on stderr, and the app launches
+  regular.
+- **`runMain({ activationPolicy })`** is the policy to launch with when `runMain` is what
+  launches the app. If the app is already up, it is a live switch, as `setActivationPolicy` is.
+
+A policy the code gives before launch (`initApp`, `setActivationPolicy`, `runMain`) wins
+over the variable. A bundled app says the same with `LSUIElement` in its Info.plist.
+
 `dockMenuInfo()` and `activateDockMenuItem([i, j, …])` mirror `mainMenuInfo()` and
 `activateMenuItem()` for tests; both go through the delegate method the Dock itself calls.
 

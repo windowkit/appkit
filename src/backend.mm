@@ -99,9 +99,41 @@ static NSMenu* gDockMenu = nil;  // applicationDockMenu: answer; setDockMenu
 static void BInstallAppDelegate();  // the app lifecycle section, below
 static void BInstallAccessibilityObserver();  // the accessibility section, below
 static void BPublishAppState();  // the published state section, below
+static bool PolicyFromName(const std::string& s,
+                           NSApplicationActivationPolicy* out);  // app presence
+static void PublishPolicy(NSApplicationActivationPolicy p);  // published state
+
+// Said before launch by initApp({ activationPolicy }), setActivationPolicy
+// or runMain({ activationPolicy }): then the environment is not consulted.
+static bool gPolicyChosen = false;
+
+// APPKIT_ACTIVATION_POLICY=regular|accessory|prohibited — the policy to
+// launch with when the code that would say so has not run yet
+// (windowkit/appkit#64): a launcher's initApp() or runMain() launches the
+// app before a worker has imported the app's entry, and a policy set after
+// finishLaunching is too late for an agent app, whose Dock tile has
+// already appeared. A bundled app says the same with LSUIElement. A name
+// nobody knows is reported and the default kept.
+static void PolicyFromEnvironment() {
+  const char* v = getenv("APPKIT_ACTIVATION_POLICY");
+  if (!v || !*v) return;
+  NSApplicationActivationPolicy p;
+  if (PolicyFromName(v, &p)) {
+    gActivationPolicy = p;
+  } else {
+    fprintf(stderr,
+            "@windowkit/appkit: APPKIT_ACTIVATION_POLICY=%s is not regular, "
+            "accessory or prohibited; launching as regular\n",
+            v);
+  }
+}
 
 void BEnsureApp() {
   if (gAppLaunched) return;
+  if (!gPolicyChosen) PolicyFromEnvironment();
+  // published as it is decided, not after finishLaunching: a launch can
+  // take longer than a worker takes to start and read it
+  PublishPolicy(gActivationPolicy);
   @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:gActivationPolicy];
@@ -215,6 +247,8 @@ static std::vector<PubScreen>& gPubScreens = *new std::vector<PubScreen>;
 static A11yOptions gPubA11y = {};
 static std::atomic<int> gPubPolicy{(int)NSApplicationActivationPolicyRegular};
 static std::atomic<long> gPubPasteboardCount{0};
+
+static void PublishPolicy(NSApplicationActivationPolicy p) { gPubPolicy = (int)p; }
 
 // A call off the main thread — a worker's, threaded mode's — answers from
 // the copy: AppKit's state is not that thread's to read.
@@ -2796,6 +2830,7 @@ static const char* PolicyName(NSApplicationActivationPolicy p) {
 static bool ApplyActivationPolicy(NSApplicationActivationPolicy p) {
   if (!gAppLaunched) {
     gActivationPolicy = p;
+    gPolicyChosen = true;  // over APPKIT_ACTIVATION_POLICY
     BEnsureApp();  // publishes it
     return true;
   }
@@ -2818,6 +2853,18 @@ static bool ParsePolicyOption(Napi::Env env, Napi::Value v, bool* has,
     return false;
   }
   *has = true;
+  return true;
+}
+
+// runMain({ activationPolicy }) (threaded.mm, windowkit/appkit#64), on the
+// main thread: before launch it is the policy the app launches with; after,
+// a live switch, as setActivationPolicy is. False with a RangeError pending
+// for a name nobody knows.
+bool CALApplyActivationPolicyOption(Napi::Env env, Napi::Value v) {
+  bool has = false;
+  NSApplicationActivationPolicy p = NSApplicationActivationPolicyRegular;
+  if (!ParsePolicyOption(env, v, &has, &p)) return false;
+  if (has) ApplyActivationPolicy(p);
   return true;
 }
 

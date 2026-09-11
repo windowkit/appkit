@@ -75,6 +75,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -617,10 +618,34 @@ bool CALAwaitFrame(double width, double height, double waitMs, double* waitedMs)
   }
   bool met = false;
   if (connected && waitMs > 0) {
-    std::unique_lock<std::mutex> l(gCmdMu);
-    met = gCmdCv.wait_until(
-        l, t0 + std::chrono::microseconds((long long)(waitMs * 1000)),
-        [&] { return QueuedFrameAt(width, height); });
+    // The deadline is not the condition variable's own timeout: the kernel
+    // coalesces timers, and on a CI VM a 15 ms wait woke only as the worker's
+    // 60 ms setTimeout fired. A strict dispatch timer (zero leeway, the flag
+    // that asks the system not to coalesce it) ends the wait instead, and the
+    // timed wait below is only a backstop a second later.
+    auto expired = std::make_shared<std::atomic<bool>>(false);
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
+    dispatch_source_set_timer(
+        timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_MSEC)),
+        DISPATCH_TIME_FOREVER, 0);
+    dispatch_source_set_event_handler(timer, ^{
+      {
+        std::lock_guard<std::mutex> l(gCmdMu);
+        expired->store(true);
+      }
+      gCmdCv.notify_all();
+    });
+    dispatch_resume(timer);
+    {
+      std::unique_lock<std::mutex> l(gCmdMu);
+      gCmdCv.wait_until(
+          l, t0 + std::chrono::microseconds((long long)(waitMs * 1000)) + std::chrono::seconds(1),
+          [&] { return QueuedFrameAt(width, height) || expired->load(); });
+      met = QueuedFrameAt(width, height);
+    }
+    dispatch_source_cancel(timer);
   }
   *waitedMs = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0)

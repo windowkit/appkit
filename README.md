@@ -182,7 +182,10 @@ handshake the edge moves first while the content catches up a frame or more behi
 
 JS never waits on the UI thread, so the worst case is the deadline. A frame that misses it
 shows the last frame at the new size, with the root layer's `backgroundColor` in the newly
-exposed edge.
+exposed edge. The deadline is a strict dispatch timer (`DISPATCH_TIMER_STRICT`, zero
+leeway), not a plain timed wait. Under a lower-QoS task policy, as on a CI runner or under
+`taskpolicy -c utility`, the kernel coalesces timers: a 15 ms timed wait woke only when the
+worker's own 60 ms timer fired.
 
 Measured by `test/threaded-resize.js` on an M1 Pro, with 3 ms of layout per frame and a
 50 ms budget:

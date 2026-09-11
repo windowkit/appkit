@@ -88,6 +88,34 @@ static T Deref(Napi::Value v) {
   return (__bridge T)(v.As<Napi::External<void>>().Data());
 }
 
+#include <pthread.h>
+
+#include "channel.h"
+
+// The first-generation window API (createWindow, setEventCallback, pump,
+// closeWindow, windowScale, windowContentSize, hitTest, drawControl,
+// appearanceIsDark) is pump mode's: called off the main thread it is an
+// Error, never a crash on AppKit's thread checks. The verbs the backend's
+// windows share (windowRootLayer, windowNumber, windowIsVisible,
+// snapshotWindow, postMouseEvent) follow threaded mode instead.
+static bool PumpModeOnly(const Napi::CallbackInfo& info, const char* name) {
+  if (pthread_main_np()) return true;
+  Napi::Error::New(info.Env(), std::string(name) +
+                                   ": the first-generation API is pump mode's — "
+                                   "call it on the main thread")
+      .ThrowAsJavaScriptException();
+  return false;
+}
+
+// windowIsVisible from the published copy (backend.mm).
+bool CALWindowVisible(long number, bool* visible);
+
+// A worker's window handle (createWindow2 off the main thread), or nil.
+static CALHandle* WindowHandleOf(Napi::Value v) {
+  id target = CALHandleTarget(v);
+  return [target isKindOfClass:[CALHandle class]] ? (CALHandle*)target : nil;
+}
+
 // Wrap an ObjC object as an External holding a +1 retain, released on GC.
 static Napi::Value WrapRetained(Napi::Env env, id obj) {
   void* p = (void*)CFBridgingRetain(obj);
@@ -117,6 +145,7 @@ static void EnsureApp() { BEnsureApp(); }
 
 static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!PumpModeOnly(info, "createWindow")) return env.Undefined();
   EnsureApp();
   double w = info[0].As<Napi::Number>().DoubleValue();
   double h = info[1].As<Napi::Number>().DoubleValue();
@@ -153,17 +182,26 @@ static Napi::Value CreateWindowFn(const Napi::CallbackInfo& info) {
   return WrapRetained(env, win);
 }
 
+// From a worker: the root layer's handle, allocated with the window's (the
+// layer verbs that take it are windowkit/appkit#52's).
 static Napi::Value WindowRootLayer(const Napi::CallbackInfo& info) {
-  NSWindow* win = Deref<NSWindow*>(info[0]);
+  if (!pthread_main_np()) {
+    CALHandle* h = WindowHandleOf(info[0]);
+    if (!h || !h->part_) return info.Env().Null();
+    return CALWrapHandle(info.Env(), h->part_, false);
+  }
+  NSWindow* win = CALResolve(CALHandleTarget(info[0]));
   return WrapRetained(info.Env(), win.contentView.layer);
 }
 
 static Napi::Value WindowScale(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "windowScale")) return info.Env().Undefined();
   NSWindow* win = Deref<NSWindow*>(info[0]);
   return Napi::Number::New(info.Env(), win.backingScaleFactor);
 }
 
 static Napi::Value WindowContentSize(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "windowContentSize")) return info.Env().Undefined();
   NSWindow* win = Deref<NSWindow*>(info[0]);
   NSSize s = win.contentView.bounds.size;
   Napi::Array a = Napi::Array::New(info.Env(), 2);
@@ -172,17 +210,31 @@ static Napi::Value WindowContentSize(const Napi::CallbackInfo& info) {
   return a;
 }
 
+// From a worker: the published copy, null until the window is made.
 static Napi::Value WindowIsVisible(const Napi::CallbackInfo& info) {
-  NSWindow* win = Deref<NSWindow*>(info[0]);
+  if (!pthread_main_np()) {
+    CALHandle* h = WindowHandleOf(info[0]);
+    bool visible = false;
+    if (!h || !CALWindowVisible(h->number_.load(), &visible)) return info.Env().Null();
+    return Napi::Boolean::New(info.Env(), visible);
+  }
+  NSWindow* win = CALResolve(CALHandleTarget(info[0]));
   return Napi::Boolean::New(info.Env(), win.isVisible);
 }
 
+// From a worker: the number once the window is made, null before.
 static Napi::Value WindowNumber(const Napi::CallbackInfo& info) {
-  NSWindow* win = Deref<NSWindow*>(info[0]);
+  if (!pthread_main_np()) {
+    CALHandle* h = WindowHandleOf(info[0]);
+    long n = h ? h->number_.load() : 0;
+    return n ? Napi::Value(Napi::Number::New(info.Env(), (double)n)) : info.Env().Null();
+  }
+  NSWindow* win = CALResolve(CALHandleTarget(info[0]));
   return Napi::Number::New(info.Env(), (double)win.windowNumber);
 }
 
 static Napi::Value CloseWindow(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "closeWindow")) return info.Env().Undefined();
   NSWindow* win = Deref<NSWindow*>(info[0]);
   [win close];
   return info.Env().Undefined();
@@ -235,8 +287,9 @@ static void DispatchEvent(Napi::Env env, NSEvent* e) {
 
 // postMouseEvent(win, 'down'|'up'|'move'|'drag', x, y) — synthesizes an event
 // through the normal pump path (top-left coords). Handy for automated tests.
+// A command in threaded mode, like every test-only post.
 static Napi::Value PostMouseEvent(const Napi::CallbackInfo& info) {
-  NSWindow* win = Deref<NSWindow*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   std::string t = info[1].As<Napi::String>().Utf8Value();
   double x = info[2].As<Napi::Number>().DoubleValue();
   double y = info[3].As<Napi::Number>().DoubleValue();
@@ -245,22 +298,27 @@ static Napi::Value PostMouseEvent(const Napi::CallbackInfo& info) {
   else if (t == "up") type = NSEventTypeLeftMouseUp;
   else if (t == "drag") type = NSEventTypeLeftMouseDragged;
   else type = NSEventTypeMouseMoved;
-  NSView* v = win.contentView;
-  NSPoint wp = [v convertPoint:NSMakePoint(x, y) toView:nil];  // v is flipped
-  NSEvent* e = [NSEvent mouseEventWithType:type
-                                  location:wp
-                             modifierFlags:0
-                                 timestamp:[[NSProcessInfo processInfo] systemUptime]
-                              windowNumber:win.windowNumber
-                                   context:nil
-                               eventNumber:0
-                                clickCount:1
-                                  pressure:1];
-  [NSApp postEvent:e atStart:NO];
+  CALOnUI(^{
+    NSWindow* win = CALResolve(target);
+    if (!win) return;
+    NSView* v = win.contentView;
+    NSPoint wp = [v convertPoint:NSMakePoint(x, y) toView:nil];  // v is flipped
+    NSEvent* e = [NSEvent mouseEventWithType:type
+                                    location:wp
+                               modifierFlags:0
+                                   timestamp:[[NSProcessInfo processInfo] systemUptime]
+                                windowNumber:win.windowNumber
+                                     context:nil
+                                 eventNumber:0
+                                  clickCount:1
+                                    pressure:1];
+    [NSApp postEvent:e atStart:NO];
+  });
   return info.Env().Undefined();
 }
 
 static Napi::Value SetEventCallback(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "setEventCallback")) return info.Env().Undefined();
   if (info[0].IsFunction()) {
     gEventCb = Napi::Persistent(info[0].As<Napi::Function>());
     gEventCb.SuppressDestruct();  // static: outlives the env, see backend.mm
@@ -272,6 +330,7 @@ static Napi::Value SetEventCallback(const Napi::CallbackInfo& info) {
 
 static Napi::Value Pump(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!PumpModeOnly(info, "pump")) return env.Undefined();
   EnsureApp();
   @autoreleasepool {
     while (true) {
@@ -545,8 +604,8 @@ static Napi::Value SetShapeProps(const Napi::CallbackInfo& info) {
 // waits; and the presentation value plus the completion event, which say
 // where an animation is and when it stopped.
 
-// The completion event goes out through the backend's one event path.
-#include "channel.h"
+// The completion event goes out through the backend's one event path
+// (channel.h, included above).
 
 static bool ThrowType(Napi::Env env, const char* msg) {
   Napi::TypeError::New(env, msg).ThrowAsJavaScriptException();
@@ -953,6 +1012,7 @@ static Napi::Value TxCommit(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 static Napi::Value HitTest(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "hitTest")) return info.Env().Undefined();
   Napi::Env env = info.Env();
   CALayer* root = Deref<CALayer*>(info[0]);
   double x = info[1].As<Napi::Number>().DoubleValue();
@@ -1076,6 +1136,7 @@ static NSView* DummyDrawView() {
 //   -> { image: External<CGImage>, width, height, scale }  (points)
 // width/height default to the cell's natural cellSize (slider must pass them).
 static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "drawControl")) return info.Env().Undefined();
   Napi::Env env = info.Env();
   EnsureApp();
   Napi::Object o = info[0].As<Napi::Object>();
@@ -1222,6 +1283,7 @@ static Napi::Value SetLayerContentsIOSurface(const Napi::CallbackInfo& info) {
 }
 
 static Napi::Value AppearanceIsDark(const Napi::CallbackInfo& info) {
+  if (!PumpModeOnly(info, "appearanceIsDark")) return info.Env().Undefined();
   EnsureApp();
   NSAppearanceName n = [NSApp.effectiveAppearance
       bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
@@ -1232,37 +1294,44 @@ static Napi::Value AppearanceIsDark(const Napi::CallbackInfo& info) {
 // snapshot (renderInContext -> PNG) — for debugging / headless verification
 // ---------------------------------------------------------------------------
 
+// snapshotWindow(win, path, withShadow?, cb?) -> bool; off the main thread
+// the answer comes through cb (the last argument).
 static Napi::Value SnapshotWindow(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSWindow* win = Deref<NSWindow*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   NSString* path = ToNSString(info[1]);
-
-  // Capture our own window's real composited pixels (allowed without the
-  // screen-recording permission for windows the process owns). This shows the
-  // true WindowServer output, including geometryFlipped, masks, and shadows.
+  bool withShadow =
+      info.Length() > 2 && !info[2].IsFunction() && info[2].ToBoolean().Value();
+  return CALAnswer(info, "snapshotWindow", ^CALValueBlock {
+    NSWindow* win = CALResolve(target);
+    bool ok = false;
+    if (win) {
+      // Capture our own window's real composited pixels (allowed without the
+      // screen-recording permission for windows the process owns). This
+      // shows the true WindowServer output, including geometryFlipped, masks,
+      // and shadows.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  bool withShadow = info.Length() > 2 && info[2].ToBoolean().Value();
-  CGImageRef img = CGWindowListCreateImage(
-      CGRectNull, kCGWindowListOptionIncludingWindow, (CGWindowID)win.windowNumber,
-      withShadow
-          ? (CGWindowImageOption)kCGWindowImageBestResolution
-          : (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming |
-                                  kCGWindowImageBestResolution));
+      CGImageRef img = CGWindowListCreateImage(
+          CGRectNull, kCGWindowListOptionIncludingWindow, (CGWindowID)win.windowNumber,
+          withShadow
+              ? (CGWindowImageOption)kCGWindowImageBestResolution
+              : (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming |
+                                      kCGWindowImageBestResolution));
 #pragma clang diagnostic pop
-  if (!img) return Napi::Boolean::New(env, false);
-
-  NSURL* url = [NSURL fileURLWithPath:path];
-  CGImageDestinationRef dst =
-      CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
-  bool ok = false;
-  if (dst) {
-    CGImageDestinationAddImage(dst, img, NULL);
-    ok = CGImageDestinationFinalize(dst);
-    CFRelease(dst);
-  }
-  CGImageRelease(img);
-  return Napi::Boolean::New(env, ok);
+      if (img) {
+        NSURL* url = [NSURL fileURLWithPath:path];
+        CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+            (__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
+        if (dst) {
+          CGImageDestinationAddImage(dst, img, NULL);
+          ok = CGImageDestinationFinalize(dst);
+          CFRelease(dst);
+        }
+        CGImageRelease(img);
+      }
+    }
+    return ^Napi::Value(Napi::Env e) { return Napi::Boolean::New(e, ok); };
+  });
 }
 
 // ---------------------------------------------------------------------------

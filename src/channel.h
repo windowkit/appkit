@@ -15,6 +15,8 @@
 #include <napi.h>
 #import <Foundation/Foundation.h>
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,9 @@ class CALEvent {
   // JSON text, parsed as it crosses; the text itself if it does not parse
   CALEvent& Json(const char* key, const std::string& v);
   CALEvent& Handle(const char* key, CALValueBlock v);
+  // the JS handle CALWrapHandle registered for this id, or null when the
+  // delivering environment is not the one holding it (or it was collected)
+  CALEvent& HandleRef(const char* key, uint64_t id);
   // In threaded mode an event of the same type and key queued right behind
   // this one replaces it: consecutive motion crosses as its latest position.
   CALEvent& FoldBy(double key) {
@@ -109,5 +114,69 @@ void CALOnUIModal(void (^block)(void));
 // Windows and status items alive — the objects a person can act on. The
 // channel's threadsafe function holds the connected environment's loop open
 // while any exist and lets it go when none do, so an app with nothing on
-// screen can exit.
+// screen can exit. Called on the connected environment's own thread (a
+// worker's createWindow2) the reference changes at once, so a worker whose
+// script ends right after making a window is still held.
 void CALUIObjectsChanged(int delta);
+
+// ---------------------------------------------------------------------------
+// handles allocated at the call (windowkit/appkit#51)
+// ---------------------------------------------------------------------------
+//
+// JS never waits on the UI thread, so in threaded mode a verb that makes an
+// AppKit object answers before the object exists: it allocates a CALHandle
+// on the calling thread, hands JS an External over it, and queues the
+// making; the UI thread binds the object into the handle as it makes it.
+// Every later verb captures the handle and resolves it inside its own
+// command, which runs after the making because commands apply in order.
+// Pump mode still hands out the object itself, as it always has; the two
+// helpers below take either.
+
+@interface CALHandle : NSObject {
+ @public
+  uint64_t id_;                  // what an event's `handle` field names
+  id object_;                    // the UI thread's: nil until made, nil once gone
+  CALHandle* part_;              // a window's root layer, allocated with it
+  std::atomic<long> number_;     // a window's number once made (0 before); any thread
+  std::atomic<bool> released_;   // destroyed / removed through a verb (counted once)
+}
+@end
+
+CALHandle* CALNewHandle();  // any thread
+
+// The External JS holds. `registered`: events may name it (a window, a
+// status item), so a weak reference is kept for CALEvent::HandleRef; the
+// External's finalizer drops it. The object is let go on the UI thread
+// whichever thread the handle dies on.
+Napi::Value CALWrapHandle(Napi::Env env, CALHandle* h, bool registered);
+
+// Hold a registered handle's External strongly (pin) or let it go again,
+// on the environment's own thread: a worker's status item stays in the bar
+// until removeStatusItem even when JS drops its handle, as pump mode's does.
+void CALPinHandle(Napi::Env env, uint64_t id, bool pin);
+
+// What a verb captures for its command: the handle, or pump mode's object
+// itself; nil for anything that is neither.
+id CALHandleTarget(Napi::Value v);
+
+// On the UI thread: the object a captured target names — nil before it is
+// made and after it is gone.
+id CALResolve(id target);
+
+// A one-shot callback in the calling environment, answered from any thread:
+// `make` runs there and builds the one argument cb gets. A pending reply
+// holds that environment's loop open, like I/O in flight.
+Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
+                                    const char* name);
+void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make);
+
+// A read of AppKit state, in either mode. Without a callback (the last
+// argument, when it is a function) it answers synchronously — on the main
+// thread only, as every read always has; off it that is a TypeError. With
+// one, `compute` runs on the UI thread and what it returns builds cb's one
+// argument in the caller's environment, a later tick even on the main
+// thread. `compute` never returns nil. `nested`: compute spins a run loop of
+// its own (a test hook waiting for a window), so a queued one runs through
+// CALOnUIModal rather than inside a drain.
+Napi::Value CALAnswer(const Napi::CallbackInfo& info, const char* name,
+                      CALValueBlock (^compute)(void), bool nested = false);

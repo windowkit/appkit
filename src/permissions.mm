@@ -312,6 +312,8 @@ static void Answer(Napi::ThreadSafeFunction tsfn, const char* status) {
   Answer(tsfn, status, strcmp(status, kAuthorized) == 0);
 }
 
+#include "channel.h"  // CALOnUI
+
 // A location request: its own CLLocationManager whose delegate reports the
 // decision. The delegate is also told the current status right after it is
 // set, which is notDetermined while the prompt is still up — that echo is
@@ -338,15 +340,20 @@ static NSMutableArray<CALLocationRequest*>* gLocationRequests = nil;
 }
 @end
 
+// The manager reports on the run loop of the thread that made it, and a
+// worker has none: it is made on the UI thread (inline in pump mode, a
+// command in threaded mode), where the delegate call then arrives.
 static void StartLocationRequest(Napi::ThreadSafeFunction tsfn) {
-  CALLocationRequest* r = [CALLocationRequest new];
-  r->tsfn_ = tsfn;
-  r->done_ = false;
-  r->mgr_ = [CLLocationManager new];
-  r->mgr_.delegate = r;
-  if (!gLocationRequests) gLocationRequests = [NSMutableArray new];
-  [gLocationRequests addObject:r];
-  [r->mgr_ requestWhenInUseAuthorization];
+  CALOnUI(^{
+    CALLocationRequest* r = [CALLocationRequest new];
+    r->tsfn_ = tsfn;
+    r->done_ = false;
+    r->mgr_ = [CLLocationManager new];
+    r->mgr_.delegate = r;
+    if (!gLocationRequests) gLocationRequests = [NSMutableArray new];
+    [gLocationRequests addObject:r];
+    [r->mgr_ requestWhenInUseAuthorization];
+  });
 }
 
 // --- the natives -----------------------------------------------------------

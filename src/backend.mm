@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -207,8 +208,27 @@ static A11yOptions gPubA11y = {};
 static std::atomic<int> gPubPolicy{(int)NSApplicationActivationPolicyRegular};
 static std::atomic<long> gPubPasteboardCount{0};
 
-// A worker's call while the main thread is AppKit's: answer from the copy.
-static bool ReadPublished() { return CALThreaded() && !pthread_main_np(); }
+// A call off the main thread — a worker's, threaded mode's — answers from
+// the copy: AppKit's state is not that thread's to read.
+static bool ReadPublished() { return !pthread_main_np(); }
+
+// appInfo's part of the copy: the name LaunchServices has for the process,
+// the Dock badge, whether the app is active.
+static NSString* gPubName = nil;   // gPubMu
+static NSString* gPubBadge = nil;  // gPubMu
+static std::atomic<bool> gPubActive{false};
+
+static void PublishName() {
+  NSString* name = NSRunningApplication.currentApplication.localizedName;
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubName = [name copy];
+}
+
+static void PublishBadge() {
+  NSString* badge = NSApp.dockTile.badgeLabel;
+  std::lock_guard<std::mutex> l(gPubMu);
+  gPubBadge = [badge copy];
+}
 
 static bool WindowOnGlass(NSWindow* win) {
   return (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
@@ -256,6 +276,29 @@ static void PublishWindow(NSWindow* win) {
 static void ForgetWindow(long number) {
   std::lock_guard<std::mutex> l(gPubMu);
   gPubWindows.erase(number);
+}
+
+static bool PublishedWindow(long number, PubWindow* out) {
+  if (!number) return false;
+  std::lock_guard<std::mutex> l(gPubMu);
+  auto it = gPubWindows.find(number);
+  if (it == gPubWindows.end()) return false;
+  *out = it->second;
+  return true;
+}
+
+// For addon.mm's windowIsVisible on a worker's window.
+bool CALWindowVisible(long number, bool* visible) {
+  PubWindow s;
+  if (!PublishedWindow(number, &s)) return false;
+  *visible = s.visible;
+  return true;
+}
+
+// A worker's window handle, or nil for anything else (pump mode's window
+// itself included).
+static CALHandle* WindowHandleOf(id target) {
+  return [target isKindOfClass:[CALHandle class]] ? (CALHandle*)target : nil;
 }
 
 static std::vector<PubScreen> ScreensNow() {
@@ -337,17 +380,33 @@ static void PublishPasteboardCount() {
 // the screen list again whenever the arrangement or a resolution changes.
 static id gScreensObserver = nil;
 
+static id gActiveObserver = nil, gInactiveObserver = nil;
+
 static void BPublishAppState() {
   PublishScreens();
   PublishA11y(A11yOptionsNow());
   gPubPolicy = (int)NSApp.activationPolicy;
   PublishPasteboardCount();
+  PublishName();
+  PublishBadge();
+  gPubActive = NSApp.isActive;
   if (gScreensObserver) return;
-  gScreensObserver = [NSNotificationCenter.defaultCenter
-      addObserverForName:NSApplicationDidChangeScreenParametersNotification
-                  object:NSApp
-                   queue:nil
-              usingBlock:^(NSNotification*) { PublishScreens(); }];
+  NSNotificationCenter* nc = NSNotificationCenter.defaultCenter;
+  gScreensObserver =
+      [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                      object:NSApp
+                       queue:nil
+                  usingBlock:^(NSNotification*) { PublishScreens(); }];
+  gActiveObserver =
+      [nc addObserverForName:NSApplicationDidBecomeActiveNotification
+                      object:NSApp
+                       queue:nil
+                  usingBlock:^(NSNotification*) { gPubActive = true; }];
+  gInactiveObserver =
+      [nc addObserverForName:NSApplicationDidResignActiveNotification
+                      object:NSApp
+                       queue:nil
+                  usingBlock:^(NSNotification*) { gPubActive = false; }];
 }
 
 // windowState(windowNumber) -> { x, y, width, height, scale, visible,
@@ -363,12 +422,7 @@ static Napi::Value WindowStateFn(const Napi::CallbackInfo& info) {
   }
   long number = (long)info[0].As<Napi::Number>().Int64Value();
   PubWindow s;
-  {
-    std::lock_guard<std::mutex> l(gPubMu);
-    auto it = gPubWindows.find(number);
-    if (it == gPubWindows.end()) return env.Null();
-    s = it->second;
-  }
+  if (!PublishedWindow(number, &s)) return env.Null();
   return WindowStateObject(env, s);
 }
 
@@ -573,9 +627,21 @@ static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info
 @interface CALBackendDelegate : NSObject <NSWindowDelegate>
 @end
 
+// A worker's window carries its handle's id (createWindow2 off the main
+// thread), and every event about it names the handle JS holds, so a
+// renderer can key its windows on the handle. Pump mode's windows have
+// none, and their events are what they always were.
+static char kWindowHandleKey;
+
+static void AddWindowHandle(CALEvent& ev, NSWindow* win) {
+  NSNumber* id = objc_getAssociatedObject(win, &kWindowHandleKey);
+  if (id) ev.HandleRef("handle", id.unsignedLongLongValue);
+}
+
 static CALEvent WindowEvent(NSWindow* win, const char* type) {
   CALEvent ev(type);
   ev.Num("windowNumber", (double)win.windowNumber);
+  AddWindowHandle(ev, win);
   return ev;
 }
 
@@ -703,15 +769,63 @@ static char kDelegateKey;
 //                 resizable, opaque, hasShadow, level,   // level: 'normal'|'popup'|'floating'
 //                 ignoresMouseEvents,     // the pointer passes through (below)
 //                 backgroundColor })      // [r,g,b,a] or absent
-static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  BEnsureApp();
-  Napi::Object o = info[0].As<Napi::Object>();
-  double w = BNumOr(o, "width", 640), h = BNumOr(o, "height", 480);
-  std::string kind = o.Has("kind") && o.Get("kind").IsString()
-                         ? o.Get("kind").As<Napi::String>().Utf8Value()
-                         : "normal";
-  bool resizable = BBoolOr(o, "resizable", true);
+//
+// On the main thread (pump mode) the window is made in the call and the
+// window itself is the handle, as always. Off it (a worker, threaded mode)
+// the options are read here, a handle is answered at once, and the window is
+// made by a command; `window-created { handle, windowNumber }` follows, and
+// every event about the window carries `handle`.
+
+// createWindow2's options, read on the calling thread.
+struct WindowSpec {
+  double w = 640, h = 480;
+  std::string kind = "normal", level;
+  bool resizable = true;
+  NSString* title = nil;
+  int hasShadow = -1, opaque = -1, ignoresMouseEvents = -1;  // -1: not given
+  bool hasBackground = false;
+  double background[4] = {0, 0, 0, 1};
+  bool placed = false;
+  double x = 0, y = 0;
+};
+
+static int BTriOr(Napi::Object o, const char* k, bool d) {
+  return o.Has(k) ? (int)BBoolOr(o, k, d) : -1;
+}
+
+static WindowSpec ParseWindowSpec(Napi::Object o) {
+  WindowSpec s;
+  s.w = BNumOr(o, "width", 640);
+  s.h = BNumOr(o, "height", 480);
+  if (o.Has("kind") && o.Get("kind").IsString())
+    s.kind = o.Get("kind").As<Napi::String>().Utf8Value();
+  s.resizable = BBoolOr(o, "resizable", true);
+  if (o.Has("title") && o.Get("title").IsString())
+    s.title = BToNSString(o.Get("title"));
+  if (o.Has("level") && o.Get("level").IsString())
+    s.level = o.Get("level").As<Napi::String>().Utf8Value();
+  s.hasShadow = BTriOr(o, "hasShadow", true);
+  s.opaque = BTriOr(o, "opaque", true);
+  s.ignoresMouseEvents = BTriOr(o, "ignoresMouseEvents", false);
+  if (o.Has("backgroundColor") && o.Get("backgroundColor").IsArray()) {
+    Napi::Array a = o.Get("backgroundColor").As<Napi::Array>();
+    s.hasBackground = true;
+    for (uint32_t i = 0; i < 4 && i < a.Length(); i++)
+      s.background[i] = a.Get(i).As<Napi::Number>().DoubleValue();
+  }
+  if (o.Has("x") && o.Get("x").IsNumber() && o.Has("y") && o.Get("y").IsNumber()) {
+    s.placed = true;
+    s.x = BNumOr(o, "x", 0);
+    s.y = BNumOr(o, "y", 0);
+  }
+  return s;
+}
+
+// On the UI thread, the app launched.
+static NSWindow* BuildWindow(const WindowSpec& spec) {
+  double w = spec.w, h = spec.h;
+  const std::string& kind = spec.kind;
+  bool resizable = spec.resizable;
 
   NSWindow* win;
   @autoreleasepool {
@@ -746,16 +860,12 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     // Never a tab bar, whatever an earlier process left in the defaults
     // domain (see BEnsureApp).
     win.tabbingMode = NSWindowTabbingModeDisallowed;
-    if (o.Has("title") && o.Get("title").IsString())
-      win.title = BToNSString(o.Get("title"));
-    if (o.Has("level") && o.Get("level").IsString()) {
-      std::string level = o.Get("level").As<Napi::String>().Utf8Value();
-      if (level == "popup") win.level = NSPopUpMenuWindowLevel;
-      else if (level == "floating") win.level = NSFloatingWindowLevel;
-    }
-    if (o.Has("hasShadow")) win.hasShadow = BBoolOr(o, "hasShadow", true);
-    if (o.Has("opaque")) {
-      win.opaque = BBoolOr(o, "opaque", true);
+    if (spec.title) win.title = spec.title;
+    if (spec.level == "popup") win.level = NSPopUpMenuWindowLevel;
+    else if (spec.level == "floating") win.level = NSFloatingWindowLevel;
+    if (spec.hasShadow >= 0) win.hasShadow = spec.hasShadow;
+    if (spec.opaque >= 0) {
+      win.opaque = spec.opaque;
       if (!win.opaque) win.backgroundColor = NSColor.clearColor;
     }
     // A window the pointer passes through. The window server hit-tests
@@ -764,8 +874,7 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     // types is not that: the window under the pointer is found first, an
     // unregistered one is still the one found, and the drag then has no
     // destination at all. Transparent pixels do not pass a hit either.
-    if (o.Has("ignoresMouseEvents"))
-      win.ignoresMouseEvents = BBoolOr(o, "ignoresMouseEvents", false);
+    if (spec.ignoresMouseEvents >= 0) win.ignoresMouseEvents = spec.ignoresMouseEvents;
 
     CALBackendView* view = [[CALBackendView alloc] initWithFrame:rect];
     CALayer* root = [CALayer layer];
@@ -774,21 +883,17 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     [view setWantsLayer:YES];
     win.contentView = view;
     root.contentsScale = win.backingScaleFactor;
-    if (o.Has("backgroundColor") && o.Get("backgroundColor").IsArray()) {
-      CGColorRef c = BMakeColor(o.Get("backgroundColor"));
+    if (spec.hasBackground) {
+      CGColorRef c = CGColorCreateSRGB(spec.background[0], spec.background[1],
+                                       spec.background[2], spec.background[3]);
       root.backgroundColor = c;
       CGColorRelease(c);
     }
 
     // Placement: explicit top-left global coordinates, or centered.
-    if (o.Has("x") && o.Get("x").IsNumber() && o.Has("y") &&
-        o.Get("y").IsNumber()) {
-      double x = BNumOr(o, "x", 0), y = BNumOr(o, "y", 0);
-      NSRect frame = [win frameRectForContentRect:NSMakeRect(0, 0, w, h)];
-      CGFloat titlebar = frame.size.height - h;
+    if (spec.placed) {
       // y is the CONTENT's top edge in top-left global coordinates.
-      [win setFrameOrigin:NSMakePoint(x, PrimaryScreenTop() - y - h)];
-      (void)titlebar;
+      [win setFrameOrigin:NSMakePoint(spec.x, PrimaryScreenTop() - spec.y - h)];
     } else {
       [win center];
     }
@@ -800,34 +905,84 @@ static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
     [win makeFirstResponder:view];
     PublishWindow(win);
   }
-  CALUIObjectsChanged(+1);
-  return BWrapRetained(env, win);
+  return win;
+}
+
+static Napi::Value CreateWindow2(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  WindowSpec spec = ParseWindowSpec(info[0].IsObject() ? info[0].As<Napi::Object>()
+                                                       : Napi::Object::New(env));
+  if (pthread_main_np()) {
+    BEnsureApp();
+    NSWindow* win = BuildWindow(spec);
+    CALUIObjectsChanged(+1);
+    return BWrapRetained(env, win);
+  }
+  CALHandle* h = CALNewHandle();
+  h->part_ = CALNewHandle();  // windowRootLayer's, bound with the window
+  Napi::Value handle = CALWrapHandle(env, h, true);
+  CALUIObjectsChanged(+1);  // counted at the call: this thread's loop is held now
+  CALOnUI(^{
+    BEnsureApp();
+    NSWindow* win = BuildWindow(spec);
+    h->object_ = win;
+    h->part_->object_ = win.contentView.layer;
+    h->number_ = (long)win.windowNumber;
+    objc_setAssociatedObject(win, &kWindowHandleKey, @(h->id_),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    CALEvent ev("window-created");
+    ev.HandleRef("handle", h->id_);
+    ev.Num("windowNumber", (double)win.windowNumber);
+    CALEmit(std::move(ev));
+  });
+  return handle;
+}
+
+// Runs `body` on the UI thread with the window a verb's first argument
+// names: inline for pump mode's window on the main thread, as a command for
+// a worker's handle — resolved there, and a no-op before the window is made
+// or for anything that is not a window handle.
+static void OnWindow(Napi::Value v, void (^body)(NSWindow* win)) {
+  id target = CALHandleTarget(v);
+  if (!target) return;
+  CALOnUI(^{
+    NSWindow* win = CALResolve(target);
+    if (win) body(win);
+  });
+}
+
+static double BNumArg(const Napi::CallbackInfo& info, size_t i) {
+  return info.Length() > i && info[i].IsNumber()
+             ? info[i].As<Napi::Number>().DoubleValue()
+             : NAN;
 }
 
 // showWindow(win, activate) — map. Popups order front without activating.
 static Napi::Value ShowWindowFn(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
   bool activate = info.Length() > 1 && info[1].ToBoolean().Value();
-  if (activate) {
-    [win makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
-  } else {
-    [win orderFrontRegardless];
-  }
-  PublishWindow(win);
+  OnWindow(info[0], ^(NSWindow* win) {
+    if (activate) {
+      [win makeKeyAndOrderFront:nil];
+      [NSApp activateIgnoringOtherApps:YES];
+    } else {
+      [win orderFrontRegardless];
+    }
+    PublishWindow(win);
+  });
   return info.Env().Undefined();
 }
 
 static Napi::Value HideWindowFn(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  [win orderOut:nil];
-  PublishWindow(win);
+  OnWindow(info[0], ^(NSWindow* win) {
+    [win orderOut:nil];
+    PublishWindow(win);
+  });
   return info.Env().Undefined();
 }
 
 static Napi::Value SetWindowTitle(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  win.title = BToNSString(info[1]);
+  NSString* title = BToNSString(info[1]);
+  OnWindow(info[0], ^(NSWindow* win) { win.title = title; });
   return info.Env().Undefined();
 }
 
@@ -835,38 +990,47 @@ static Napi::Value SetWindowTitle(const Napi::CallbackInfo& info) {
 // same name, changed on a live window; the next hit the window server
 // resolves honours it.
 static Napi::Value SetWindowIgnoresMouseEvents(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  win.ignoresMouseEvents = info.Length() > 1 && info[1].ToBoolean().Value();
-  PublishWindow(win);
+  bool flag = info.Length() > 1 && info[1].ToBoolean().Value();
+  OnWindow(info[0], ^(NSWindow* win) {
+    win.ignoresMouseEvents = flag;
+    PublishWindow(win);
+  });
   return info.Env().Undefined();
 }
 
 // setWindowFrame(win, x, y, w, h) — any argument may be null to keep it.
 // x/y are the content's top-left in global top-left coordinates, points.
 static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  NSRect content = ContentViewScreenRect(win);
-  double topY = PrimaryScreenTop() - (content.origin.y + content.size.height);
-  double x = info[1].IsNumber() ? info[1].As<Napi::Number>().DoubleValue()
-                                : content.origin.x;
-  double y = info[2].IsNumber() ? info[2].As<Napi::Number>().DoubleValue()
-                                : topY;
-  double w = info[3].IsNumber() ? info[3].As<Napi::Number>().DoubleValue()
-                                : content.size.width;
-  double h = info[4].IsNumber() ? info[4].As<Napi::Number>().DoubleValue()
-                                : content.size.height;
-  NSRect newContent =
-      NSMakeRect(x, PrimaryScreenTop() - y - h, w, h);
-  [win setFrame:[win frameRectForContentRect:newContent] display:YES];
-  PublishWindow(win);
+  double ax = BNumArg(info, 1), ay = BNumArg(info, 2);
+  double aw = BNumArg(info, 3), ah = BNumArg(info, 4);
+  OnWindow(info[0], ^(NSWindow* win) {
+    NSRect content = ContentViewScreenRect(win);
+    double topY = PrimaryScreenTop() - (content.origin.y + content.size.height);
+    double x = std::isnan(ax) ? content.origin.x : ax;
+    double y = std::isnan(ay) ? topY : ay;
+    double w = std::isnan(aw) ? content.size.width : aw;
+    double h = std::isnan(ah) ? content.size.height : ah;
+    NSRect newContent = NSMakeRect(x, PrimaryScreenTop() - y - h, w, h);
+    [win setFrame:[win frameRectForContentRect:newContent] display:YES];
+    PublishWindow(win);
+  });
   return info.Env().Undefined();
 }
 
 // -> { x, y, width, height, scale, visible, occluded, key, ignoresMouseEvents }
 // — content rect, top-left global coordinates, points. (windowState reads
-// the same shape from the published copy, by window number.)
+// the same shape from the published copy, by window number.) From a worker
+// it is that copy: null until the window is made.
 static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
-  return WindowStateObject(info.Env(), WindowStateOf(BDeref<NSWindow*>(info[0])));
+  Napi::Env env = info.Env();
+  id target = CALHandleTarget(info[0]);
+  if (!pthread_main_np()) {
+    CALHandle* h = WindowHandleOf(target);
+    PubWindow s;
+    if (!h || !PublishedWindow(h->number_.load(), &s)) return env.Null();
+    return WindowStateObject(env, s);
+  }
+  return WindowStateObject(env, WindowStateOf(CALResolve(target)));
 }
 
 // windowNumberAtPoint(x, y, belowWindowNumber?) -> number — the window the
@@ -876,6 +1040,7 @@ static Napi::Value GetWindowFrame(const Napi::CallbackInfo& info) {
 // window number in `belowWindowNumber` starts the search beneath that
 // window, so walking the answers back in finds what sits under another
 // application's window — a lock screen, a floating panel.
+// Off the main thread: windowNumberAtPoint(x, y, below?, cb).
 static Napi::Value WindowNumberAtPoint(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!info[0].IsNumber() || !info[1].IsNumber()) {
@@ -883,55 +1048,68 @@ static Napi::Value WindowNumberAtPoint(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  BEnsureApp();
   double x = info[0].As<Napi::Number>().DoubleValue();
   double y = info[1].As<Napi::Number>().DoubleValue();
   NSInteger below = info.Length() > 2 && info[2].IsNumber()
                         ? (NSInteger)info[2].As<Napi::Number>().Int64Value()
                         : 0;
-  NSInteger hit =
-      [NSWindow windowNumberAtPoint:NSMakePoint(x, PrimaryScreenTop() - y)
-          belowWindowWithWindowNumber:below];
-  return Napi::Number::New(env, (double)hit);
+  return CALAnswer(info, "windowNumberAtPoint", ^CALValueBlock {
+    BEnsureApp();
+    NSInteger hit =
+        [NSWindow windowNumberAtPoint:NSMakePoint(x, PrimaryScreenTop() - y)
+            belowWindowWithWindowNumber:below];
+    return ^Napi::Value(Napi::Env e) { return Napi::Number::New(e, (double)hit); };
+  });
 }
 
 static Napi::Value SetWindowMinMax(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
   Napi::Object o = info[1].As<Napi::Object>();
-  if (o.Has("minWidth") || o.Has("minHeight"))
-    win.contentMinSize =
-        NSMakeSize(BNumOr(o, "minWidth", 0), BNumOr(o, "minHeight", 0));
-  if (o.Has("maxWidth") || o.Has("maxHeight"))
-    win.contentMaxSize = NSMakeSize(BNumOr(o, "maxWidth", 100000),
-                                    BNumOr(o, "maxHeight", 100000));
+  bool setMin = o.Has("minWidth") || o.Has("minHeight");
+  bool setMax = o.Has("maxWidth") || o.Has("maxHeight");
+  NSSize min = NSMakeSize(BNumOr(o, "minWidth", 0), BNumOr(o, "minHeight", 0));
+  NSSize max = NSMakeSize(BNumOr(o, "maxWidth", 100000), BNumOr(o, "maxHeight", 100000));
+  OnWindow(info[0], ^(NSWindow* win) {
+    if (setMin) win.contentMinSize = min;
+    if (setMax) win.contentMaxSize = max;
+  });
   return info.Env().Undefined();
 }
 
 static void CancelPanelSheetsOn(NSWindow* win);
 
 static Napi::Value DestroyWindow2(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  long number = (long)win.windowNumber;
-  // a second destroy of the same window counts nothing
-  bool live = objc_getAssociatedObject(win, &kDelegateKey) != nil;
-  // A sheet whose owner goes away ends without telling its completion
-  // handler; answer it as a cancel first so no callback is left waiting.
-  CancelPanelSheetsOn(win);
-  win.delegate = nil;
-  objc_setAssociatedObject(win, &kDelegateKey, nil,
-                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  [win orderOut:nil];
-  [win close];
-  ForgetWindow(number);
-  if (live) CALUIObjectsChanged(-1);
+  id target = CALHandleTarget(info[0]);
+  CALHandle* h = WindowHandleOf(target);
+  if (h) {
+    // a worker's window is counted out at the call, once
+    if (h->released_.exchange(true)) return info.Env().Undefined();
+    CALUIObjectsChanged(-1);
+  }
+  OnWindow(info[0], ^(NSWindow* win) {
+    long number = (long)win.windowNumber;
+    // a second destroy of the same window counts nothing
+    bool live = objc_getAssociatedObject(win, &kDelegateKey) != nil;
+    // A sheet whose owner goes away ends without telling its completion
+    // handler; answer it as a cancel first so no callback is left waiting.
+    CancelPanelSheetsOn(win);
+    win.delegate = nil;
+    objc_setAssociatedObject(win, &kDelegateKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [win orderOut:nil];
+    [win close];
+    ForgetWindow(number);
+    if (live && !h) CALUIObjectsChanged(-1);
+  });
   return info.Env().Undefined();
 }
 
 // initApp lives in the app presence section: it takes { activationPolicy }.
 
 static Napi::Value ActivateApp(const Napi::CallbackInfo& info) {
-  BEnsureApp();
-  [NSApp activateIgnoringOtherApps:YES];
+  CALOnUI(^{
+    BEnsureApp();
+    [NSApp activateIgnoringOtherApps:YES];
+  });
   return info.Env().Undefined();
 }
 
@@ -1069,6 +1247,7 @@ static void DispatchEvent2(NSEvent* e) {
 
   CALEvent ev(type);
   if (e.window) ev.Num("windowNumber", (double)e.window.windowNumber);
+  if (e.window) AddWindowHandle(ev, e.window);
   ev.Num("time", e.timestamp * 1000.0);
   // queued behind another move in the same window, it replaces it
   if (strcmp(type, "mousemove") == 0) ev.FoldBy((double)e.window.windowNumber);
@@ -1643,25 +1822,78 @@ static CALMenuTarget* MenuTargetFor(CALMenuTarget* __strong* slot,
   return *slot;
 }
 
-static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items,
-                             CALMenuTarget* target);
+// A menu spec, read on the calling thread and built into NSMenus on the UI
+// thread — in the call in pump mode, by a command from a worker — since an
+// NSMenu touched off the main thread (the main menu's above all) is an
+// NSInternalInconsistencyException.
+struct MenuItemSpec {
+  bool separator = false;
+  NSString* title = @"";
+  NSInteger tag = 0;
+  bool enabled = true, hidden = false, checked = false;
+  NSString* key = @"";
+  NSUInteger modifiers = NSEventModifierFlagCommand;
+  NSString* iconName = @"";
+  NSData* iconData = nil;
+  bool hasItems = false;  // a non-empty `items`: a submenu, not an action
+  std::vector<MenuItemSpec> items;
+};
 
-static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o,
-                                 CALMenuTarget* target) {
-  if (BBoolOr(o, "separator", false)) return [NSMenuItem separatorItem];
-  NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:BStrOr(o, "title", @"")
+static std::vector<MenuItemSpec> ParseMenuItems(Napi::Array items);
+
+static MenuItemSpec ParseMenuItem(Napi::Object o) {
+  MenuItemSpec s;
+  s.separator = BBoolOr(o, "separator", false);
+  if (s.separator) return s;
+  s.title = BStrOr(o, "title", @"");
+  s.tag = (NSInteger)BNumOr(o, "id", 0);
+  s.enabled = BBoolOr(o, "enabled", true);
+  s.hidden = BBoolOr(o, "hidden", false);
+  s.checked = BBoolOr(o, "checked", false);
+  s.key = BStrOr(o, "key", @"");
+  s.modifiers = (NSUInteger)BNumOr(o, "modifiers", NSEventModifierFlagCommand);
+  s.iconName = BStrOr(o, "iconName", @"");
+  if (o.Has("iconData")) {
+    Napi::Value v = o.Get("iconData");
+    if (v.IsBuffer()) {
+      Napi::Buffer<uint8_t> buf = v.As<Napi::Buffer<uint8_t>>();
+      s.iconData = [NSData dataWithBytes:buf.Data() length:buf.Length()];
+    }
+  }
+  if (o.Has("items")) {
+    Napi::Value v = o.Get("items");
+    if (v.IsArray() && v.As<Napi::Array>().Length() > 0) {
+      s.hasItems = true;
+      s.items = ParseMenuItems(v.As<Napi::Array>());
+    }
+  }
+  return s;
+}
+
+static std::vector<MenuItemSpec> ParseMenuItems(Napi::Array items) {
+  std::vector<MenuItemSpec> out;
+  for (uint32_t i = 0; i < items.Length(); i++) {
+    Napi::Value v = items.Get(i);
+    if (v.IsObject()) out.push_back(ParseMenuItem(v.As<Napi::Object>()));
+  }
+  return out;
+}
+
+static NSMenu* BuildMenu(const std::vector<MenuItemSpec>& items,
+                         CALMenuTarget* target);
+
+static NSMenuItem* BuildMenuItem(const MenuItemSpec& s, CALMenuTarget* target) {
+  if (s.separator) return [NSMenuItem separatorItem];
+  NSMenuItem* it = [[NSMenuItem alloc] initWithTitle:s.title
                                               action:nil
                                        keyEquivalent:@""];
-  it.tag = (NSInteger)BNumOr(o, "id", 0);
-  it.enabled = BBoolOr(o, "enabled", true);
-  it.hidden = BBoolOr(o, "hidden", false);
-  it.state = BBoolOr(o, "checked", false) ? NSControlStateValueOn
-                                          : NSControlStateValueOff;
-  NSString* key = BStrOr(o, "key", @"");
-  if (key.length) {
-    it.keyEquivalent = key;
-    it.keyEquivalentModifierMask =
-        (NSUInteger)BNumOr(o, "modifiers", NSEventModifierFlagCommand);
+  it.tag = s.tag;
+  it.enabled = s.enabled;
+  it.hidden = s.hidden;
+  it.state = s.checked ? NSControlStateValueOn : NSControlStateValueOff;
+  if (s.key.length) {
+    it.keyEquivalent = s.key;
+    it.keyEquivalentModifierMask = s.modifiers;
   }
   // Icons, the serialisable pair from the dbusmenu vocabulary. `iconName`
   // is read in the platform's own icon theme — SF Symbols — which renders
@@ -1669,50 +1901,34 @@ static NSMenuItem* BuildMenuItem(Napi::Env env, Napi::Object o,
   // symbol catalogue does not know simply misses (a freedesktop name on
   // its way to a Linux panel does the same in reverse). `iconData` is
   // literal pixels (PNG bytes on the bus) and is the fallback.
-  NSString* iconName = BStrOr(o, "iconName", @"");
   NSImage* icon = nil;
-  if (iconName.length) {
-    icon = [NSImage imageWithSystemSymbolName:iconName
+  if (s.iconName.length) {
+    icon = [NSImage imageWithSystemSymbolName:s.iconName
                      accessibilityDescription:nil];
   }
-  if (!icon && o.Has("iconData")) {
-    Napi::Value v = o.Get("iconData");
-    if (v.IsBuffer()) {
-      Napi::Buffer<uint8_t> buf = v.As<Napi::Buffer<uint8_t>>();
-      NSData* bytes = [NSData dataWithBytes:buf.Data() length:buf.Length()];
-      icon = [[NSImage alloc] initWithData:bytes];
-      if (icon) icon.size = NSMakeSize(16, 16);
-    }
+  if (!icon && s.iconData) {
+    icon = [[NSImage alloc] initWithData:s.iconData];
+    if (icon) icon.size = NSMakeSize(16, 16);
   }
   if (icon) it.image = icon;
-  bool hasChildren = false;
-  if (o.Has("items")) {
-    Napi::Value v = o.Get("items");
-    if (v.IsArray() && v.As<Napi::Array>().Length() > 0) {
-      NSMenu* sub = BuildMenuFrom(env, v.As<Napi::Array>(), target);
-      sub.title = it.title;
-      it.submenu = sub;
-      hasChildren = true;
-    }
-  }
-  if (!hasChildren) {
+  if (s.hasItems) {
+    NSMenu* sub = BuildMenu(s.items, target);
+    sub.title = it.title;
+    it.submenu = sub;
+  } else {
     it.target = target;
     it.action = @selector(activate:);
   }
   return it;
 }
 
-static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items,
-                             CALMenuTarget* target) {
+static NSMenu* BuildMenu(const std::vector<MenuItemSpec>& items,
+                         CALMenuTarget* target) {
   NSMenu* m = [[NSMenu alloc] initWithTitle:@""];
   // we own enabled/hidden; AppKit's validation would grey everything whose
   // target it cannot interrogate
   m.autoenablesItems = NO;
-  for (uint32_t i = 0; i < items.Length(); i++) {
-    Napi::Value v = items.Get(i);
-    if (!v.IsObject()) continue;
-    [m addItem:BuildMenuItem(env, v.As<Napi::Object>(), target)];
-  }
+  for (const MenuItemSpec& s : items) [m addItem:BuildMenuItem(s, target)];
   return m;
 }
 
@@ -1720,86 +1936,144 @@ static NSMenu* BuildMenuFrom(Napi::Env env, Napi::Array items,
 // app menu (macOS shows the process name for its title regardless).
 static Napi::Value SetMainMenuFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
-  CALMenuTarget* target = MenuTargetFor(&gMenuTarget, "main");
   Napi::Array spec = info[0].As<Napi::Array>();
-  NSMenu* main = [[NSMenu alloc] initWithTitle:@"MainMenu"];
-  main.autoenablesItems = NO;
+  std::vector<std::pair<NSString*, std::vector<MenuItemSpec>>> menus;
   for (uint32_t i = 0; i < spec.Length(); i++) {
     Napi::Value v = spec.Get(i);
     if (!v.IsObject()) continue;
     Napi::Object m = v.As<Napi::Object>();
-    NSString* title = BStrOr(m, "title", @"");
-    NSMenuItem* holder = [[NSMenuItem alloc] initWithTitle:title
-                                                    action:nil
-                                             keyEquivalent:@""];
     Napi::Value items = m.Get("items");
-    NSMenu* sub = items.IsArray()
-                      ? BuildMenuFrom(env, items.As<Napi::Array>(), target)
-                      : [[NSMenu alloc] initWithTitle:title];
-    sub.autoenablesItems = NO;
-    sub.title = title;
-    holder.submenu = sub;
-    [main addItem:holder];
+    menus.emplace_back(BStrOr(m, "title", @""),
+                       items.IsArray() ? ParseMenuItems(items.As<Napi::Array>())
+                                       : std::vector<MenuItemSpec>());
   }
-  [NSApp setMainMenu:main];
+  CALOnUI(^{
+    BEnsureApp();
+    CALMenuTarget* target = MenuTargetFor(&gMenuTarget, "main");
+    NSMenu* main = [[NSMenu alloc] initWithTitle:@"MainMenu"];
+    main.autoenablesItems = NO;
+    for (const auto& m : menus) {
+      NSMenuItem* holder = [[NSMenuItem alloc] initWithTitle:m.first
+                                                      action:nil
+                                               keyEquivalent:@""];
+      NSMenu* sub = BuildMenu(m.second, target);
+      sub.autoenablesItems = NO;
+      sub.title = m.first;
+      holder.submenu = sub;
+      [main addItem:holder];
+    }
+    [NSApp setMainMenu:main];
+  });
   return env.Undefined();
 }
 
-static Napi::Object MenuInfo(Napi::Env env, NSMenu* menu) {
-  Napi::Object out = Napi::Object::New(env);
-  out.Set("title", [menu.title UTF8String]);
-  Napi::Array arr = Napi::Array::New(env, menu.numberOfItems);
+// A menu tree as plain data, read on the UI thread and made into JS on the
+// caller's: mainMenuInfo's shape.
+struct MenuInfoData {
+  struct Item {
+    std::string title, key;
+    double id;
+    bool enabled, hidden, separator, checked, hasImage;
+    std::shared_ptr<MenuInfoData> submenu;
+  };
+  std::string title;
+  std::vector<Item> items;
+};
+
+static std::shared_ptr<MenuInfoData> MenuInfoOf(NSMenu* menu) {
+  auto out = std::make_shared<MenuInfoData>();
+  out->title = menu.title.UTF8String ?: "";
   for (NSInteger i = 0; i < menu.numberOfItems; i++) {
     NSMenuItem* it = [menu itemAtIndex:i];
+    MenuInfoData::Item io;
+    io.title = it.title.UTF8String ?: "";
+    io.id = (double)it.tag;
+    io.enabled = it.enabled;
+    io.hidden = it.hidden;
+    io.separator = it.separatorItem;
+    io.checked = it.state == NSControlStateValueOn;
+    io.hasImage = it.image != nil;
+    io.key = it.keyEquivalent.UTF8String ?: "";
+    if (it.submenu) io.submenu = MenuInfoOf(it.submenu);
+    out->items.push_back(std::move(io));
+  }
+  return out;
+}
+
+static Napi::Object MenuInfoValue(Napi::Env env, const MenuInfoData& m) {
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("title", m.title);
+  Napi::Array arr = Napi::Array::New(env, m.items.size());
+  for (size_t i = 0; i < m.items.size(); i++) {
+    const MenuInfoData::Item& it = m.items[i];
     Napi::Object io = Napi::Object::New(env);
-    io.Set("title", [it.title UTF8String]);
-    io.Set("id", (double)it.tag);
-    io.Set("enabled", (bool)it.enabled);
-    io.Set("hidden", (bool)it.hidden);
-    io.Set("separator", (bool)it.separatorItem);
-    io.Set("checked", it.state == NSControlStateValueOn);
-    io.Set("hasImage", it.image != nil);
-    io.Set("key", [it.keyEquivalent UTF8String]);
-    if (it.submenu) io.Set("submenu", MenuInfo(env, it.submenu));
+    io.Set("title", it.title);
+    io.Set("id", it.id);
+    io.Set("enabled", it.enabled);
+    io.Set("hidden", it.hidden);
+    io.Set("separator", it.separator);
+    io.Set("checked", it.checked);
+    io.Set("hasImage", it.hasImage);
+    io.Set("key", it.key);
+    if (it.submenu) io.Set("submenu", MenuInfoValue(env, *it.submenu));
     arr.Set((uint32_t)i, io);
   }
   out.Set("items", arr);
   return out;
 }
 
-// mainMenuInfo() — the installed menu bar as data, for tests.
+// What a menu read answers: the tree as data, or null for no menu.
+static CALValueBlock MenuInfoAnswer(NSMenu* menu) {
+  std::shared_ptr<MenuInfoData> data = menu ? MenuInfoOf(menu) : nullptr;
+  return ^Napi::Value(Napi::Env e) {
+    return data ? Napi::Value(MenuInfoValue(e, *data)) : Napi::Value(e.Null());
+  };
+}
+
+// mainMenuInfo(cb?) — the installed menu bar as data, for tests.
 static Napi::Value MainMenuInfoFn(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSMenu* main = [NSApp mainMenu];
-  if (!main) return env.Null();
-  return MenuInfo(env, main);
+  return CALAnswer(info, "mainMenuInfo", ^CALValueBlock {
+    return MenuInfoAnswer([NSApp mainMenu]);
+  });
+}
+
+// An index path into a menu tree, read on the calling thread.
+static std::vector<NSInteger> MenuPathArg(Napi::Value v) {
+  std::vector<NSInteger> path;
+  if (!v.IsArray()) return path;
+  Napi::Array a = v.As<Napi::Array>();
+  for (uint32_t i = 0; i < a.Length(); i++)
+    path.push_back((NSInteger)a.Get(i).As<Napi::Number>().Int64Value());
+  return path;
 }
 
 // Walk a menu tree by index and fire the leaf's action the way tracking
 // would (shared by the main menu and status item test hooks).
-static bool ActivateInMenu(NSMenu* menu, Napi::Array path) {
-  if (!menu || path.Length() == 0) return false;
-  for (uint32_t d = 0; d + 1 < path.Length(); d++) {
-    NSInteger i = (NSInteger)path.Get(d).As<Napi::Number>().Int64Value();
+static bool ActivateInMenu(NSMenu* menu, const std::vector<NSInteger>& path) {
+  if (!menu || path.empty()) return false;
+  for (size_t d = 0; d + 1 < path.size(); d++) {
+    NSInteger i = path[d];
     if (i < 0 || i >= menu.numberOfItems) return false;
     menu = [menu itemAtIndex:i].submenu;
     if (!menu) return false;
   }
-  NSInteger leaf = (NSInteger)
-      path.Get(path.Length() - 1).As<Napi::Number>().Int64Value();
+  NSInteger leaf = path.back();
   if (leaf < 0 || leaf >= menu.numberOfItems) return false;
   [menu performActionForItemAtIndex:leaf];
   return true;
 }
 
-// activateMenuItem([i, j, ...]) — walk the installed bar by index and fire
-// the leaf's action, the way tracking would. For tests.
+static CALValueBlock BoolAnswer(bool ok) {
+  return ^Napi::Value(Napi::Env e) { return Napi::Boolean::New(e, ok); };
+}
+
+// activateMenuItem([i, j, ...], cb?) -> bool — walk the installed bar by
+// index and fire the leaf's action, the way tracking would. For tests.
 static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  if (!info[0].IsArray()) return Napi::Boolean::New(env, false);
-  return Napi::Boolean::New(
-      env, ActivateInMenu([NSApp mainMenu], info[0].As<Napi::Array>()));
+  std::vector<NSInteger> path = MenuPathArg(info[0]);
+  return CALAnswer(info, "activateMenuItem", ^CALValueBlock {
+    return BoolAnswer(ActivateInMenu([NSApp mainMenu], path));
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +2097,7 @@ static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
   // the JS handle: events carry this very object, so `ev.statusItem ===
   // item` holds and a renderer can key a Map on it
   Napi::Reference<Napi::Value> handle_;
+  uint64_t handleId_;  // a worker's item: its CALHandle's id instead (0: none)
   NSStatusItem* __weak item_;
 }
 - (void)click:(id)sender;
@@ -1858,15 +2133,6 @@ static bool StatusButtonFrame(NSStatusBarButton* btn, double out[4]) {
   return true;
 }
 
-static void SetStatusButtonFrame(Napi::Object ev, NSStatusBarButton* btn) {
-  double r[4];
-  if (!StatusButtonFrame(btn, r)) return;
-  ev.Set("x", r[0]);
-  ev.Set("y", r[1]);
-  ev.Set("width", r[2]);
-  ev.Set("height", r[3]);
-}
-
 static void EmitStatusItemClick(CALStatusItemTarget* t, const char* kind,
                                 NSEvent* e) {
   NSStatusItem* item = t->item_;
@@ -1876,7 +2142,8 @@ static void EmitStatusItemClick(CALStatusItemTarget* t, const char* kind,
   // `ev.statusItem === item` holds in the environment that created it.
   // Weak: an event still in flight never keeps a removed item's target.
   __weak CALStatusItemTarget* weak = t;
-  ev.Handle("statusItem", ^Napi::Value(Napi::Env env) {
+  if (t->handleId_) ev.HandleRef("statusItem", t->handleId_);
+  else ev.Handle("statusItem", ^Napi::Value(Napi::Env env) {
     CALStatusItemTarget* target = weak;
     if (!target || target->handle_.IsEmpty() ||
         (napi_env)target->handle_.Env() != (napi_env)env)
@@ -1926,65 +2193,108 @@ static bool StatusWindowEvent(NSEvent* e) {
 }
 @end
 
-static CGFloat StatusLengthFrom(Napi::Value v, CGFloat d) {
+// A length: points, 'square' or 'variable'; NAN for anything else (the
+// caller keeps what it had).
+static double StatusLengthFrom(Napi::Value v) {
   if (v.IsNumber()) return v.As<Napi::Number>().DoubleValue();
   if (v.IsString()) {
     std::string s = v.As<Napi::String>().Utf8Value();
     if (s == "square") return NSSquareStatusItemLength;
     if (s == "variable") return NSVariableStatusItemLength;
   }
-  return d;
+  return NAN;
 }
 
-// `image`: an SF Symbol name (a template by nature — it follows the bar's
-// light/dark), a surface handle (its bitmap, at its scale), or encoded
-// image bytes (PNG and friends). Template by default so a bitmap icon
-// adapts the way a symbol does; `imageTemplate: false` keeps its colours.
-// `imageSize: [w, h]` sets the size in points.
-static NSImage* StatusImageFrom(Napi::Object o) {
-  Napi::Value v = o.Get("image");
+// A status item's props, read on the calling thread and applied on the UI
+// thread; only the keys present are touched, so setStatusItem's patch is a
+// create with fewer keys. `image`: an SF Symbol name (a template by nature —
+// it follows the bar's light/dark), a surface handle (its bitmap at its
+// scale, copied as it is at the call), or encoded image bytes (PNG and
+// friends). Template by default so a bitmap icon adapts the way a symbol
+// does; `imageTemplate: false` keeps its colours. `imageSize: [w, h]` sets
+// the size in points.
+struct StatusItemSpec {
+  bool hasImage = false;
+  NSString* symbol = nil;
+  NSData* bytes = nil;
+  id bitmap = nil;  // a CGImage, owned by ARC through the bridge
+  double bitmapW = 0, bitmapH = 0;
+  bool hasImageSize = false;
+  double imageW = 0, imageH = 0;
+  bool imageTemplate = true;
+  bool hasTitle = false, hasTooltip = false, hasLength = false;
+  NSString* title = @"";
+  NSString* tooltip = @"";
+  double length = NAN;
+  int visible = -1;  // -1: not given
+};
+
+// False with a TypeError pending (a released surface as the image).
+static bool ParseStatusItemSpec(Napi::Object o, StatusItemSpec* s) {
+  if (o.Has("image")) {
+    s->hasImage = true;
+    Napi::Value v = o.Get("image");
+    if (v.IsString()) {
+      s->symbol = BToNSString(v);
+    } else if (v.IsBuffer()) {
+      Napi::Buffer<uint8_t> buf = v.As<Napi::Buffer<uint8_t>>();
+      s->bytes = [NSData dataWithBytes:buf.Data() length:buf.Length()];
+    } else if (v.IsExternal()) {
+      CALSurface* surf = SurfaceFrom(v);
+      if (!surf) return false;  // released: the error is pending
+      s->bitmap = (__bridge_transfer id)CGBitmapContextCreateImage(surf->ctx);
+      s->bitmapW = surf->width / surf->scale;
+      s->bitmapH = surf->height / surf->scale;
+    }
+    if (o.Has("imageSize") && o.Get("imageSize").IsArray()) {
+      Napi::Array sz = o.Get("imageSize").As<Napi::Array>();
+      if (sz.Length() >= 2) {
+        s->hasImageSize = true;
+        s->imageW = sz.Get(0u).As<Napi::Number>().DoubleValue();
+        s->imageH = sz.Get(1u).As<Napi::Number>().DoubleValue();
+      }
+    }
+    s->imageTemplate = BBoolOr(o, "imageTemplate", true);
+  }
+  if (o.Has("title")) {
+    s->hasTitle = true;
+    s->title = BStrOr(o, "title", @"");
+  }
+  if (o.Has("tooltip")) {
+    s->hasTooltip = true;
+    s->tooltip = BStrOr(o, "tooltip", @"");
+  }
+  if (o.Has("length")) {
+    s->hasLength = true;
+    s->length = StatusLengthFrom(o.Get("length"));
+  }
+  if (o.Has("visible")) s->visible = BBoolOr(o, "visible", true);
+  return true;
+}
+
+static NSImage* StatusImageOf(const StatusItemSpec& s) {
   NSImage* img = nil;
-  if (v.IsString()) {
-    img = [NSImage imageWithSystemSymbolName:BToNSString(v)
-                    accessibilityDescription:nil];
-  } else if (v.IsBuffer()) {
-    Napi::Buffer<uint8_t> buf = v.As<Napi::Buffer<uint8_t>>();
-    img = [[NSImage alloc]
-        initWithData:[NSData dataWithBytes:buf.Data() length:buf.Length()]];
-  } else if (v.IsExternal()) {
-    CALSurface* s = SurfaceFrom(v);
-    if (!s) return nil;  // released: the error is pending
-    CGImageRef cg = CGBitmapContextCreateImage(s->ctx);
-    img = [[NSImage alloc]
-        initWithCGImage:cg
-                   size:NSMakeSize(s->width / s->scale, s->height / s->scale)];
-    CGImageRelease(cg);
-  } else {
-    return nil;
+  if (s.symbol) {
+    img = [NSImage imageWithSystemSymbolName:s.symbol accessibilityDescription:nil];
+  } else if (s.bytes) {
+    img = [[NSImage alloc] initWithData:s.bytes];
+  } else if (s.bitmap) {
+    img = [[NSImage alloc] initWithCGImage:(__bridge CGImageRef)s.bitmap
+                                      size:NSMakeSize(s.bitmapW, s.bitmapH)];
   }
   if (!img) return nil;
-  if (o.Has("imageSize") && o.Get("imageSize").IsArray()) {
-    Napi::Array sz = o.Get("imageSize").As<Napi::Array>();
-    if (sz.Length() >= 2)
-      img.size = NSMakeSize(sz.Get(0u).As<Napi::Number>().DoubleValue(),
-                            sz.Get(1u).As<Napi::Number>().DoubleValue());
-  }
-  [img setTemplate:BBoolOr(o, "imageTemplate", true)];
+  if (s.hasImageSize) img.size = NSMakeSize(s.imageW, s.imageH);
+  [img setTemplate:s.imageTemplate];
   return img;
 }
 
-// Only the keys present are touched: createStatusItem and setStatusItem
-// share this, so a patch is a create with fewer keys.
-static void ApplyStatusItemProps(NSStatusItem* item, Napi::Object o) {
+static void ApplyStatusItemSpec(NSStatusItem* item, const StatusItemSpec& s) {
   NSStatusBarButton* btn = item.button;
-  if (o.Has("image")) btn.image = StatusImageFrom(o);
-  if (o.Has("title")) btn.title = BStrOr(o, "title", @"");
-  if (o.Has("tooltip")) {
-    NSString* tip = BStrOr(o, "tooltip", @"");
-    btn.toolTip = tip.length ? tip : nil;
-  }
-  if (o.Has("length")) item.length = StatusLengthFrom(o.Get("length"), item.length);
-  if (o.Has("visible")) item.visible = BBoolOr(o, "visible", true);
+  if (s.hasImage) btn.image = StatusImageOf(s);
+  if (s.hasTitle) btn.title = s.title;
+  if (s.hasTooltip) btn.toolTip = s.tooltip.length ? s.tooltip : nil;
+  if (s.hasLength && !std::isnan(s.length)) item.length = s.length;
+  if (s.visible >= 0) item.visible = s.visible;
   // image alone, title alone, or the image leading the title
   bool hasImage = btn.image != nil, hasTitle = btn.title.length > 0;
   btn.imagePosition = hasImage && hasTitle ? NSImageLeft
@@ -1992,65 +2302,100 @@ static void ApplyStatusItemProps(NSStatusItem* item, Napi::Object o) {
                                            : NSNoImage;
 }
 
+// On the UI thread, the app launched: the item, its target, and its props.
+static NSStatusItem* MakeStatusItem(const StatusItemSpec& spec) {
+  CGFloat len = spec.hasLength && !std::isnan(spec.length)
+                    ? spec.length
+                    : NSVariableStatusItemLength;
+  NSStatusItem* item = [[NSStatusBar systemStatusBar] statusItemWithLength:len];
+  CALStatusItemTarget* target = [CALStatusItemTarget new];
+  target->item_ = item;
+  objc_setAssociatedObject(item, &kStatusTargetKey, target,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  NSStatusBarButton* btn = item.button;
+  btn.target = target;
+  btn.action = @selector(click:);
+  [btn sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
+  RememberStatusWindow(btn.window, item);
+  // AppKit remembers an item's visibility across launches in user defaults
+  // under an autosave name it generates by creation order ("Item-0"), so
+  // an item hidden when the last process ended would come back hidden.
+  // Visibility is the renderer's to decide: assert it at creation.
+  item.visible = spec.visible != 0;
+  ApplyStatusItemSpec(item, spec);
+  return item;
+}
+
 // createStatusItem({ image, title, tooltip, length, visible,
 //                    imageTemplate, imageSize }) -> handle
-// length: 'variable' (default) | 'square' | points.
+// length: 'variable' (default) | 'square' | points. From a worker the
+// handle is answered at the call and the item made by a command; its clicks
+// carry that handle, and it is held until removeStatusItem.
 static Napi::Value CreateStatusItem(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
   Napi::Object o = info.Length() > 0 && info[0].IsObject()
                        ? info[0].As<Napi::Object>()
                        : Napi::Object::New(env);
-  NSStatusItem* item;
-  Napi::Value handle;
-  @autoreleasepool {
-    CGFloat len = o.Has("length")
-                      ? StatusLengthFrom(o.Get("length"), NSVariableStatusItemLength)
-                      : NSVariableStatusItemLength;
-    item = [[NSStatusBar systemStatusBar] statusItemWithLength:len];
-    CALStatusItemTarget* target = [CALStatusItemTarget new];
-    target->item_ = item;
-    objc_setAssociatedObject(item, &kStatusTargetKey, target,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSStatusBarButton* btn = item.button;
-    btn.target = target;
-    btn.action = @selector(click:);
-    [btn sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
-    RememberStatusWindow(btn.window, item);
-    // AppKit remembers an item's visibility across launches in user defaults
-    // under an autosave name it generates by creation order ("Item-0"), so
-    // an item hidden when the last process ended would come back hidden.
-    // Visibility is the renderer's to decide: assert it at creation.
-    item.visible = BBoolOr(o, "visible", true);
-    ApplyStatusItemProps(item, o);
-    handle = BWrapRetained(env, item);
-    target->handle_ = Napi::Reference<Napi::Value>::New(handle, 1);
+  StatusItemSpec spec;
+  if (!ParseStatusItemSpec(o, &spec)) return env.Undefined();
+  if (pthread_main_np()) {
+    BEnsureApp();
+    Napi::Value handle;
+    @autoreleasepool {
+      NSStatusItem* item = MakeStatusItem(spec);
+      handle = BWrapRetained(env, item);
+      StatusTargetOf(item)->handle_ = Napi::Reference<Napi::Value>::New(handle, 1);
+    }
+    CALUIObjectsChanged(+1);
+    return handle;
   }
+  CALHandle* h = CALNewHandle();
+  Napi::Value handle = CALWrapHandle(env, h, true);
+  CALPinHandle(env, h->id_, true);
   CALUIObjectsChanged(+1);
+  CALOnUI(^{
+    BEnsureApp();
+    NSStatusItem* item = MakeStatusItem(spec);
+    StatusTargetOf(item)->handleId_ = h->id_;
+    h->object_ = item;
+  });
   return handle;
 }
 
-// The item behind a handle, or nil when it was removed: every verb after
-// removeStatusItem is a no-op, never a crash.
-static NSStatusItem* StatusItemFrom(Napi::Value v) {
+// A status item verb's first argument, captured for its command (a
+// TypeError, and nil, for anything that is not a handle).
+static id StatusTargetArg(Napi::Value v) {
   if (!v.IsExternal()) {
     Napi::TypeError::New(v.Env(), "expected a status item handle")
         .ThrowAsJavaScriptException();
     return nil;
   }
-  NSStatusItem* item = BDeref<NSStatusItem*>(v);
-  return StatusTargetOf(item) ? item : nil;
+  return CALHandleTarget(v);
+}
+
+// On the UI thread: the item a captured target names, or nil when it was
+// removed (or not made yet) — every verb after removeStatusItem is a no-op,
+// never a crash.
+static NSStatusItem* ResolveStatusItem(id target) {
+  NSStatusItem* item = CALResolve(target);
+  return item && StatusTargetOf(item) ? item : nil;
 }
 
 // setStatusItem(item, { image, title, tooltip, length, visible, ... })
 static Napi::Value SetStatusItem(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  if (!item || !info[1].IsObject()) return env.Undefined();
-  @autoreleasepool {
-    ApplyStatusItemProps(item, info[1].As<Napi::Object>());
-    RememberStatusWindow(item.button.window, item);
-  }
+  id target = StatusTargetArg(info[0]);
+  if (!target || !info[1].IsObject()) return env.Undefined();
+  StatusItemSpec spec;
+  if (!ParseStatusItemSpec(info[1].As<Napi::Object>(), &spec)) return env.Undefined();
+  CALOnUI(^{
+    NSStatusItem* item = ResolveStatusItem(target);
+    if (!item) return;
+    @autoreleasepool {
+      ApplyStatusItemSpec(item, spec);
+      RememberStatusWindow(item.button.window, item);
+    }
+  });
   return env.Undefined();
 }
 
@@ -2061,74 +2406,96 @@ static Napi::Value SetStatusItem(const Napi::CallbackInfo& info) {
 // returns the item to click events.
 static Napi::Value SetStatusItemMenu(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  if (!item) return env.Undefined();
+  id target = StatusTargetArg(info[0]);
+  if (!target) return env.Undefined();
   Napi::Value spec = info.Length() > 1 ? info[1] : env.Null();
-  @autoreleasepool {
-    if (spec.IsArray()) {
-      CALMenuTarget* target = MenuTargetFor(&gStatusMenuTarget, "status");
-      item.menu = BuildMenuFrom(env, spec.As<Napi::Array>(), target);
-    } else {
-      item.menu = nil;
+  bool hasMenu = spec.IsArray();
+  std::vector<MenuItemSpec> items;
+  if (hasMenu) items = ParseMenuItems(spec.As<Napi::Array>());
+  CALOnUI(^{
+    NSStatusItem* item = ResolveStatusItem(target);
+    if (!item) return;
+    @autoreleasepool {
+      item.menu = hasMenu ? BuildMenu(items, MenuTargetFor(&gStatusMenuTarget, "status"))
+                          : nil;
     }
-  }
+  });
   return env.Undefined();
 }
 
 static Napi::Value RemoveStatusItem(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  if (!item) return env.Undefined();
-  @autoreleasepool {
-    CALStatusItemTarget* target = StatusTargetOf(item);
-    item.button.target = nil;
-    item.button.action = nil;
-    item.menu = nil;
-    [[NSStatusBar systemStatusBar] removeStatusItem:item];
-    objc_setAssociatedObject(item, &kStatusTargetKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    target->item_ = nil;
-    target->handle_.Reset();  // the handle may now be collected
+  id target = StatusTargetArg(info[0]);
+  if (!target) return env.Undefined();
+  CALHandle* h = WindowHandleOf(target);  // any handle: a worker's item
+  if (h) {
+    // counted out and let go at the call, once
+    if (h->released_.exchange(true)) return env.Undefined();
+    CALUIObjectsChanged(-1);
+    CALPinHandle(env, h->id_, false);
   }
-  CALUIObjectsChanged(-1);
+  CALOnUI(^{
+    NSStatusItem* item = ResolveStatusItem(target);
+    if (!item) return;
+    @autoreleasepool {
+      CALStatusItemTarget* t = StatusTargetOf(item);
+      item.button.target = nil;
+      item.button.action = nil;
+      item.menu = nil;
+      [[NSStatusBar systemStatusBar] removeStatusItem:item];
+      objc_setAssociatedObject(item, &kStatusTargetKey, nil,
+                               OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+      t->item_ = nil;
+      t->handle_.Reset();  // pump mode's handle may now be collected
+    }
+    if (!h) CALUIObjectsChanged(-1);
+  });
   return env.Undefined();
 }
 
-// statusItemInfo(item) — the item as data, for tests: what the bar shows,
-// its menu in mainMenuInfo's shape, and the button's screen rect. Null
-// once removed.
+// statusItemInfo(item, cb?) — the item as data, for tests: what the bar
+// shows, its menu in mainMenuInfo's shape, and the button's screen rect.
+// Null once removed.
 static Napi::Value StatusItemInfo(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  if (!item) return env.Null();
-  NSStatusBarButton* btn = item.button;
-  Napi::Object r = Napi::Object::New(env);
-  r.Set("title", btn.title.UTF8String);
-  r.Set("tooltip", btn.toolTip ? btn.toolTip.UTF8String : "");
-  r.Set("visible", (bool)item.visible);
-  r.Set("hasImage", btn.image != nil);
-  r.Set("imageTemplate", btn.image != nil && [btn.image isTemplate]);
-  if (btn.image) {
-    r.Set("imageWidth", btn.image.size.width);
-    r.Set("imageHeight", btn.image.size.height);
-  }
-  if (item.length == NSVariableStatusItemLength) r.Set("length", "variable");
-  else if (item.length == NSSquareStatusItemLength) r.Set("length", "square");
-  else r.Set("length", item.length);
-  r.Set("menu", item.menu ? MenuInfo(env, item.menu) : env.Null());
-  if (btn.window) r.Set("windowNumber", (double)btn.window.windowNumber);
-  SetStatusButtonFrame(r, btn);
-  return r;
+  id target = StatusTargetArg(info[0]);
+  if (!target) return info.Env().Undefined();
+  return CALAnswer(info, "statusItemInfo", ^CALValueBlock {
+    NSStatusItem* item = ResolveStatusItem(target);
+    if (!item) return ^Napi::Value(Napi::Env e) { return e.Null(); };
+    NSStatusBarButton* btn = item.button;
+    CALEvent r;
+    r.Str("title", btn.title.UTF8String);
+    r.Str("tooltip", btn.toolTip ? btn.toolTip.UTF8String : "");
+    r.Bool("visible", item.visible);
+    r.Bool("hasImage", btn.image != nil);
+    r.Bool("imageTemplate", btn.image != nil && [btn.image isTemplate]);
+    if (btn.image) {
+      r.Num("imageWidth", btn.image.size.width);
+      r.Num("imageHeight", btn.image.size.height);
+    }
+    if (item.length == NSVariableStatusItemLength) r.Str("length", "variable");
+    else if (item.length == NSSquareStatusItemLength) r.Str("length", "square");
+    else r.Num("length", item.length);
+    r.Handle("menu", MenuInfoAnswer(item.menu));
+    if (btn.window) r.Num("windowNumber", (double)btn.window.windowNumber);
+    double f[4];
+    if (StatusButtonFrame(btn, f))
+      r.Num("x", f[0]).Num("y", f[1]).Num("width", f[2]).Num("height", f[3]);
+    return ^Napi::Value(Napi::Env e) { return r.ToObject(e); };
+  });
 }
 
-// activateStatusItemMenuItem(item, [i, j, ...]) — for tests; a real click
-// would track the menu in a modal loop nobody can dismiss from a script.
+// activateStatusItemMenuItem(item, [i, j, ...], cb?) — for tests; a real
+// click would track the menu in a modal loop nobody can dismiss from a
+// script.
 static Napi::Value ActivateStatusItemMenuItem(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  if (!item || !info[1].IsArray()) return Napi::Boolean::New(env, false);
-  return Napi::Boolean::New(env,
-                            ActivateInMenu(item.menu, info[1].As<Napi::Array>()));
+  id target = StatusTargetArg(info[0]);
+  if (!target) return info.Env().Undefined();
+  std::vector<NSInteger> path = MenuPathArg(info[1]);
+  return CALAnswer(info, "activateStatusItemMenuItem", ^CALValueBlock {
+    NSStatusItem* item = ResolveStatusItem(target);
+    return BoolAnswer(item && ActivateInMenu(item.menu, path));
+  });
 }
 
 // Two things have to happen before a mouse event posted into an item's
@@ -2159,82 +2526,93 @@ static bool WaitForStatusWindow(NSWindow* win, NSTimeInterval timeout) {
 // what fires. Declines a left or right click while a menu is set: that
 // click would open the menu and never return. Pump afterwards; the event
 // arrives through the backend callback like a user's click.
+// Off the main thread: clickStatusItem(item, kind, cb). It waits for the
+// status window in a run loop of its own, so a queued one is a callout of
+// its own too (CALAnswer's `nested`).
 static Napi::Value ClickStatusItem(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  if (!item) return Napi::Boolean::New(env, false);
+  id target = StatusTargetArg(info[0]);
+  if (!target) return info.Env().Undefined();
   std::string kind = info.Length() > 1 && info[1].IsString()
                          ? info[1].As<Napi::String>().Utf8Value()
                          : "left";
-  if (item.menu && kind != "middle") return Napi::Boolean::New(env, false);
-  NSStatusBarButton* btn = item.button;
-  NSWindow* win = btn.window;
-  if (!win) return Napi::Boolean::New(env, false);
-  WaitForStatusWindow(win, 2.0);
-  RememberStatusWindow(win, item);
-  NSEventType down = NSEventTypeLeftMouseDown, up = NSEventTypeLeftMouseUp;
-  if (kind == "right") {
-    down = NSEventTypeRightMouseDown; up = NSEventTypeRightMouseUp;
-  } else if (kind == "middle") {
-    down = NSEventTypeOtherMouseDown; up = NSEventTypeOtherMouseUp;
-  }
-  NSRect r = [btn convertRect:btn.bounds toView:nil];
-  NSPoint p = NSMakePoint(NSMidX(r), NSMidY(r));
-  NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
-  for (NSEventType t : {down, up}) {
-    NSEvent* e = [NSEvent mouseEventWithType:t
-                                    location:p
-                               modifierFlags:0
-                                   timestamp:now
-                                windowNumber:win.windowNumber
-                                     context:nil
-                                 eventNumber:0
-                                  clickCount:1
-                                    pressure:t == down ? 1 : 0];
-    if (kind == "middle") {
-      // mouseEventWithType: leaves the button number at 0 for the "other"
-      // types; the middle button is number 2, which only the CGEvent
-      // underneath can say
-      CGEventRef cg = CGEventCreateCopy(e.CGEvent);
-      CGEventSetIntegerValueField(cg, kCGMouseEventButtonNumber, 2);
-      NSEvent* e2 = [NSEvent eventWithCGEvent:cg];
-      CFRelease(cg);
-      if (e2) e = e2;
+  return CALAnswer(info, "clickStatusItem", ^CALValueBlock {
+    NSStatusItem* item = ResolveStatusItem(target);
+    if (!item) return BoolAnswer(false);
+    if (item.menu && kind != "middle") return BoolAnswer(false);
+    NSStatusBarButton* btn = item.button;
+    NSWindow* win = btn.window;
+    if (!win) return BoolAnswer(false);
+    WaitForStatusWindow(win, 2.0);
+    RememberStatusWindow(win, item);
+    NSEventType down = NSEventTypeLeftMouseDown, up = NSEventTypeLeftMouseUp;
+    if (kind == "right") {
+      down = NSEventTypeRightMouseDown; up = NSEventTypeRightMouseUp;
+    } else if (kind == "middle") {
+      down = NSEventTypeOtherMouseDown; up = NSEventTypeOtherMouseUp;
     }
-    [NSApp postEvent:e atStart:NO];
-  }
-  return Napi::Boolean::New(env, true);
+    NSRect r = [btn convertRect:btn.bounds toView:nil];
+    NSPoint p = NSMakePoint(NSMidX(r), NSMidY(r));
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    for (NSEventType t : {down, up}) {
+      NSEvent* e = [NSEvent mouseEventWithType:t
+                                      location:p
+                                 modifierFlags:0
+                                     timestamp:now
+                                  windowNumber:win.windowNumber
+                                       context:nil
+                                   eventNumber:0
+                                    clickCount:1
+                                      pressure:t == down ? 1 : 0];
+      if (kind == "middle") {
+        // mouseEventWithType: leaves the button number at 0 for the "other"
+        // types; the middle button is number 2, which only the CGEvent
+        // underneath can say
+        CGEventRef cg = CGEventCreateCopy(e.CGEvent);
+        CGEventSetIntegerValueField(cg, kCGMouseEventButtonNumber, 2);
+        NSEvent* e2 = [NSEvent eventWithCGEvent:cg];
+        CFRelease(cg);
+        if (e2) e = e2;
+      }
+      [NSApp postEvent:e atStart:NO];
+    }
+    return BoolAnswer(true);
+  }, true);
 }
 
-// snapshotStatusItem(item, file) — the item's window as the WindowServer
-// composited it, to PNG (our own window: no screen-recording permission
-// needed, unlike `screencapture -l` from another process). For tests.
+// snapshotStatusItem(item, file, cb?) — the item's window as the
+// WindowServer composited it, to PNG (our own window: no screen-recording
+// permission needed, unlike `screencapture -l` from another process). For
+// tests.
 static Napi::Value SnapshotStatusItem(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  NSStatusItem* item = StatusItemFrom(info[0]);
-  NSWindow* win = item ? item.button.window : nil;
-  if (!win || !info[1].IsString()) return Napi::Boolean::New(env, false);
-  WaitForStatusWindow(win, 2.0);
+  id target = StatusTargetArg(info[0]);
+  if (!target) return info.Env().Undefined();
+  NSString* path = info[1].IsString() ? BToNSString(info[1]) : nil;
+  return CALAnswer(info, "snapshotStatusItem", ^CALValueBlock {
+    NSStatusItem* item = ResolveStatusItem(target);
+    NSWindow* win = item ? item.button.window : nil;
+    if (!win || !path) return BoolAnswer(false);
+    WaitForStatusWindow(win, 2.0);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  CGImageRef img = CGWindowListCreateImage(
-      CGRectNull, kCGWindowListOptionIncludingWindow,
-      (CGWindowID)win.windowNumber,
-      (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming |
-                            kCGWindowImageBestResolution));
+    CGImageRef img = CGWindowListCreateImage(
+        CGRectNull, kCGWindowListOptionIncludingWindow,
+        (CGWindowID)win.windowNumber,
+        (CGWindowImageOption)(kCGWindowImageBoundsIgnoreFraming |
+                              kCGWindowImageBestResolution));
 #pragma clang diagnostic pop
-  if (!img) return Napi::Boolean::New(env, false);
-  NSURL* url = [NSURL fileURLWithPath:BToNSString(info[1])];
-  CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
-      (__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
-  bool ok = false;
-  if (dst) {
-    CGImageDestinationAddImage(dst, img, NULL);
-    ok = CGImageDestinationFinalize(dst);
-    CFRelease(dst);
-  }
-  CGImageRelease(img);
-  return Napi::Boolean::New(env, ok);
+    if (!img) return BoolAnswer(false);
+    NSURL* url = [NSURL fileURLWithPath:path];
+    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
+    bool ok = false;
+    if (dst) {
+      CGImageDestinationAddImage(dst, img, NULL);
+      ok = CGImageDestinationFinalize(dst);
+      CFRelease(dst);
+    }
+    CGImageRelease(img);
+    return BoolAnswer(ok);
+  }, true);
 }
 
 // setDockMenu(items | null) — the menu behind a right-click (or a press-
@@ -2246,19 +2624,19 @@ static Napi::Value SnapshotStatusItem(const Napi::CallbackInfo& info) {
 // removes the menu (the Dock then shows only its own entries).
 static Napi::Value SetDockMenuFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
   Napi::Value v = info[0];
-  if (v.IsNull() || v.IsUndefined()) {
-    gDockMenu = nil;
-    return env.Undefined();
-  }
-  if (!v.IsArray()) {
+  bool clear = v.IsNull() || v.IsUndefined();
+  if (!clear && !v.IsArray()) {
     Napi::TypeError::New(env, "setDockMenu: expected an array of items or null")
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  CALMenuTarget* target = MenuTargetFor(&gDockMenuTarget, "dock");
-  gDockMenu = BuildMenuFrom(env, v.As<Napi::Array>(), target);
+  std::vector<MenuItemSpec> items;
+  if (!clear) items = ParseMenuItems(v.As<Napi::Array>());
+  CALOnUI(^{
+    BEnsureApp();
+    gDockMenu = clear ? nil : BuildMenu(items, MenuTargetFor(&gDockMenuTarget, "dock"));
+  });
   return env.Undefined();
 }
 
@@ -2272,20 +2650,19 @@ static NSMenu* DockMenuViaDelegate() {
 
 // dockMenuInfo() — the installed Dock menu as data (null when none). Tests.
 static Napi::Value DockMenuInfoFn(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  BEnsureApp();
-  NSMenu* m = DockMenuViaDelegate();
-  if (!m) return env.Null();
-  return MenuInfo(env, m);
+  return CALAnswer(info, "dockMenuInfo", ^CALValueBlock {
+    BEnsureApp();
+    return MenuInfoAnswer(DockMenuViaDelegate());
+  });
 }
 
-// activateDockMenuItem([i, j, ...]) — through the Dock menu.
+// activateDockMenuItem([i, j, ...], cb?) — through the Dock menu.
 static Napi::Value ActivateDockMenuItemFn(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  BEnsureApp();
-  if (!info[0].IsArray()) return Napi::Boolean::New(env, false);
-  return Napi::Boolean::New(
-      env, ActivateInMenu(DockMenuViaDelegate(), info[0].As<Napi::Array>()));
+  std::vector<NSInteger> path = MenuPathArg(info[0]);
+  return CALAnswer(info, "activateDockMenuItem", ^CALValueBlock {
+    BEnsureApp();
+    return BoolAnswer(ActivateInMenu(DockMenuViaDelegate(), path));
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2326,19 +2703,29 @@ static bool ApplyActivationPolicy(NSApplicationActivationPolicy p) {
   return ok;
 }
 
-// Reads `activationPolicy` off an options object; throws on an unknown name.
-// Returns false when it threw.
-static bool ApplyPolicyOption(Napi::Env env, Napi::Value v) {
+// Reads `activationPolicy` off an options object on the calling thread;
+// throws on an unknown name. Returns false when it threw; *has says whether
+// there was one to apply.
+static bool ParsePolicyOption(Napi::Env env, Napi::Value v, bool* has,
+                              NSApplicationActivationPolicy* p) {
+  *has = false;
   if (v.IsUndefined() || v.IsNull()) return true;
-  NSApplicationActivationPolicy p;
-  if (!v.IsString() || !PolicyFromName(v.As<Napi::String>().Utf8Value(), &p)) {
+  if (!v.IsString() || !PolicyFromName(v.As<Napi::String>().Utf8Value(), p)) {
     Napi::RangeError::New(
         env, "activationPolicy: expected 'regular' | 'accessory' | 'prohibited'")
         .ThrowAsJavaScriptException();
     return false;
   }
-  ApplyActivationPolicy(p);
+  *has = true;
   return true;
+}
+
+// A command's answer, for the verbs that return what AppKit said: the
+// answer in pump mode, where the block ran in the call; undefined from a
+// worker, whose command has not run yet (JS never waits on the UI thread).
+static Napi::Value BCommandAnswer(Napi::Env env, bool ok) {
+  return pthread_main_np() ? Napi::Value(Napi::Boolean::New(env, ok))
+                           : env.Undefined();
 }
 
 // initApp({ activationPolicy? }) — the NSApplication, its activation policy
@@ -2350,11 +2737,17 @@ static bool ApplyPolicyOption(Napi::Env env, Napi::Value v) {
 // how the app launches, afterwards it switches live.
 static Napi::Value InitAppFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  bool has = false;
+  NSApplicationActivationPolicy p = NSApplicationActivationPolicyRegular;
   if (info.Length() > 0 && info[0].IsObject()) {
     Napi::Object o = info[0].As<Napi::Object>();
-    if (!ApplyPolicyOption(env, o.Get("activationPolicy"))) return env.Undefined();
+    if (!ParsePolicyOption(env, o.Get("activationPolicy"), &has, &p))
+      return env.Undefined();
   }
-  BEnsureApp();
+  CALOnUI(^{
+    if (has) ApplyActivationPolicy(p);
+    BEnsureApp();
+  });
   return env.Undefined();
 }
 
@@ -2372,7 +2765,9 @@ static Napi::Value SetActivationPolicyFn(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  return Napi::Boolean::New(env, ApplyActivationPolicy(p));
+  __block bool ok = false;
+  CALOnUI(^{ ok = ApplyActivationPolicy(p); });
+  return BCommandAnswer(env, ok);
 }
 
 // activationPolicy() -> 'regular' | 'accessory' | 'prohibited' — as the UI
@@ -2387,16 +2782,20 @@ static Napi::Value ActivationPolicyFn(const Napi::CallbackInfo& info) {
 // undefined clears. Shows only while the tile exists (policy 'regular').
 static Napi::Value SetDockBadgeFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
   Napi::Value v = info[0];
-  if (v.IsNull() || v.IsUndefined()) {
-    NSApp.dockTile.badgeLabel = nil;
-  } else if (v.IsString() || v.IsNumber()) {
-    NSApp.dockTile.badgeLabel = BToNSString(v.ToString());
-  } else {
+  NSString* label = nil;
+  if (v.IsString() || v.IsNumber()) {
+    label = BToNSString(v.ToString());
+  } else if (!v.IsNull() && !v.IsUndefined()) {
     Napi::TypeError::New(env, "setDockBadge: expected a string, a number or null")
         .ThrowAsJavaScriptException();
+    return env.Undefined();
   }
+  CALOnUI(^{
+    BEnsureApp();
+    NSApp.dockTile.badgeLabel = label;
+    PublishBadge();
+  });
   return env.Undefined();
 }
 
@@ -2406,9 +2805,15 @@ static Napi::Value SetDockBadgeFn(const Napi::CallbackInfo& info) {
 // activated. AppKit ignores the request while the app is active (the id it
 // returns then is still safe to cancel; appInfo().active says which case a
 // caller is in). Anything else as the type is a RangeError.
+//
+// From a worker the id is the bridge's own, allocated at the call from a
+// range AppKit's never reaches (2^40 up) and mapped to AppKit's when the
+// command runs; cancelUserAttention takes either kind.
+static std::atomic<int64_t> gNextAttentionId{(int64_t)1 << 40};
+static NSMutableDictionary<NSNumber*, NSNumber*>* gAttention = nil;  // UI thread
+
 static Napi::Value RequestUserAttentionFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  BEnsureApp();
   NSRequestUserAttentionType type;
   std::string s = info[0].IsString() ? info[0].As<Napi::String>().Utf8Value() : "";
   if (s == "informational") type = NSInformationalRequest;
@@ -2419,7 +2824,17 @@ static Napi::Value RequestUserAttentionFn(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  return Napi::Number::New(env, (double)[NSApp requestUserAttention:type]);
+  if (pthread_main_np()) {
+    BEnsureApp();
+    return Napi::Number::New(env, (double)[NSApp requestUserAttention:type]);
+  }
+  int64_t id = gNextAttentionId++;
+  CALOnUI(^{
+    BEnsureApp();
+    if (!gAttention) gAttention = [NSMutableDictionary dictionary];
+    gAttention[@(id)] = @([NSApp requestUserAttention:type]);
+  });
+  return Napi::Number::New(env, (double)id);
 }
 
 // cancelUserAttention(requestId) — stop a bounce early (the message was
@@ -2431,8 +2846,13 @@ static Napi::Value CancelUserAttentionFn(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  BEnsureApp();
-  [NSApp cancelUserAttentionRequest:(NSInteger)info[0].As<Napi::Number>().Int64Value()];
+  int64_t id = info[0].As<Napi::Number>().Int64Value();
+  CALOnUI(^{
+    BEnsureApp();
+    NSNumber* mapped = gAttention[@(id)];
+    if (mapped) [gAttention removeObjectForKey:@(id)];
+    [NSApp cancelUserAttentionRequest:mapped ? mapped.integerValue : (NSInteger)id];
+  });
   return env.Undefined();
 }
 
@@ -2484,17 +2904,39 @@ static Napi::Value SetAppNameFn(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  BEnsureApp();
-  if (BundleDeclaresName()) return Napi::Boolean::New(env, false);
-  return Napi::Boolean::New(env,
-                            SetLaunchServicesDisplayName(BToNSString(info[0])));
+  NSString* name = BToNSString(info[0]);
+  __block bool ok = false;
+  CALOnUI(^{
+    BEnsureApp();
+    ok = !BundleDeclaresName() && SetLaunchServicesDisplayName(name);
+    PublishName();
+  });
+  return BCommandAnswer(env, ok);
 }
 
 // appInfo() -> { activationPolicy, name, dockBadge, active } — the presence
 // state read back from AppKit and LaunchServices, for tests and for a
-// renderer deciding whether a bounce would even be seen.
+// renderer deciding whether a bounce would even be seen. From a worker it is
+// the published copy.
 static Napi::Value AppInfoFn(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (ReadPublished()) {
+    NSString *name, *badge;
+    {
+      std::lock_guard<std::mutex> l(gPubMu);
+      name = gPubName;
+      badge = gPubBadge;
+    }
+    Napi::Object r = Napi::Object::New(env);
+    r.Set("activationPolicy",
+          PolicyName((NSApplicationActivationPolicy)gPubPolicy.load()));
+    if (name) r.Set("name", name.UTF8String);
+    else r.Set("name", env.Null());
+    if (badge.length) r.Set("dockBadge", badge.UTF8String);
+    else r.Set("dockBadge", env.Null());
+    r.Set("active", gPubActive.load());
+    return r;
+  }
   BEnsureApp();
   Napi::Object r = Napi::Object::New(env);
   r.Set("activationPolicy", PolicyName(NSApp.activationPolicy));
@@ -4568,24 +5010,37 @@ static Napi::Value LayoutCaret(const Napi::CallbackInfo& info) {
 // pasteboard
 // ---------------------------------------------------------------------------
 
+// The general pasteboard is the UI thread's: writes are commands, and a
+// read off the main thread answers through a callback.
 static Napi::Value PbWriteTextFn(const Napi::CallbackInfo& info) {
-  NSPasteboard* pb = NSPasteboard.generalPasteboard;
-  [pb clearContents];
-  [pb setString:BToNSString(info[0]) forType:NSPasteboardTypeString];
-  PublishPasteboardCount();
+  NSString* text = BToNSString(info[0]);
+  CALOnUI(^{
+    NSPasteboard* pb = NSPasteboard.generalPasteboard;
+    [pb clearContents];
+    [pb setString:text forType:NSPasteboardTypeString];
+    PublishPasteboardCount();
+  });
   return info.Env().Undefined();
 }
 
+// pasteboardReadText(cb?) -> string | null
 static Napi::Value PbReadTextFn(const Napi::CallbackInfo& info) {
-  NSString* s =
-      [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
-  return s ? Napi::Value(Napi::String::New(info.Env(), s.UTF8String))
-           : Napi::Value(info.Env().Null());
+  return CALAnswer(info, "pasteboardReadText", ^CALValueBlock {
+    NSString* s =
+        [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+    std::string text = s ? s.UTF8String : "";
+    bool has = s != nil;
+    return ^Napi::Value(Napi::Env e) {
+      return has ? Napi::Value(Napi::String::New(e, text)) : Napi::Value(e.Null());
+    };
+  });
 }
 
 static Napi::Value PbClearFn(const Napi::CallbackInfo& info) {
-  [NSPasteboard.generalPasteboard clearContents];
-  PublishPasteboardCount();
+  CALOnUI(^{
+    [NSPasteboard.generalPasteboard clearContents];
+    PublishPasteboardCount();
+  });
   return info.Env().Undefined();
 }
 
@@ -4628,14 +5083,13 @@ static Napi::Value SetCursorFn(const Napi::CallbackInfo& info) {
     c = NSCursor.resizeUpDownCursor;
   else if (name == "not-allowed") c = NSCursor.operationNotAllowedCursor;
   else c = NSCursor.arrowCursor;
-  [c set];
+  CALOnUI(^{ [c set]; });
   return info.Env().Undefined();
 }
 
 // postKeyEvent(win, down, keyCode, chars, modifiers) — synthetic keys for
 // tests, through the real pump like postMouseEvent.
 static Napi::Value PostKeyEvent(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
   bool down = info[1].ToBoolean().Value();
   unsigned short keyCode = (unsigned short)info[2].As<Napi::Number>().Uint32Value();
   NSString* chars = info.Length() > 3 && info[3].IsString()
@@ -4649,17 +5103,19 @@ static Napi::Value PostKeyEvent(const Napi::CallbackInfo& info) {
     if (BBoolOr(m, "option", false)) flags |= NSEventModifierFlagOption;
     if (BBoolOr(m, "command", false)) flags |= NSEventModifierFlagCommand;
   }
-  NSEvent* e = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp
-                                location:NSMakePoint(0, 0)
-                           modifierFlags:flags
-                               timestamp:NSProcessInfo.processInfo.systemUptime
-                            windowNumber:win.windowNumber
-                                 context:nil
-                              characters:chars
-             charactersIgnoringModifiers:chars
-                               isARepeat:NO
-                                 keyCode:keyCode];
-  [NSApp postEvent:e atStart:NO];
+  OnWindow(info[0], ^(NSWindow* win) {
+    NSEvent* e = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp
+                                  location:NSMakePoint(0, 0)
+                             modifierFlags:flags
+                                 timestamp:NSProcessInfo.processInfo.systemUptime
+                              windowNumber:win.windowNumber
+                                   context:nil
+                                characters:chars
+               charactersIgnoringModifiers:chars
+                                 isARepeat:NO
+                                   keyCode:keyCode];
+    [NSApp postEvent:e atStart:NO];
+  });
   return info.Env().Undefined();
 }
 
@@ -4669,8 +5125,7 @@ static Napi::Value PostKeyEvent(const Napi::CallbackInfo& info) {
 // automatically, so a popup presented after its map keeps whatever shape
 // AppKit guessed first (a full-frame dark square). Call after presenting.
 static Napi::Value InvalidateWindowShadow(const Napi::CallbackInfo& info) {
-  NSWindow* win = BDeref<NSWindow*>(info[0]);
-  [win invalidateShadow];
+  OnWindow(info[0], ^(NSWindow* win) { [win invalidateShadow]; });
   return info.Env().Undefined();
 }
 

@@ -40,6 +40,8 @@
 #include <string>
 #include <vector>
 
+#include "channel.h"  // CALOnUI: the session is the UI thread's
+
 // src/backend.mm — NSApplication set up exactly once, whichever verb comes
 // first. The sampler is AppKit UI like a panel, so it wants an app.
 void BEnsureApp();
@@ -52,9 +54,9 @@ struct ColorAnswer {
 };
 
 // The callers of the session that is up, in the order they asked; empty when
-// none is. Touched on the JS thread only: the verb runs there, and so does
-// AppKit's handler — node's main thread is the process main thread, and the
-// handler arrives on it inside the pump.
+// none is. Touched on the UI thread only: the verb's own part runs there
+// (inline in pump mode, a command from a worker), and so does AppKit's
+// handler, inside the pump or the run.
 static std::vector<Napi::ThreadSafeFunction> gWaiting;
 
 // cb(err) | cb(null, null) | cb(null, { r, g, b }) on the JS thread, then the
@@ -121,18 +123,22 @@ static Napi::Value SampleScreenColor(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  @autoreleasepool {
-    BEnsureApp();
-    bool sessionUp = !gWaiting.empty();
-    gWaiting.push_back(Napi::ThreadSafeFunction::New(
-        env, info[0].As<Napi::Function>(), "appkit:sampleScreenColor", 0, 1));
-    if (sessionUp) return env.Undefined();
-    // Nothing here keeps the sampler alive: AppKit retains it for as long as
-    // the session lasts, which its header promises in as many words.
-    [[NSColorSampler new] showSamplerWithSelectionHandler:^(NSColor* c) {
-      FinishSession(c);
-    }];
-  }
+  // made in the caller's environment, which is the one answered
+  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
+      env, info[0].As<Napi::Function>(), "appkit:sampleScreenColor", 0, 1);
+  CALOnUI(^{
+    @autoreleasepool {
+      BEnsureApp();
+      bool sessionUp = !gWaiting.empty();
+      gWaiting.push_back(tsfn);
+      if (sessionUp) return;
+      // Nothing here keeps the sampler alive: AppKit retains it for as long
+      // as the session lasts, which its header promises in as many words.
+      [[NSColorSampler new] showSamplerWithSelectionHandler:^(NSColor* c) {
+        FinishSession(c);
+      }];
+    }
+  });
   return env.Undefined();
 }
 

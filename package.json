@@ -43,7 +43,7 @@
     "install": "node scripts/install.js",
     "build": "node-gyp rebuild",
     "demo": "node demo/demo.js",
-    "test": "node test/app-lifecycle.js && node test/animation.js && node test/accessibility-display.js && node test/ignores-mouse-events.js && node test/surface-blit.js && node test/eventkit-permissions.js && node test/calendars.js && node test/calendar-writes.js && node test/screencolor.js && node test/threaded.js && node test/threaded-verbs.js && node test/threaded-frames.js && node test/threaded-resize.js && node test/ending-worker.js"
+    "test": "node test/app-lifecycle.js && node test/animation.js && node test/accessibility-display.js && node test/ignores-mouse-events.js && node test/surface-blit.js && node test/eventkit-permissions.js && node test/calendars.js && node test/calendar-writes.js && node test/screencolor.js && node test/threaded.js && node test/threaded-verbs.js && node test/threaded-frames.js && node test/threaded-resize.js && node test/ending-worker.js && node test/activation-policy.js"
   },
   "dependencies": {
     "node-addon-api": "^8.3.0"

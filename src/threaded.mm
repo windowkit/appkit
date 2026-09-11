@@ -85,6 +85,7 @@
 // what the run loop needs beyond pump mode (the event monitor, the polled
 // pasteboard count)
 void BEnsureApp();
+bool CALApplyActivationPolicyOption(Napi::Env env, Napi::Value v);
 bool CALHasBackendCb();
 void CALPumpDeliver(const CALEvent& ev);
 void CALReplayHeldEvents();
@@ -810,6 +811,12 @@ static Napi::Value RunMain(const Napi::CallbackInfo& info) {
     Napi::Error::New(env, "runMain: already running").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  // runMain({ activationPolicy }) — the policy to launch with, for a
+  // launcher that knows it before the app's code has run (#64); a name
+  // nobody knows is a RangeError before anything launches
+  if (info.Length() > 0 && info[0].IsObject() &&
+      !CALApplyActivationPolicyOption(env, info[0].As<Napi::Object>().Get("activationPolicy")))
+    return env.Undefined();
   // asked before there was a run to end
   if (gExitAsked.exchange(false)) return Napi::Number::New(env, gExitCode.load());
 

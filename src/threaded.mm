@@ -359,18 +359,21 @@ void CALUIObjectsChanged(int delta) {
   WakeLocked();  // elsewhere the next delivery re-decides it
 }
 
-// Whether JS can still be called in `env`. A worker that is ending (an
-// uncaught error, its own process.exit) can still run a threadsafe
-// function's callback from its loop's last spin, and there every property
-// set fails — which node-addon-api, with C++ exceptions off, turns into a
-// fatal error, since it cannot throw either (Node 18 on CI: "FATAL ERROR:
-// Error::ThrowAsJavaScriptException napi_throw" from DeliverBatch). Asked
+// Why it is asked is in channel.h; Node 18 on CI showed it as "FATAL ERROR:
+// Error::ThrowAsJavaScriptException napi_throw" from DeliverBatch. Asked
 // with a raw set on a scratch object, whose failure is only a status.
-static bool CanCallIntoJS(napi_env env) {
+bool CALCanCallIntoJS(napi_env env) {
   napi_value o, v;
   if (napi_create_object(env, &o) != napi_ok) return false;
   if (napi_get_boolean(env, true, &v) != napi_ok) return false;
   return napi_set_named_property(env, o, "probe", v) == napi_ok;
+}
+
+void CALCallJS(napi_env env, napi_value cb,
+               std::initializer_list<napi_value> args) {
+  napi_value undefined;
+  if (napi_get_undefined(env, &undefined) != napi_ok) return;
+  napi_call_function(env, undefined, cb, args.size(), args.begin(), nullptr);
 }
 
 // On the connected environment's thread.
@@ -389,18 +392,12 @@ static void DeliverBatch(napi_env env, napi_value cb, void*, void*) {
     }
   }
   // an environment on its way out gets nothing more: the batch goes with it
-  if (batch.empty() || !CanCallIntoJS(env)) return;
+  if (batch.empty() || !CALCanCallIntoJS(env)) return;
   Napi::Env e(env);
   Napi::HandleScope scope(e);
   Napi::Array arr = Napi::Array::New(e, batch.size());
   for (uint32_t i = 0; i < batch.size(); i++) arr.Set(i, batch[i].ToObject(e));
-  // Raw, so a failed call is a status rather than node-addon-api's fatal
-  // error. An exception from onEvents is left pending: Node reports it as
-  // that environment's uncaught exception.
-  napi_value argv[1] = {arr};
-  napi_value undefined;
-  napi_get_undefined(env, &undefined);
-  napi_call_function(env, undefined, cb, 1, argv, nullptr);
+  CALCallJS(env, cb, {arr});
 }
 
 static void StopRun();
@@ -577,16 +574,14 @@ Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
 void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make) {
   Reply* r = new Reply{make};
   napi_status st = tsfn.BlockingCall(r, [](Napi::Env env, Napi::Function cb, Reply* r) {
-    // an environment on its way out gets no answer (see DeliverBatch)
-    if (!CanCallIntoJS(env)) {
+    // an environment on its way out gets no answer (channel.h)
+    if (!CALCanCallIntoJS(env)) {
       delete r;
       return;
     }
     napi_value v = r->make(env);
     delete r;
-    napi_value undefined;
-    napi_get_undefined(env, &undefined);
-    napi_call_function(env, undefined, cb, 1, &v, nullptr);
+    CALCallJS(env, cb, {v});
   });
   if (st != napi_ok) delete r;
   tsfn.Release();

@@ -743,28 +743,33 @@ static Napi::Value ErrorJs(Napi::Env env, const CalAnswer& a) {
 static void Deliver(Napi::ThreadSafeFunction tsfn, CalAnswer* a) {
   napi_status st = tsfn.BlockingCall(
       a, [](Napi::Env env, Napi::Function cb, CalAnswer* a) {
+        // an environment on its way out gets no answer (channel.h)
+        if (!CALCanCallIntoJS(env)) {
+          delete a;
+          return;
+        }
         if (!a->error.empty()) {
-          cb.Call({ErrorJs(env, *a)});
+          CALCallJS(env, cb, {ErrorJs(env, *a)});
         } else if (a->kind == Answer::Events) {
           Napi::Array out = Napi::Array::New(env, a->events.size());
           for (uint32_t i = 0; i < a->events.size(); i++) {
             out.Set(i, EventJs(env, a->events[i]));
           }
-          cb.Call({env.Null(), out});
+          CALCallJS(env, cb, {env.Null(), out});
         } else if (a->kind == Answer::Calendars) {
           Napi::Array out = Napi::Array::New(env, a->calendars.size());
           for (uint32_t i = 0; i < a->calendars.size(); i++) {
             out.Set(i, CalendarJs(env, a->calendars[i]));
           }
-          cb.Call({env.Null(), out});
+          CALCallJS(env, cb, {env.Null(), out});
         } else if (a->kind == Answer::Calendar) {
-          cb.Call({env.Null(), a->calendar
-                                   ? CalendarJs(env, *a->calendar)
-                                   : env.Null().As<Napi::Value>()});
+          CALCallJS(env, cb, {env.Null(), a->calendar
+                                              ? CalendarJs(env, *a->calendar)
+                                              : env.Null().As<Napi::Value>()});
         } else if (a->kind == Answer::Id) {
-          cb.Call({env.Null(), StringOrNull(env, a->id)});
+          CALCallJS(env, cb, {env.Null(), StringOrNull(env, a->id)});
         } else {
-          cb.Call({env.Null()});
+          CALCallJS(env, cb, {env.Null()});
         }
         delete a;
       });
@@ -800,6 +805,7 @@ void CALCalendarsReplayHeld() {
 
 static void CallJsChanged(Napi::Env env, Napi::Function, void*, void*) {
   if ((napi_env)env == nullptr) return;  // the function is being torn down
+  if (!CALCanCallIntoJS(env)) return;    // or the environment is (channel.h)
   EmitOrHoldChange();
 }
 

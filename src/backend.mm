@@ -155,12 +155,13 @@ static bool HasBackendCb() { return !gBackendCb.IsEmpty(); }
 // is closed: the record materialized in the callback's own environment and
 // handed over inline, as every event always was. Producers everywhere build
 // a CALEvent and call CALEmit (channel.h); nothing calls the callback
-// directly any more.
+// directly any more. The call is raw (channel.h): the notification and
+// calendar-change hops reach here from a threadsafe function's callback.
 void CALPumpDeliver(const CALEvent& ev) {
   if (!HasBackendCb()) return;
   Napi::Env env = gBackendCb.Env();
   Napi::HandleScope scope(env);
-  gBackendCb.Call({ev.ToObject(env)});
+  CALCallJS(env, gBackendCb.Value(), {ev.ToObject(env)});
 }
 
 bool CALHasBackendCb() { return HasBackendCb(); }

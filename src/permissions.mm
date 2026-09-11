@@ -56,6 +56,8 @@
 #include <cstring>
 #include <string>
 
+#include "channel.h"  // CALOnUI, CALCanCallIntoJS
+
 // src/calendars.mm — the change observer the process's store gets as it is
 // created, so EKEventStoreChangedNotification is watched from the store's
 // first moment whichever verb made it.
@@ -299,8 +301,13 @@ static void Answer(Napi::ThreadSafeFunction tsfn, const char* status,
   Reply* r = new Reply{status, granted};
   napi_status st = tsfn.BlockingCall(
       r, [](Napi::Env env, Napi::Function cb, Reply* r) {
-        cb.Call({Napi::Boolean::New(env, r->granted),
-                 Napi::String::New(env, r->status)});
+        // an environment on its way out gets no answer (channel.h)
+        if (!CALCanCallIntoJS(env)) {
+          delete r;
+          return;
+        }
+        CALCallJS(env, cb, {Napi::Boolean::New(env, r->granted),
+                            Napi::String::New(env, r->status)});
         delete r;
       });
   if (st != napi_ok) delete r;
@@ -311,8 +318,6 @@ static void Answer(Napi::ThreadSafeFunction tsfn, const char* status,
 static void Answer(Napi::ThreadSafeFunction tsfn, const char* status) {
   Answer(tsfn, status, strcmp(status, kAuthorized) == 0);
 }
-
-#include "channel.h"  // CALOnUI
 
 // A location request: its own CLLocationManager whose delegate reports the
 // decision. The delegate is also told the current status right after it is

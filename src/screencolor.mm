@@ -40,7 +40,7 @@
 #include <string>
 #include <vector>
 
-#include "channel.h"  // CALOnUI: the session is the UI thread's
+#include "channel.h"  // CALOnUI: the session is the UI thread's; CALCallJS
 
 // src/backend.mm — NSApplication set up exactly once, whichever verb comes
 // first. The sampler is AppKit UI like a panel, so it wants an app.
@@ -65,16 +65,21 @@ static void Deliver(Napi::ThreadSafeFunction tsfn, const ColorAnswer& answer) {
   ColorAnswer* a = new ColorAnswer(answer);
   napi_status st = tsfn.BlockingCall(
       a, [](Napi::Env env, Napi::Function cb, ColorAnswer* a) {
+        // an environment on its way out gets no answer (channel.h)
+        if (!CALCanCallIntoJS(env)) {
+          delete a;
+          return;
+        }
         if (!a->error.empty()) {
-          cb.Call({Napi::Error::New(env, a->error).Value()});
+          CALCallJS(env, cb, {Napi::Error::New(env, a->error).Value()});
         } else if (a->cancelled) {
-          cb.Call({env.Null(), env.Null()});
+          CALCallJS(env, cb, {env.Null(), env.Null()});
         } else {
           Napi::Object c = Napi::Object::New(env);
           c.Set("r", Napi::Number::New(env, a->r));
           c.Set("g", Napi::Number::New(env, a->g));
           c.Set("b", Napi::Number::New(env, a->b));
-          cb.Call({env.Null(), c});
+          CALCallJS(env, cb, {env.Null(), c});
         }
         delete a;
       });

@@ -53,7 +53,7 @@ function main() {
   if (mode === 'full') runChildren();
   native.initApp();
   const expect = { mode };
-  if (mode === 'full' || mode === 'exit' || mode === 'throw') {
+  if (['full', 'exit', 'throw', 'cb-throw', 'cb-throw-unhandled'].includes(mode)) {
     const win = native.createWindow2({ width: 240, height: 160, title: 'threaded', x: 80, y: 120 });
     native.showWindow(win, false);
     native.pump2(); // one dequeue first: an event posted before the app's first is dropped
@@ -83,14 +83,14 @@ function main() {
   w.on('error', () => {}); // the 'throw' child's; runMain's answer is what is checked
   const code = native.runMain();
   if (native.threaded()) fail('threaded() still true after runMain returned');
-  const want = { full: 0, idle: null, exit: null, throw: null, signal: 143 }[mode];
+  const want = { full: 0, idle: null, exit: null, throw: null, signal: 143, 'cb-throw': 0, 'cb-throw-unhandled': null }[mode];
   if (code !== want) fail(`${mode}: runMain returned ${code}, expected ${want}`);
   if (mode !== 'full') say(`${mode}: runMain returned ${code}`);
   process.exit(0);
 }
 
 function runChildren() {
-  for (const m of ['idle', 'exit', 'throw', 'signal']) {
+  for (const m of ['idle', 'exit', 'throw', 'signal', 'cb-throw', 'cb-throw-unhandled']) {
     const r = spawnSync(process.execPath, [__filename, m], { encoding: 'utf8', timeout: 20000 });
     process.stderr.write(r.stderr || '');
     if (r.status !== 0) fail(`child '${m}' ended with status ${r.status}, signal ${r.signal}`);
@@ -119,6 +119,32 @@ function worker() {
   } else if (mode === 'signal') {
     // never connects: nobody to hand the signal to
     setTimeout(() => process.kill(process.pid, 'SIGTERM'), 50);
+  } else if (mode === 'cb-throw') {
+    // #62: an exception thrown from the connect callback, and one from an
+    // answer callback, is this environment's uncaught exception — not a
+    // warning, with the error gone
+    const seen = [];
+    process.on('uncaughtException', (e) => {
+      seen.push(e.message);
+      if (seen.length === 2) native.requestExit(seen.join() === 'from onEvents,from an answer' ? 0 : 1);
+    });
+    let thrown = false;
+    native.connect(() => {
+      if (thrown) return;
+      thrown = true;
+      native.windowNumberAtPoint(1, 1, () => {
+        throw new Error('from an answer');
+      });
+      throw new Error('from onEvents');
+    });
+    native.pingUI(1);
+  } else if (mode === 'cb-throw-unhandled') {
+    // with no handler it ends the worker, and so the run: the process never
+    // hangs with the window up and the error gone (#62's repro)
+    native.connect(() => {
+      throw new Error('boom');
+    });
+    native.pingUI(1);
   } else {
     full().then(
       () => native.requestExit(0),

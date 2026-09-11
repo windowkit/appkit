@@ -205,9 +205,18 @@ void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make);
 // callback asks first and, told no, frees what it carried and returns.
 bool CALCanCallIntoJS(napi_env env);
 
+// In a threadsafe function's callback, after calling into JS: an exception
+// left pending is made that environment's uncaught exception
+// (napi_fatal_exception). Left pending, Node's default N-API policy would
+// only warn and drop it (windowkit/appkit#62). Not for a call made inside a
+// JS call frame (pump2's inline delivery): there the exception rethrows to
+// the caller, as it always has.
+void CALRaiseUncaughtIfPending(napi_env env);
+
 // cb(...args) with undefined as this, raw, so a failed call is a status
-// rather than node-addon-api's fatal error. An exception cb throws is left
-// pending: Node reports it as that environment's uncaught exception.
+// rather than node-addon-api's fatal error — from a threadsafe function's
+// callback, so an exception cb throws is then the environment's uncaught
+// exception (CALRaiseUncaughtIfPending).
 void CALCallJS(napi_env env, napi_value cb,
                std::initializer_list<napi_value> args);
 

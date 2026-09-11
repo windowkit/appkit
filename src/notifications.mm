@@ -201,6 +201,9 @@ static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev) {
   }
   CALNotificationsReplayHeld();  // keep order behind anything still held
   EmitOrHold(ev);
+  // pump mode's inline delivery leaves a listener's exception pending; from
+  // a threadsafe function's callback it is the uncaught exception (#62)
+  CALRaiseUncaughtIfPending(env);
 }
 
 // From any thread: onto node's loop, then to the listener or the held list

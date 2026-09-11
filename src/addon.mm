@@ -14,7 +14,9 @@
 #import <ImageIO/ImageIO.h>
 
 #include <cmath>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -350,40 +352,134 @@ static Napi::Value Pump(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 // layers
 // ---------------------------------------------------------------------------
+//
+// Frames from a worker (windowkit/appkit#52). On the main thread (pump mode)
+// every layer verb acts in the call, as it always has. Off it a layer is the
+// UI thread's to touch, and a frame's changes have to land in one commit
+// with nothing between them: a verb called between txBegin and txCommit
+// records into its thread's open batch, and the outermost txCommit posts
+// the batch as one command, applied on the UI thread in the order it was
+// recorded. txBegin and txCommit are recorded too, so what applies is the
+// very sequence of Core Animation calls pump mode would make — inside the
+// drain's transaction, so one commit, with actions as the frame asked for
+// them. A verb outside any txBegin is a command of its own, in a transaction
+// with actions on, as pump mode's implicit transaction has them. Arguments
+// are read on the calling thread into plain values (colours, paths,
+// transforms and animation objects are thread-safe to make); a layer is
+// made on the UI thread when its create applies, behind a handle answered
+// at the call.
+
+struct FrameBatch {
+  int depth = 0;
+  std::vector<dispatch_block_t> ops;
+};
+static thread_local FrameBatch tlFrame;
+
+// Set while the UI thread applies a worker's layer changes, whose replaced
+// IOSurfaces are then reported.
+static bool gApplyingWorkerFrame = false;
+static std::vector<uint32_t> gReleasedSurfaces;  // the UI thread's
+
+static void RunLayerOp(dispatch_block_t op) {
+  @try {
+    op();
+  } @catch (NSException* e) {
+    fprintf(stderr, "@windowkit/appkit: a layer change raised %s: %s\n",
+            e.name.UTF8String, e.reason.UTF8String ?: "");
+  }
+}
+
+// The IOSurfaces a worker's frame took off its layers, as
+// `surface-released { id }`: from a block, which runs after the source
+// callout that queued it — after the drain's commit — so the new buffer has
+// gone to the render server before the renderer hears it may draw into the
+// old one. (Whether the old one is still scanning out is IOSurfaceIsInUse's
+// to say: surfaceIsInUse.)
+static void FlushReleasedSurfaces() {
+  if (gReleasedSurfaces.empty()) return;
+  std::vector<uint32_t> ids = std::move(gReleasedSurfaces);
+  gReleasedSurfaces.clear();
+  CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+    for (uint32_t id : ids)
+      CALEmit(std::move(CALEvent("surface-released").Num("id", (double)id)));
+  });
+  CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+void CALNoteContentsReplaced(id layer, id next) {
+  if (!gApplyingWorkerFrame) return;
+  id old = ((CALayer*)layer).contents;
+  if (!old || old == next ||
+      CFGetTypeID((__bridge CFTypeRef)old) != IOSurfaceGetTypeID())
+    return;
+  gReleasedSurfaces.push_back(IOSurfaceGetID((__bridge IOSurfaceRef)old));
+}
+
+void CALOnLayers(dispatch_block_t op) {
+  if (pthread_main_np()) {
+    op();
+    return;
+  }
+  if (tlFrame.depth > 0) {
+    tlFrame.ops.push_back(op);
+    return;
+  }
+  CALOnUI(^{
+    gApplyingWorkerFrame = true;
+    [CATransaction begin];
+    [CATransaction setDisableActions:NO];
+    RunLayerOp(op);
+    [CATransaction commit];
+    gApplyingWorkerFrame = false;
+    FlushReleasedSurfaces();
+  });
+}
+
+// A layer: made in the call on the main thread; from a worker, a handle now
+// and the layer when its create applies.
+static Napi::Value NewLayer(const Napi::CallbackInfo& info, CALayer* (^make)(void)) {
+  if (pthread_main_np()) return WrapRetained(info.Env(), make());
+  CALHandle* h = CALNewHandle();
+  Napi::Value v = CALWrapHandle(info.Env(), h, false);
+  CALOnLayers(^{ h->object_ = make(); });
+  return v;
+}
 
 static Napi::Value CreateLayer(const Napi::CallbackInfo& info) {
-  return WrapRetained(info.Env(), [CALayer layer]);
+  return NewLayer(info, ^CALayer* { return [CALayer layer]; });
 }
 static Napi::Value CreateTextLayer(const Napi::CallbackInfo& info) {
-  CATextLayer* t = [CATextLayer layer];
-  t.contentsScale = 2.0;  // sane retina default; overridable via contentsScale
-  return WrapRetained(info.Env(), t);
+  return NewLayer(info, ^CALayer* {
+    CATextLayer* t = [CATextLayer layer];
+    t.contentsScale = 2.0;  // sane retina default; overridable via contentsScale
+    return t;
+  });
 }
 static Napi::Value CreateGradientLayer(const Napi::CallbackInfo& info) {
-  return WrapRetained(info.Env(), [CAGradientLayer layer]);
+  return NewLayer(info, ^CALayer* { return [CAGradientLayer layer]; });
 }
 static Napi::Value CreateShapeLayer(const Napi::CallbackInfo& info) {
-  return WrapRetained(info.Env(), [CAShapeLayer layer]);
+  return NewLayer(info, ^CALayer* { return [CAShapeLayer layer]; });
 }
 
 static Napi::Value AddSublayer(const Napi::CallbackInfo& info) {
-  CALayer* parent = Deref<CALayer*>(info[0]);
-  CALayer* child = Deref<CALayer*>(info[1]);
-  [parent addSublayer:child];
+  id parent = CALHandleTarget(info[0]), child = CALHandleTarget(info[1]);
+  CALOnLayers(^{
+    CALayer* p = CALResolve(parent);
+    CALayer* c = CALResolve(child);
+    if (p && c) [p addSublayer:c];
+  });
   return info.Env().Undefined();
 }
 
 static Napi::Value RemoveFromSuperlayer(const Napi::CallbackInfo& info) {
-  CALayer* l = Deref<CALayer*>(info[0]);
-  [l removeFromSuperlayer];
+  id target = CALHandleTarget(info[0]);
+  CALOnLayers(^{ [(CALayer*)CALResolve(target) removeFromSuperlayer]; });
   return info.Env().Undefined();
 }
 
-static void ApplyTransform(CALayer* L, Napi::Value v) {
-  if (v.IsNull() || v.IsUndefined()) {
-    L.transform = CATransform3DIdentity;
-    return;
-  }
+static CATransform3D TransformFrom(Napi::Value v) {
+  if (v.IsNull() || v.IsUndefined()) return CATransform3DIdentity;
   Napi::Object t = v.As<Napi::Object>();
   CATransform3D m = CATransform3DIdentity;
   m = CATransform3DTranslate(m, NumOr(t, "translateX", 0), NumOr(t, "translateY", 0), 0);
@@ -392,72 +488,144 @@ static void ApplyTransform(CALayer* L, Napi::Value v) {
   double s = NumOr(t, "scale", 1);
   double sx = NumOr(t, "scaleX", s), sy = NumOr(t, "scaleY", s);
   if (sx != 1 || sy != 1) m = CATransform3DScale(m, sx, sy, 1);
-  L.transform = m;
+  return m;
 }
 
-static void SetColorProp(CALayer* L, Napi::Object o, const char* key,
-                         void (^setter)(CGColorRef)) {
-  if (!o.Has(key)) return;
+// A colour property as given: absent, null (cleared) or a colour.
+struct ColorProp {
+  bool given = false;
+  id color = nil;  // a CGColor, owned by ARC through the bridge; nil clears
+};
+
+static ColorProp ColorPropOf(Napi::Object o, const char* key) {
+  ColorProp c;
+  if (!o.Has(key)) return c;
+  c.given = true;
   Napi::Value v = o.Get(key);
-  if (v.IsNull()) {
-    setter(NULL);
-  } else {
-    CGColorRef c = MakeColor(v);
-    setter(c);
-    CGColorRelease(c);
-  }
+  if (!v.IsNull()) c.color = CFBridgingRelease(MakeColor(v));
+  return c;
 }
 
-static void ApplyLayerProps(CALayer* L, Napi::Object o) {
-  if (o.Has("frame")) L.frame = RectFrom(o.Get("frame"));
+static CGColorRef ColorOf(const ColorProp& c) { return (__bridge CGColorRef)c.color; }
+
+// setLayerProps' object, read on the calling thread; only what is present
+// is applied.
+struct LayerPropsSpec {
+  bool hasFrame = false, hasBounds = false, hasPosition = false, hasAnchor = false;
+  CGRect frame = CGRectZero, bounds = CGRectZero;
+  CGPoint position = CGPointZero, anchor = CGPointZero;
+  bool hasZ = false;
+  double z = 0;
+  ColorProp background, border, shadow;
+  bool hasCorner = false, hasBorderWidth = false, hasOpacity = false, hasHidden = false;
+  bool hasMasks = false, hasShadowOpacity = false, hasShadowRadius = false;
+  bool hasShadowOffset = false, hasContentsScale = false, hasName = false;
+  bool hasMask = false, hasTransform = false, clearContents = false;
+  double corner = 0, borderWidth = 0, shadowRadius = 3, contentsScale = 1;
+  float opacity = 1, shadowOpacity = 0;
+  bool hidden = false, masks = false;
+  CGSize shadowOffset = CGSizeZero;
+  NSString* name = nil;
+  id mask = nil;  // a layer target; nil clears
+  CATransform3D transform = CATransform3DIdentity;
+};
+
+static LayerPropsSpec ParseLayerProps(Napi::Object o) {
+  LayerPropsSpec s;
+  if (o.Has("frame")) {
+    s.hasFrame = true;
+    s.frame = RectFrom(o.Get("frame"));
+  }
   if (o.Has("bounds")) {
     // [w, h] or [x, y, w, h] — the four-element form carries a bounds
     // ORIGIN, which is Core Animation's native scroll: the layer shows its
     // sublayers shifted by (-x, -y) with nothing repainted.
+    s.hasBounds = true;
     Napi::Array a = o.Get("bounds").As<Napi::Array>();
     if (a.Length() >= 4) {
-      L.bounds = CGRectMake(a.Get(0u).As<Napi::Number>().DoubleValue(),
+      s.bounds = CGRectMake(a.Get(0u).As<Napi::Number>().DoubleValue(),
                             a.Get(1u).As<Napi::Number>().DoubleValue(),
                             a.Get(2u).As<Napi::Number>().DoubleValue(),
                             a.Get(3u).As<Napi::Number>().DoubleValue());
     } else {
-      L.bounds = CGRectMake(0, 0, a.Get(0u).As<Napi::Number>().DoubleValue(),
+      s.bounds = CGRectMake(0, 0, a.Get(0u).As<Napi::Number>().DoubleValue(),
                             a.Get(1u).As<Napi::Number>().DoubleValue());
     }
   }
-  if (o.Has("position")) L.position = PointFrom(o.Get("position"));
-  if (o.Has("anchorPoint")) L.anchorPoint = PointFrom(o.Get("anchorPoint"));
-  if (o.Has("zPosition")) L.zPosition = NumOr(o, "zPosition", 0);
-  SetColorProp(L, o, "backgroundColor", ^(CGColorRef c) { L.backgroundColor = c; });
-  SetColorProp(L, o, "borderColor", ^(CGColorRef c) { L.borderColor = c; });
-  SetColorProp(L, o, "shadowColor", ^(CGColorRef c) { L.shadowColor = c; });
-  if (o.Has("cornerRadius")) L.cornerRadius = NumOr(o, "cornerRadius", 0);
-  if (o.Has("borderWidth")) L.borderWidth = NumOr(o, "borderWidth", 0);
-  if (o.Has("opacity")) L.opacity = (float)NumOr(o, "opacity", 1);
-  if (o.Has("hidden")) L.hidden = BoolOr(o, "hidden", false);
-  if (o.Has("masksToBounds")) L.masksToBounds = BoolOr(o, "masksToBounds", false);
-  if (o.Has("shadowOpacity")) L.shadowOpacity = (float)NumOr(o, "shadowOpacity", 0);
-  if (o.Has("shadowRadius")) L.shadowRadius = NumOr(o, "shadowRadius", 3);
-  if (o.Has("shadowOffset")) {
+  if (o.Has("position")) {
+    s.hasPosition = true;
+    s.position = PointFrom(o.Get("position"));
+  }
+  if (o.Has("anchorPoint")) {
+    s.hasAnchor = true;
+    s.anchor = PointFrom(o.Get("anchorPoint"));
+  }
+  if (o.Has("zPosition")) {
+    s.hasZ = true;
+    s.z = NumOr(o, "zPosition", 0);
+  }
+  s.background = ColorPropOf(o, "backgroundColor");
+  s.border = ColorPropOf(o, "borderColor");
+  s.shadow = ColorPropOf(o, "shadowColor");
+  if ((s.hasCorner = o.Has("cornerRadius"))) s.corner = NumOr(o, "cornerRadius", 0);
+  if ((s.hasBorderWidth = o.Has("borderWidth"))) s.borderWidth = NumOr(o, "borderWidth", 0);
+  if ((s.hasOpacity = o.Has("opacity"))) s.opacity = (float)NumOr(o, "opacity", 1);
+  if ((s.hasHidden = o.Has("hidden"))) s.hidden = BoolOr(o, "hidden", false);
+  if ((s.hasMasks = o.Has("masksToBounds"))) s.masks = BoolOr(o, "masksToBounds", false);
+  if ((s.hasShadowOpacity = o.Has("shadowOpacity")))
+    s.shadowOpacity = (float)NumOr(o, "shadowOpacity", 0);
+  if ((s.hasShadowRadius = o.Has("shadowRadius"))) s.shadowRadius = NumOr(o, "shadowRadius", 3);
+  if ((s.hasShadowOffset = o.Has("shadowOffset"))) {
     CGPoint p = PointFrom(o.Get("shadowOffset"));
-    L.shadowOffset = CGSizeMake(p.x, p.y);
+    s.shadowOffset = CGSizeMake(p.x, p.y);
   }
-  if (o.Has("contentsScale")) L.contentsScale = NumOr(o, "contentsScale", 1);
-  if (o.Has("name")) L.name = ToNSString(o.Get("name"));
-  if (o.Has("mask")) {
+  if ((s.hasContentsScale = o.Has("contentsScale")))
+    s.contentsScale = NumOr(o, "contentsScale", 1);
+  if ((s.hasName = o.Has("name"))) s.name = ToNSString(o.Get("name"));
+  if ((s.hasMask = o.Has("mask"))) {
     Napi::Value v = o.Get("mask");
-    L.mask = (v.IsNull() || v.IsUndefined()) ? nil : Deref<CALayer*>(v);
+    s.mask = (v.IsNull() || v.IsUndefined()) ? nil : CALHandleTarget(v);
   }
-  if (o.Has("transform")) ApplyTransform(L, o.Get("transform"));
-  if (o.Has("contents")) {
-    Napi::Value v = o.Get("contents");
-    if (v.IsNull()) L.contents = nil;
+  if ((s.hasTransform = o.Has("transform"))) s.transform = TransformFrom(o.Get("transform"));
+  if (o.Has("contents")) s.clearContents = o.Get("contents").IsNull();
+  return s;
+}
+
+// On the UI thread, in the order the keys have always been applied.
+static void ApplyLayerProps(CALayer* L, const LayerPropsSpec& s) {
+  if (s.hasFrame) L.frame = s.frame;
+  if (s.hasBounds) L.bounds = s.bounds;
+  if (s.hasPosition) L.position = s.position;
+  if (s.hasAnchor) L.anchorPoint = s.anchor;
+  if (s.hasZ) L.zPosition = s.z;
+  if (s.background.given) L.backgroundColor = ColorOf(s.background);
+  if (s.border.given) L.borderColor = ColorOf(s.border);
+  if (s.shadow.given) L.shadowColor = ColorOf(s.shadow);
+  if (s.hasCorner) L.cornerRadius = s.corner;
+  if (s.hasBorderWidth) L.borderWidth = s.borderWidth;
+  if (s.hasOpacity) L.opacity = s.opacity;
+  if (s.hasHidden) L.hidden = s.hidden;
+  if (s.hasMasks) L.masksToBounds = s.masks;
+  if (s.hasShadowOpacity) L.shadowOpacity = s.shadowOpacity;
+  if (s.hasShadowRadius) L.shadowRadius = s.shadowRadius;
+  if (s.hasShadowOffset) L.shadowOffset = s.shadowOffset;
+  if (s.hasContentsScale) L.contentsScale = s.contentsScale;
+  if (s.hasName) L.name = s.name;
+  if (s.hasMask) L.mask = s.mask ? CALResolve(s.mask) : nil;
+  if (s.hasTransform) L.transform = s.transform;
+  if (s.clearContents) {
+    CALNoteContentsReplaced(L, nil);
+    L.contents = nil;
   }
 }
 
 static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
-  CALayer* L = Deref<CALayer*>(info[0]);
-  ApplyLayerProps(L, info[1].As<Napi::Object>());
+  id target = CALHandleTarget(info[0]);
+  LayerPropsSpec s = ParseLayerProps(info[1].As<Napi::Object>());
+  CALOnLayers(^{
+    CALayer* L = CALResolve(target);
+    if (L) ApplyLayerProps(L, s);
+  });
   return info.Env().Undefined();
 }
 
@@ -466,33 +634,42 @@ static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 static Napi::Value SetTextProps(const Napi::CallbackInfo& info) {
-  CATextLayer* T = (CATextLayer*)Deref<CALayer*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   Napi::Object o = info[1].As<Napi::Object>();
-  if (o.Has("fontSize")) T.fontSize = NumOr(o, "fontSize", 14);
-  if (o.Has("fontName")) {
-    NSString* name = ToNSString(o.Get("fontName"));
-    CTFontRef f = CTFontCreateWithName((__bridge CFStringRef)name,
-                                       T.fontSize > 0 ? T.fontSize : 14, NULL);
-    T.font = f;
-    CFRelease(f);
-  }
-  if (o.Has("string")) T.string = ToNSString(o.Get("string"));
-  SetColorProp(T, o, "color", ^(CGColorRef c) { T.foregroundColor = c; });
-  if (o.Has("align")) {
-    NSString* a = ToNSString(o.Get("align"));
-    if ([a isEqualToString:@"center"]) T.alignmentMode = kCAAlignmentCenter;
-    else if ([a isEqualToString:@"right"]) T.alignmentMode = kCAAlignmentRight;
-    else if ([a isEqualToString:@"justified"]) T.alignmentMode = kCAAlignmentJustified;
-    else T.alignmentMode = kCAAlignmentLeft;
-  }
-  if (o.Has("wrapped")) T.wrapped = BoolOr(o, "wrapped", false);
-  if (o.Has("truncation")) {
-    NSString* t = ToNSString(o.Get("truncation"));
-    if ([t isEqualToString:@"start"]) T.truncationMode = kCATruncationStart;
-    else if ([t isEqualToString:@"end"]) T.truncationMode = kCATruncationEnd;
-    else if ([t isEqualToString:@"middle"]) T.truncationMode = kCATruncationMiddle;
-    else T.truncationMode = kCATruncationNone;
-  }
+  bool hasSize = o.Has("fontSize");
+  double size = NumOr(o, "fontSize", 14);
+  NSString* fontName = o.Has("fontName") ? ToNSString(o.Get("fontName")) : nil;
+  NSString* string = o.Has("string") ? ToNSString(o.Get("string")) : nil;
+  ColorProp color = ColorPropOf(o, "color");
+  NSString* align = o.Has("align") ? ToNSString(o.Get("align")) : nil;
+  int wrapped = o.Has("wrapped") ? (int)BoolOr(o, "wrapped", false) : -1;
+  NSString* truncation = o.Has("truncation") ? ToNSString(o.Get("truncation")) : nil;
+  CALOnLayers(^{
+    CATextLayer* T = (CATextLayer*)CALResolve(target);
+    if (!T) return;
+    if (hasSize) T.fontSize = size;
+    if (fontName) {
+      CTFontRef f = CTFontCreateWithName((__bridge CFStringRef)fontName,
+                                         T.fontSize > 0 ? T.fontSize : 14, NULL);
+      T.font = f;
+      CFRelease(f);
+    }
+    if (string) T.string = string;
+    if (color.given) T.foregroundColor = ColorOf(color);
+    if (align) {
+      if ([align isEqualToString:@"center"]) T.alignmentMode = kCAAlignmentCenter;
+      else if ([align isEqualToString:@"right"]) T.alignmentMode = kCAAlignmentRight;
+      else if ([align isEqualToString:@"justified"]) T.alignmentMode = kCAAlignmentJustified;
+      else T.alignmentMode = kCAAlignmentLeft;
+    }
+    if (wrapped >= 0) T.wrapped = wrapped;
+    if (truncation) {
+      if ([truncation isEqualToString:@"start"]) T.truncationMode = kCATruncationStart;
+      else if ([truncation isEqualToString:@"end"]) T.truncationMode = kCATruncationEnd;
+      else if ([truncation isEqualToString:@"middle"]) T.truncationMode = kCATruncationMiddle;
+      else T.truncationMode = kCATruncationNone;
+    }
+  });
   return info.Env().Undefined();
 }
 
@@ -501,32 +678,41 @@ static Napi::Value SetTextProps(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 static Napi::Value SetGradientProps(const Napi::CallbackInfo& info) {
-  CAGradientLayer* G = (CAGradientLayer*)Deref<CALayer*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   Napi::Object o = info[1].As<Napi::Object>();
+  NSMutableArray* colors = nil;
   if (o.Has("colors")) {
     Napi::Array arr = o.Get("colors").As<Napi::Array>();
-    NSMutableArray* colors = [NSMutableArray arrayWithCapacity:arr.Length()];
+    colors = [NSMutableArray arrayWithCapacity:arr.Length()];
     for (uint32_t i = 0; i < arr.Length(); i++) {
       [colors addObject:CFBridgingRelease(MakeColor(arr.Get(i)))];
     }
-    G.colors = colors;
   }
+  NSMutableArray* locs = nil;
   if (o.Has("locations")) {
     Napi::Array arr = o.Get("locations").As<Napi::Array>();
-    NSMutableArray* locs = [NSMutableArray arrayWithCapacity:arr.Length()];
+    locs = [NSMutableArray arrayWithCapacity:arr.Length()];
     for (uint32_t i = 0; i < arr.Length(); i++) {
       [locs addObject:@(arr.Get(i).As<Napi::Number>().DoubleValue())];
     }
-    G.locations = locs;
   }
-  if (o.Has("startPoint")) G.startPoint = PointFrom(o.Get("startPoint"));
-  if (o.Has("endPoint")) G.endPoint = PointFrom(o.Get("endPoint"));
-  if (o.Has("type")) {
-    NSString* t = ToNSString(o.Get("type"));
-    if ([t isEqualToString:@"radial"]) G.type = kCAGradientLayerRadial;
-    else if ([t isEqualToString:@"conic"]) G.type = kCAGradientLayerConic;
-    else G.type = kCAGradientLayerAxial;
-  }
+  bool hasStart = o.Has("startPoint"), hasEnd = o.Has("endPoint");
+  CGPoint start = hasStart ? PointFrom(o.Get("startPoint")) : CGPointZero;
+  CGPoint end = hasEnd ? PointFrom(o.Get("endPoint")) : CGPointZero;
+  NSString* type = o.Has("type") ? ToNSString(o.Get("type")) : nil;
+  CALOnLayers(^{
+    CAGradientLayer* G = (CAGradientLayer*)CALResolve(target);
+    if (!G) return;
+    if (colors) G.colors = colors;
+    if (locs) G.locations = locs;
+    if (hasStart) G.startPoint = start;
+    if (hasEnd) G.endPoint = end;
+    if (type) {
+      if ([type isEqualToString:@"radial"]) G.type = kCAGradientLayerRadial;
+      else if ([type isEqualToString:@"conic"]) G.type = kCAGradientLayerConic;
+      else G.type = kCAGradientLayerAxial;
+    }
+  });
   return info.Env().Undefined();
 }
 
@@ -555,35 +741,43 @@ static CGPathRef BuildPath(Napi::Array ops) {
 }
 
 static Napi::Value SetShapeProps(const Napi::CallbackInfo& info) {
-  CAShapeLayer* S = (CAShapeLayer*)Deref<CALayer*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   Napi::Object o = info[1].As<Napi::Object>();
-  if (o.Has("path")) {
-    CGPathRef p = BuildPath(o.Get("path").As<Napi::Array>());
-    S.path = p;
-    CGPathRelease(p);
-  }
-  SetColorProp(S, o, "fillColor", ^(CGColorRef c) { S.fillColor = c; });
-  SetColorProp(S, o, "strokeColor", ^(CGColorRef c) { S.strokeColor = c; });
-  if (o.Has("lineWidth")) S.lineWidth = NumOr(o, "lineWidth", 1);
-  if (o.Has("strokeStart")) S.strokeStart = NumOr(o, "strokeStart", 0);
-  if (o.Has("strokeEnd")) S.strokeEnd = NumOr(o, "strokeEnd", 1);
-  if (o.Has("lineCap")) {
-    NSString* c = ToNSString(o.Get("lineCap"));
-    if ([c isEqualToString:@"round"]) S.lineCap = kCALineCapRound;
-    else if ([c isEqualToString:@"square"]) S.lineCap = kCALineCapSquare;
-    else S.lineCap = kCALineCapButt;
-  }
+  // a CGPath is immutable once built, so the one made here is the one set
+  id path = o.Has("path") ? CFBridgingRelease(BuildPath(o.Get("path").As<Napi::Array>())) : nil;
+  bool hasPath = o.Has("path");
+  ColorProp fill = ColorPropOf(o, "fillColor"), stroke = ColorPropOf(o, "strokeColor");
+  bool hasWidth = o.Has("lineWidth"), hasStart = o.Has("strokeStart"), hasEnd = o.Has("strokeEnd");
+  double width = NumOr(o, "lineWidth", 1), start = NumOr(o, "strokeStart", 0),
+         end = NumOr(o, "strokeEnd", 1);
+  NSString* cap = o.Has("lineCap") ? ToNSString(o.Get("lineCap")) : nil;
+  NSMutableArray* dash = nil;
   if (o.Has("lineDashPattern")) {
     Napi::Array arr = o.Get("lineDashPattern").As<Napi::Array>();
-    NSMutableArray* d = [NSMutableArray arrayWithCapacity:arr.Length()];
+    dash = [NSMutableArray arrayWithCapacity:arr.Length()];
     for (uint32_t i = 0; i < arr.Length(); i++)
-      [d addObject:@(arr.Get(i).As<Napi::Number>().DoubleValue())];
-    S.lineDashPattern = d;
+      [dash addObject:@(arr.Get(i).As<Napi::Number>().DoubleValue())];
   }
-  if (o.Has("fillRule")) {
-    S.fillRule = [ToNSString(o.Get("fillRule")) isEqualToString:@"evenodd"]
-                     ? kCAFillRuleEvenOdd : kCAFillRuleNonZero;
-  }
+  int evenOdd = o.Has("fillRule")
+                    ? (int)[ToNSString(o.Get("fillRule")) isEqualToString:@"evenodd"]
+                    : -1;
+  CALOnLayers(^{
+    CAShapeLayer* S = (CAShapeLayer*)CALResolve(target);
+    if (!S) return;
+    if (hasPath) S.path = (__bridge CGPathRef)path;
+    if (fill.given) S.fillColor = ColorOf(fill);
+    if (stroke.given) S.strokeColor = ColorOf(stroke);
+    if (hasWidth) S.lineWidth = width;
+    if (hasStart) S.strokeStart = start;
+    if (hasEnd) S.strokeEnd = end;
+    if (cap) {
+      if ([cap isEqualToString:@"round"]) S.lineCap = kCALineCapRound;
+      else if ([cap isEqualToString:@"square"]) S.lineCap = kCALineCapSquare;
+      else S.lineCap = kCALineCapButt;
+    }
+    if (dash) S.lineDashPattern = dash;
+    if (evenOdd >= 0) S.fillRule = evenOdd ? kCAFillRuleEvenOdd : kCAFillRuleNonZero;
+  });
   return info.Env().Undefined();
 }
 
@@ -701,8 +895,10 @@ static CAMediaTimingFunction* TimingFrom(Napi::Env env, Napi::Value v) {
 // What every animation kind shares: repetition, the curve, additive, a
 // delay, speed/timeOffset, hold, and the completion delegate. false with a
 // TypeError pending.
-static bool ApplyTiming(Napi::Env env, CAPropertyAnimation* a, CALayer* L, Napi::Object o,
-                        NSString* key) {
+// *delay: the delay asked for, whose begin time is set as the animation is
+// added (on the UI thread, in the layer's own time).
+static bool ApplyTiming(Napi::Env env, CAPropertyAnimation* a, Napi::Object o,
+                        NSString* key, double* delayOut) {
   double rep = NumOr(o, "repeat", 0);
   if (rep > 0) a.repeatCount = std::isinf(rep) ? HUGE_VALF : (float)rep;
   a.autoreverses = BoolOr(o, "autoreverse", false);
@@ -723,11 +919,9 @@ static bool ApplyTiming(Napi::Env env, CAPropertyAnimation* a, CALayer* L, Napi:
   if (o.Has("timeOffset")) a.timeOffset = NumOr(o, "timeOffset", 0);
   bool hold = BoolOr(o, "hold", false);
   double delay = NumOr(o, "delay", 0);
+  *delayOut = delay;
   if (delay > 0) {
-    // in the layer's own time — the media time unless the layer itself has
-    // been slowed or offset
-    a.beginTime = [L convertTime:CACurrentMediaTime() fromLayer:nil] + delay;
-    // and the layer shows `from` while it waits, rather than the model value
+    // the layer shows `from` while it waits, rather than the model value
     // it is about to leave and then snap back from
     a.fillMode = hold ? kCAFillModeBoth : kCAFillModeBackwards;
   }
@@ -773,9 +967,13 @@ static bool ReadFromTo(Napi::Env env, CABasicAnimation* a, Napi::Object o) {
 // points), additive, cumulative, delay, speed, timeOffset, hold, and id —
 // with an id the animation reports its end as an `animation-end` backend
 // event { id, key, keyPath, finished }.
+//
+// The animation object is built in the call, on whichever thread (a plain
+// model object; the validation throws there), and added where layers are
+// touched — in the call on the main thread, with the frame from a worker.
 static Napi::Value AddAnimation(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  CALayer* L = Deref<CALayer*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   NSString* keyPath = ToNSString(info[1]);
   Napi::Object o = info[2].As<Napi::Object>();
   NSString* key = info.Length() > 3 && info[3].IsString() ? ToNSString(info[3]) : keyPath;
@@ -886,20 +1084,30 @@ static Napi::Value AddAnimation(const Napi::CallbackInfo& info) {
     b.duration = NumOr(o, "duration", 0.25);
     a = b;
   }
-  if (!ApplyTiming(env, a, L, o, key)) return env.Undefined();
-  [L addAnimation:a forKey:key];
-  return Napi::Number::New(env, a.duration);
+  double delay = 0;
+  if (!ApplyTiming(env, a, o, key, &delay)) return env.Undefined();
+  double duration = a.duration;
+  CALOnLayers(^{
+    CALayer* L = CALResolve(target);
+    if (!L) return;
+    // in the layer's own time — the media time unless the layer itself has
+    // been slowed or offset
+    if (delay > 0) a.beginTime = [L convertTime:CACurrentMediaTime() fromLayer:nil] + delay;
+    [L addAnimation:a forKey:key];
+  });
+  return Napi::Number::New(env, duration);
 }
 
 static Napi::Value RemoveAnimation(const Napi::CallbackInfo& info) {
-  CALayer* L = Deref<CALayer*>(info[0]);
-  [L removeAnimationForKey:ToNSString(info[1])];
+  id target = CALHandleTarget(info[0]);
+  NSString* key = ToNSString(info[1]);
+  CALOnLayers(^{ [(CALayer*)CALResolve(target) removeAnimationForKey:key]; });
   return info.Env().Undefined();
 }
 
 static Napi::Value RemoveAllAnimations(const Napi::CallbackInfo& info) {
-  CALayer* L = Deref<CALayer*>(info[0]);
-  [L removeAllAnimations];
+  id target = CALHandleTarget(info[0]);
+  CALOnLayers(^{ [(CALayer*)CALResolve(target) removeAllAnimations]; });
   return info.Env().Undefined();
 }
 
@@ -962,22 +1170,32 @@ static Napi::Value JSFromCAValue(Napi::Env env, id v) {
 // showing for that key path right now, animations applied — or null before
 // the layer's first commit. The model value is what the caller set; this is
 // where the pixels are, which is the `from` an interrupted colour animation
-// needs and the number a test reads a curve back through.
+// needs and the number a test reads a curve back through. From a worker,
+// presentationValue(layer, keyPath, cb): the render server's state is read
+// on the UI thread.
 static Napi::Value PresentationValue(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  CALayer* L = Deref<CALayer*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   NSString* keyPath = ToNSString(info[1]);
-  CALayer* p = L.presentationLayer;
-  if (!p) return env.Null();
-  id v = nil;
-  @try {
-    v = [p valueForKeyPath:keyPath];
-  } @catch (NSException* e) {
-    return env.Null();
-  }
-  return JSFromCAValue(env, v);
+  return CALAnswer(info, "presentationValue", ^CALValueBlock {
+    CALayer* p = ((CALayer*)CALResolve(target)).presentationLayer;
+    id v = nil;
+    if (p) {
+      @try {
+        v = [p valueForKeyPath:keyPath];
+      } @catch (NSException* e) {
+        v = nil;
+      }
+    }
+    // an NSNumber, an NSValue or a CGColor: immutable, made into JS on the
+    // caller's thread
+    return ^Napi::Value(Napi::Env e) { return JSFromCAValue(e, v); };
+  });
 }
 
+// txBegin(opts?) / txCommit(). On the main thread a Core Animation
+// transaction, as always. From a worker the frame batch: txBegin opens it
+// (or nests inside it), and the txCommit that closes the outermost one
+// posts the whole batch as one command.
 static Napi::Value TxBegin(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CAMediaTimingFunction* timing = nil;
@@ -992,18 +1210,50 @@ static Napi::Value TxBegin(const Napi::CallbackInfo& info) {
       if (!timing) return env.Undefined();
     }
   }
-  [CATransaction begin];
+  bool hasDuration = false, disable = false;
+  double duration = 0.25;
   if (info.Length() > 0 && info[0].IsObject()) {
     Napi::Object o = info[0].As<Napi::Object>();
-    if (o.Has("duration")) [CATransaction setAnimationDuration:NumOr(o, "duration", 0.25)];
-    if (BoolOr(o, "disableActions", false)) [CATransaction setDisableActions:YES];
-    if (hasTiming) [CATransaction setAnimationTimingFunction:timing];
+    hasDuration = o.Has("duration");
+    duration = NumOr(o, "duration", 0.25);
+    disable = BoolOr(o, "disableActions", false);
   }
+  if (pthread_main_np()) {
+    [CATransaction begin];
+    if (hasDuration) [CATransaction setAnimationDuration:duration];
+    if (disable) [CATransaction setDisableActions:YES];
+    if (hasTiming) [CATransaction setAnimationTimingFunction:timing];
+    return env.Undefined();
+  }
+  // Recorded with its options stated in full: it applies inside the drain's
+  // own transaction, whose actions are off, and a frame that did not ask
+  // for that has them on, as in pump mode.
+  tlFrame.depth++;
+  tlFrame.ops.push_back(^{
+    [CATransaction begin];
+    [CATransaction setDisableActions:disable];
+    if (hasDuration) [CATransaction setAnimationDuration:duration];
+    if (hasTiming) [CATransaction setAnimationTimingFunction:timing];
+  });
   return env.Undefined();
 }
 
 static Napi::Value TxCommit(const Napi::CallbackInfo& info) {
-  [CATransaction commit];
+  if (pthread_main_np()) {
+    [CATransaction commit];
+    return info.Env().Undefined();
+  }
+  if (tlFrame.depth == 0) return info.Env().Undefined();  // nothing open
+  tlFrame.ops.push_back(^{ [CATransaction commit]; });
+  if (--tlFrame.depth > 0) return info.Env().Undefined();
+  std::vector<dispatch_block_t> ops = std::move(tlFrame.ops);
+  tlFrame.ops.clear();
+  CALOnUI(^{
+    gApplyingWorkerFrame = true;
+    for (dispatch_block_t op : ops) RunLayerOp(op);
+    gApplyingWorkerFrame = false;
+    FlushReleasedSurfaces();
+  });
   return info.Env().Undefined();
 }
 
@@ -1110,11 +1360,17 @@ static Napi::Value CreateTextImage(const Napi::CallbackInfo& info) {
 
 // setContentsImage(layer, imageExternal, contentsScale?)
 static Napi::Value SetContentsImage(const Napi::CallbackInfo& info) {
-  CALayer* L = Deref<CALayer*>(info[0]);
-  CGImageRef img = (CGImageRef)info[1].As<Napi::External<void>>().Data();
-  L.contents = (__bridge id)img;
-  if (info.Length() > 2 && info[2].IsNumber())
-    L.contentsScale = info[2].As<Napi::Number>().DoubleValue();
+  id target = CALHandleTarget(info[0]);
+  id img = (__bridge id)(CGImageRef)info[1].As<Napi::External<void>>().Data();
+  bool hasScale = info.Length() > 2 && info[2].IsNumber();
+  double scale = hasScale ? info[2].As<Napi::Number>().DoubleValue() : 1;
+  CALOnLayers(^{
+    CALayer* L = CALResolve(target);
+    if (!L) return;
+    CALNoteContentsReplaced(L, img);
+    L.contents = img;
+    if (hasScale) L.contentsScale = scale;
+  });
   return info.Env().Undefined();
 }
 
@@ -1261,10 +1517,13 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
 // setLayerContentsIOSurface(layer, iosurfaceId) — the receiving end of an
 // IOSurface render target (x11-dri's appleCreateTarget): the id is process-
 // global, so the GPU addon and this one never share a pointer. The layer
-// retains the surface; our lookup reference is dropped immediately.
+// retains the surface; our lookup reference goes with the change. From a
+// worker the flip happens when the frame applies, so the renderer may not
+// draw into the buffer it replaced until `surface-released` names it (or
+// surfaceIsInUse says it is off glass).
 static Napi::Value SetLayerContentsIOSurface(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  CALayer* L = Deref<CALayer*>(info[0]);
+  id target = CALHandleTarget(info[0]);
   uint32_t sid = info[1].As<Napi::Number>().Uint32Value();
   IOSurfaceRef surface = IOSurfaceLookup(sid);
   if (!surface) {
@@ -1272,13 +1531,18 @@ static Napi::Value SetLayerContentsIOSurface(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  // its own transaction, actions off: a present is a buffer flip, and the
-  // implicit action for `contents` would turn it into a crossfade
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  L.contents = (__bridge id)surface;
-  [CATransaction commit];
-  CFRelease(surface);
+  id s = CFBridgingRelease(surface);  // held until the change has been made
+  CALOnLayers(^{
+    CALayer* L = CALResolve(target);
+    if (!L) return;
+    // its own transaction, actions off: a present is a buffer flip, and the
+    // implicit action for `contents` would turn it into a crossfade
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    CALNoteContentsReplaced(L, s);
+    L.contents = s;
+    [CATransaction commit];
+  });
   return env.Undefined();
 }
 

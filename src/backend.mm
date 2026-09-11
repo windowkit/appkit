@@ -3926,18 +3926,37 @@ static Napi::Value CtxGetImageData(const Napi::CallbackInfo& info) {
 
 // surfaceToLayer(surface, layer) — hand the bitmap to a layer as contents.
 // CGBitmapContextCreateImage is copy-on-write, so this is cheap per frame.
+// The image is taken in the call, on the thread that paints the surface, so
+// what a worker's frame shows is the bitmap as it was then, whatever is
+// drawn into it before the frame applies.
 static Napi::Value SurfaceToLayer(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
   if (!s) return info.Env().Undefined();
-  CALayer* L = BDeref<CALayer*>(info[1]);
-  CGImageRef img = CGBitmapContextCreateImage(s->ctx);
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  L.contents = (__bridge id)img;
-  L.contentsScale = s->scale;
-  [CATransaction commit];
-  CGImageRelease(img);
+  id target = CALHandleTarget(info[1]);
+  id img = CFBridgingRelease(CGBitmapContextCreateImage(s->ctx));
+  double scale = s->scale;
+  CALOnLayers(^{
+    CALayer* L = CALResolve(target);
+    if (!L) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    CALNoteContentsReplaced(L, img);
+    L.contents = img;
+    L.contentsScale = scale;
+    [CATransaction commit];
+  });
   return info.Env().Undefined();
+}
+
+// surfaceIsInUse(surface) -> bool — whether anything (the render server
+// scanning it out, most often) still reads an IOSurface-backed surface:
+// IOSurfaceIsInUse, which is thread-safe, so a worker's renderer can poll
+// it before drawing into a buffer it handed a layer. False for a surface
+// that is not IOSurface-backed.
+static Napi::Value SurfaceIsInUse(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
+  return Napi::Boolean::New(info.Env(), s->iosurface && IOSurfaceIsInUse(s->iosurface));
 }
 
 // scrollSurface(surface, x, y, w, h, dx, dy) — scroll the pixels WITHIN
@@ -6190,6 +6209,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("copySurfaceRegion", CopySurfaceRegion);
   BFN("blitSurface", BlitSurface);
   BFN("surfaceSize", SurfaceSize);
+  BFN("surfaceIsInUse", SurfaceIsInUse);
   BFN("ctxSave", CtxSave);
   BFN("ctxRestore", CtxRestore);
   BFN("ctxTranslate", CtxTranslate);

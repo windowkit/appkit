@@ -194,7 +194,8 @@ void CALNotificationsReplayHeld() {
 }
 
 static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev) {
-  if ((napi_env)env == nullptr) {  // the function is being torn down
+  // the function is being torn down, or the environment is (channel.h)
+  if ((napi_env)env == nullptr || !CALCanCallIntoJS(env)) {
     delete ev;
     return;
   }
@@ -414,7 +415,10 @@ static Napi::Value NotificationSettings(const Napi::CallbackInfo& info) {
   if (!gCenter) {
     tsfn.BlockingCall((void*)nullptr,
                       [](Napi::Env env, Napi::Function cb, void*) {
-                        cb.Call({UnavailableObject(env)});
+                        // an environment on its way out gets no answer
+                        // (channel.h)
+                        if (!CALCanCallIntoJS(env)) return;
+                        CALCallJS(env, cb, {UnavailableObject(env)});
                       });
     tsfn.Release();
     return env.Undefined();
@@ -424,7 +428,9 @@ static Napi::Value NotificationSettings(const Napi::CallbackInfo& info) {
     void* p = (void*)CFBridgingRetain(s);
     tsfn.BlockingCall(p, [](Napi::Env env, Napi::Function cb, void* p) {
       UNNotificationSettings* s = CFBridgingRelease(p);
-      cb.Call({SettingsObject(env, s)});
+      // an environment on its way out gets no answer (channel.h)
+      if (!CALCanCallIntoJS(env)) return;
+      CALCallJS(env, cb, {SettingsObject(env, s)});
     });
     tsfn.Release();
   }];
@@ -503,8 +509,16 @@ static Napi::Value RequestNotificationAuthorization(
                                 if (out->ok && gCenter && gCategories) {
                                   [gCenter setNotificationCategories:gCategories];
                                 }
-                                cb.Call({Napi::Boolean::New(env, out->ok),
-                                         ErrorValue(env, out->error)});
+                                // an environment on its way out gets no
+                                // answer (channel.h); the categories are the
+                                // process's, re-applied either way
+                                if (!CALCanCallIntoJS(env)) {
+                                  delete out;
+                                  return;
+                                }
+                                CALCallJS(env, cb,
+                                          {Napi::Boolean::New(env, out->ok),
+                                           ErrorValue(env, out->error)});
                                 delete out;
                               });
                           tsfn.Release();
@@ -644,10 +658,12 @@ static Napi::Value NotificationCategories(const Napi::CallbackInfo& info) {
     void* p = (void*)CFBridgingRetain(cats);
     tsfn.BlockingCall(p, [](Napi::Env env, Napi::Function cb, void* p) {
       NSSet<UNNotificationCategory*>* cats = CFBridgingRelease(p);
+      // an environment on its way out gets no answer (channel.h)
+      if (!CALCanCallIntoJS(env)) return;
       Napi::Array out = Napi::Array::New(env);
       uint32_t n = 0;
       for (UNNotificationCategory* c in cats) out.Set(n++, CategoryObject(env, c));
-      cb.Call({out});
+      CALCallJS(env, cb, {out});
     });
     tsfn.Release();
   }];
@@ -750,7 +766,13 @@ static Napi::Value Post(const Napi::CallbackInfo& info, size_t propsAt,
                  Outcome* out = new Outcome{error == nil, error};
                  tsfn.BlockingCall(
                      out, [](Napi::Env env, Napi::Function cb, Outcome* out) {
-                       cb.Call({ErrorValue(env, out->error)});
+                       // an environment on its way out gets no answer
+                       // (channel.h)
+                       if (!CALCanCallIntoJS(env)) {
+                         delete out;
+                         return;
+                       }
+                       CALCallJS(env, cb, {ErrorValue(env, out->error)});
                        delete out;
                      });
                  tsfn.Release();
@@ -824,6 +846,8 @@ static Napi::Value DeliveredNotifications(const Napi::CallbackInfo& info) {
     void* p = (void*)CFBridgingRetain(list);
     tsfn.BlockingCall(p, [](Napi::Env env, Napi::Function cb, void* p) {
       NSArray<UNNotification*>* list = CFBridgingRelease(p);
+      // an environment on its way out gets no answer (channel.h)
+      if (!CALCanCallIntoJS(env)) return;
       Napi::Array out = Napi::Array::New(env);
       uint32_t n = 0;
       for (UNNotification* note in list) {
@@ -852,7 +876,7 @@ static Napi::Value DeliveredNotifications(const Napi::CallbackInfo& info) {
         o.Set("date", note.date.timeIntervalSince1970 * 1000.0);
         out.Set(n++, o);
       }
-      cb.Call({out});
+      CALCallJS(env, cb, {out});
     });
     tsfn.Release();
   }];

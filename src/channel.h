@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -195,6 +196,20 @@ void CALNoteContentsReplaced(id layer, id next);
 Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
                                     const char* name);
 void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make);
+
+// Whether JS can still be called in `env`. A worker that is ending (an
+// uncaught error, its own process.exit) can still run a threadsafe
+// function's callback from its loop's last spin, and there every property
+// set fails — which node-addon-api, with C++ exceptions off, turns into a
+// fatal error, since it cannot throw either. Every threadsafe function's
+// callback asks first and, told no, frees what it carried and returns.
+bool CALCanCallIntoJS(napi_env env);
+
+// cb(...args) with undefined as this, raw, so a failed call is a status
+// rather than node-addon-api's fatal error. An exception cb throws is left
+// pending: Node reports it as that environment's uncaught exception.
+void CALCallJS(napi_env env, napi_value cb,
+               std::initializer_list<napi_value> args);
 
 // A read of AppKit state, in either mode. Without a callback (the last
 // argument, when it is a function) it answers synchronously — on the main

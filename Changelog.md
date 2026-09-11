@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.0](https://github.com/windowkit/appkit/compare/v0.9.0...v0.10.0) (2026-09-11)
+
+
+### Features
+
+* control bezels from a worker — measureControl / drawControlIntoSurface made on the UI thread, answered through a callback ([#60](https://github.com/windowkit/appkit/issues/60)) ([0b17653](https://github.com/windowkit/appkit/commit/0b176533aa97f2211014ce2511d548cb4ffde838)), closes [#54](https://github.com/windowkit/appkit/issues/54)
+* frames from a worker — a frame's layer changes as one batch applied on the UI thread, layer handles, IOSurface buffers handed back by event ([#58](https://github.com/windowkit/appkit/issues/58)) ([f86ad30](https://github.com/windowkit/appkit/commit/f86ad300f0e2f5a2f544e11f0f894a8ac56bd43b)), closes [#52](https://github.com/windowkit/appkit/issues/52)
+* the activation policy before launch without the app's code — APPKIT_ACTIVATION_POLICY and runMain({ activationPolicy }); the policy published as it is decided ([#67](https://github.com/windowkit/appkit/issues/67)) ([8e41f93](https://github.com/windowkit/appkit/commit/8e41f93cfcc3cdd1483c976e76be45c7a7f9a57e)), closes [#64](https://github.com/windowkit/appkit/issues/64)
+* the AppKit verbs from a worker — handles answered at the call, commands, published reads, callback answers ([#57](https://github.com/windowkit/appkit/issues/57)) ([68fc4a1](https://github.com/windowkit/appkit/commit/68fc4a1403c64a871421da2a9d63aee2db0d60af)), closes [#51](https://github.com/windowkit/appkit/issues/51)
+* the live-resize handshake — a bounded wait for a frame at the new size, applied in the resize's own transaction ([#59](https://github.com/windowkit/appkit/issues/59)) ([1737764](https://github.com/windowkit/appkit/commit/17377646f69cf5af2dc3ef5501ceb604b571bfb0))
+* threaded mode's core — the main thread in a real [NSApp run], commands in through the common modes, events out in batches, published state ([#55](https://github.com/windowkit/appkit/issues/55)) ([d005e55](https://github.com/windowkit/appkit/commit/d005e55ee4df4ba2b4c2dedec0bf9340439af208))
+* window-live-resize begin / end, and liveResize in the published window state ([#66](https://github.com/windowkit/appkit/issues/66)) ([0dc3b69](https://github.com/windowkit/appkit/commit/0dc3b69131616939c86e9cbdd0c3673ebde61f19)), closes [#63](https://github.com/windowkit/appkit/issues/63)
+
+
+### Bug Fixes
+
+* an exception from connect's callback, or any callback the bridge answers through, is the environment's uncaught exception — no longer a dropped warning ([#65](https://github.com/windowkit/appkit/issues/65)) ([f22eb72](https://github.com/windowkit/appkit/commit/f22eb72bf5e1f97d0a0060a2f7a998471ae83e2a)), closes [#62](https://github.com/windowkit/appkit/issues/62)
+* no answer into an environment that is ending, from any threadsafe function — the colour sampler, permissions, calendars, notifications ([#61](https://github.com/windowkit/appkit/issues/61)) ([45eb2dc](https://github.com/windowkit/appkit/commit/45eb2dcdf8e10b58e5e79f05dbc238ad841e107a))
+
 ## [0.9.0](https://github.com/windowkit/appkit/compare/v0.8.0...v0.9.0) (2026-09-10)
 
 

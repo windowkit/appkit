@@ -157,7 +157,10 @@ struct NotifEvent {
 
 static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev);
 using EventTsfn = Napi::TypedThreadSafeFunction<void, NotifEvent, CallJsEvent>;
-static EventTsfn gEvents;
+// Made in the first environment to reach the centre (ProbeCenter) and called
+// from the centre's own thread, so through CALTsfn: once that environment
+// has begun to end, an event is dropped rather than sent into it.
+static CALTsfn gEvents;
 static std::vector<NotifEvent*> gHeld;
 
 static CALEvent EventRecord(const NotifEvent& ev) {
@@ -215,7 +218,10 @@ static void QueueEvent(NotifEvent* ev) {
     delete ev;
     return;
   }
-  if (gEvents.NonBlockingCall(ev) != napi_ok) delete ev;
+  bool queued = gEvents.Use(false, [ev](napi_threadsafe_function f) {
+    return EventTsfn(f).NonBlockingCall(ev);
+  });
+  if (!queued) delete ev;
 }
 
 static void QueueResponse(UNNotificationResponse* r) {
@@ -287,8 +293,9 @@ static UNNotificationCategory* DefaultCategory() {
 static void ProbeCenter(Napi::Env env) {
   if (gProbed) return;
   gProbed = true;
-  gEvents = EventTsfn::New(env, "appkit:notifications", 0, 1);
-  gEvents.Unref(env);  // events never hold the loop open by themselves
+  EventTsfn events = EventTsfn::New(env, "appkit:notifications", 0, 1);
+  events.Unref(env);  // events never hold the loop open by themselves
+  gEvents = CALTsfn::Watch(env, events);
   @autoreleasepool {
     NSBundle* main = NSBundle.mainBundle;
     if (!main.bundleIdentifier) {
@@ -413,29 +420,26 @@ static Napi::Value NotificationSettings(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!CallbackArg(info, 0, "notificationSettings", "(cb)"))
     return env.Undefined();
-  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-      env, info[0].As<Napi::Function>(), "appkit:notificationSettings", 0, 1);
+  CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                              "appkit:notificationSettings");
   if (!gCenter) {
-    tsfn.BlockingCall((void*)nullptr,
-                      [](Napi::Env env, Napi::Function cb, void*) {
-                        // an environment on its way out gets no answer
-                        // (channel.h)
-                        if (!CALCanCallIntoJS(env)) return;
-                        CALCallJS(env, cb, {UnavailableObject(env)});
-                      });
-    tsfn.Release();
+    tsfn.Answer((void*)nullptr, [](Napi::Env env, Napi::Function cb, void*) {
+      // an environment on its way out gets no answer (channel.h)
+      if (!CALCanCallIntoJS(env)) return;
+      CALCallJS(env, cb, {UnavailableObject(env)});
+    });
     return env.Undefined();
   }
   [gCenter getNotificationSettingsWithCompletionHandler:^(
                UNNotificationSettings* s) {
     void* p = (void*)CFBridgingRetain(s);
-    tsfn.BlockingCall(p, [](Napi::Env env, Napi::Function cb, void* p) {
+    bool queued = tsfn.Answer(p, [](Napi::Env env, Napi::Function cb, void* p) {
       UNNotificationSettings* s = CFBridgingRelease(p);
       // an environment on its way out gets no answer (channel.h)
       if (!CALCanCallIntoJS(env)) return;
       CALCallJS(env, cb, {SettingsObject(env, s)});
     });
-    tsfn.Release();
+    if (!queued) CFRelease(p);
   }];
   return env.Undefined();
 }
@@ -500,13 +504,12 @@ static Napi::Value RequestNotificationAuthorization(
   if (!CallbackArg(info, 1, fn, "(options, cb)")) return env.Undefined();
   UNUserNotificationCenter* center = CenterOrThrow(env, fn);
   if (!center) return env.Undefined();
-  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-      env, info[1].As<Napi::Function>(), "appkit:requestNotificationAuthorization",
-      0, 1);
+  CALTsfn tsfn = CALTsfn::New(env, info[1].As<Napi::Function>(),
+                              "appkit:requestNotificationAuthorization");
   [center requestAuthorizationWithOptions:opts
                         completionHandler:^(BOOL granted, NSError* error) {
                           Outcome* out = new Outcome{(bool)granted, error};
-                          tsfn.BlockingCall(
+                          bool queued = tsfn.Answer(
                               out, [](Napi::Env env, Napi::Function cb,
                                       Outcome* out) {
                                 if (out->ok && gCenter && gCategories) {
@@ -524,7 +527,7 @@ static Napi::Value RequestNotificationAuthorization(
                                            ErrorValue(env, out->error)});
                                 delete out;
                               });
-                          tsfn.Release();
+                          if (!queued) delete out;
                         }];
   return env.Undefined();
 }
@@ -654,12 +657,12 @@ static Napi::Value NotificationCategories(const Napi::CallbackInfo& info) {
   if (!CallbackArg(info, 0, fn, "(cb)")) return env.Undefined();
   UNUserNotificationCenter* center = CenterOrThrow(env, fn);
   if (!center) return env.Undefined();
-  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-      env, info[0].As<Napi::Function>(), "appkit:notificationCategories", 0, 1);
+  CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                              "appkit:notificationCategories");
   [center getNotificationCategoriesWithCompletionHandler:^(
               NSSet<UNNotificationCategory*>* cats) {
     void* p = (void*)CFBridgingRetain(cats);
-    tsfn.BlockingCall(p, [](Napi::Env env, Napi::Function cb, void* p) {
+    bool queued = tsfn.Answer(p, [](Napi::Env env, Napi::Function cb, void* p) {
       NSSet<UNNotificationCategory*>* cats = CFBridgingRelease(p);
       // an environment on its way out gets no answer (channel.h)
       if (!CALCanCallIntoJS(env)) return;
@@ -668,7 +671,7 @@ static Napi::Value NotificationCategories(const Napi::CallbackInfo& info) {
       for (UNNotificationCategory* c in cats) out.Set(n++, CategoryObject(env, c));
       CALCallJS(env, cb, {out});
     });
-    tsfn.Release();
+    if (!queued) CFRelease(p);
   }];
   return env.Undefined();
 }
@@ -761,13 +764,12 @@ static Napi::Value Post(const Napi::CallbackInfo& info, size_t propsAt,
     if (!hasCb) {
       [center addNotificationRequest:req withCompletionHandler:nil];
     } else {
-      Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-          env, info[cbAt].As<Napi::Function>(), "appkit:postNotification", 0,
-          1);
+      CALTsfn tsfn = CALTsfn::New(env, info[cbAt].As<Napi::Function>(),
+                                  "appkit:postNotification");
       [center addNotificationRequest:req
                withCompletionHandler:^(NSError* error) {
                  Outcome* out = new Outcome{error == nil, error};
-                 tsfn.BlockingCall(
+                 bool queued = tsfn.Answer(
                      out, [](Napi::Env env, Napi::Function cb, Outcome* out) {
                        // an environment on its way out gets no answer
                        // (channel.h)
@@ -778,7 +780,7 @@ static Napi::Value Post(const Napi::CallbackInfo& info, size_t propsAt,
                        CALCallJS(env, cb, {ErrorValue(env, out->error)});
                        delete out;
                      });
-                 tsfn.Release();
+                 if (!queued) delete out;
                }];
     }
     return Napi::String::New(env, req.identifier.UTF8String);
@@ -842,12 +844,12 @@ static Napi::Value DeliveredNotifications(const Napi::CallbackInfo& info) {
   if (!CallbackArg(info, 0, fn, "(cb)")) return env.Undefined();
   UNUserNotificationCenter* center = CenterOrThrow(env, fn);
   if (!center) return env.Undefined();
-  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-      env, info[0].As<Napi::Function>(), "appkit:deliveredNotifications", 0, 1);
+  CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                              "appkit:deliveredNotifications");
   [center getDeliveredNotificationsWithCompletionHandler:^(
               NSArray<UNNotification*>* list) {
     void* p = (void*)CFBridgingRetain(list);
-    tsfn.BlockingCall(p, [](Napi::Env env, Napi::Function cb, void* p) {
+    bool queued = tsfn.Answer(p, [](Napi::Env env, Napi::Function cb, void* p) {
       NSArray<UNNotification*>* list = CFBridgingRelease(p);
       // an environment on its way out gets no answer (channel.h)
       if (!CALCanCallIntoJS(env)) return;
@@ -881,7 +883,7 @@ static Napi::Value DeliveredNotifications(const Napi::CallbackInfo& info) {
       }
       CALCallJS(env, cb, {out});
     });
-    tsfn.Release();
+    if (!queued) CFRelease(p);
   }];
   return env.Undefined();
 }

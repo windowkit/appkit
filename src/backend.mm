@@ -3120,7 +3120,7 @@ static Napi::Value AppInfoFn(const Napi::CallbackInfo& info) {
   napi_env env_;
   Napi::FunctionReference cb_;
   bool threaded_;
-  Napi::ThreadSafeFunction tsfn_;
+  CALTsfn tsfn_;
   bool open_;   // NSOpenPanel answers paths[], NSSavePanel answers a path
   bool modal_;  // app-modal (runModal) rather than a sheet
 }
@@ -3310,7 +3310,7 @@ static Napi::Value PresentPanel(const Napi::CallbackInfo& info, bool open) {
   // answer through a threadsafe function in this environment.
   CALHandle* h = CALNewHandle();
   Napi::Value handle = CALWrapHandle(env, h, false);
-  Napi::ThreadSafeFunction tsfn = CALReplyTo(
+  CALTsfn tsfn = CALReplyTo(
       env, info[1].As<Napi::Function>(), open ? "appkit:openPanel" : "appkit:savePanel");
   dispatch_block_t present = ^{
     BEnsureApp();

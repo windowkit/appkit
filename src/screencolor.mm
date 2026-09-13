@@ -57,13 +57,13 @@ struct ColorAnswer {
 // none is. Touched on the UI thread only: the verb's own part runs there
 // (inline in pump mode, a command from a worker), and so does AppKit's
 // handler, inside the pump or the run.
-static std::vector<Napi::ThreadSafeFunction> gWaiting;
+static std::vector<CALTsfn> gWaiting;
 
 // cb(err) | cb(null, null) | cb(null, { r, g, b }) on the JS thread, then the
 // thread-safe function goes — which is what held the loop open meanwhile.
-static void Deliver(Napi::ThreadSafeFunction tsfn, const ColorAnswer& answer) {
+static void Deliver(const CALTsfn& tsfn, const ColorAnswer& answer) {
   ColorAnswer* a = new ColorAnswer(answer);
-  napi_status st = tsfn.BlockingCall(
+  bool queued = tsfn.Answer(
       a, [](Napi::Env env, Napi::Function cb, ColorAnswer* a) {
         // an environment on its way out gets no answer (channel.h)
         if (!CALCanCallIntoJS(env)) {
@@ -83,8 +83,7 @@ static void Deliver(Napi::ThreadSafeFunction tsfn, const ColorAnswer& answer) {
         }
         delete a;
       });
-  if (st != napi_ok) delete a;
-  tsfn.Release();
+  if (!queued) delete a;
 }
 
 // The one place a session answers. The waiting list comes off first, so a
@@ -112,9 +111,9 @@ static void FinishSession(NSColor* picked) {
           "sampleScreenColor: the sampler answered a colour with no sRGB form";
     }
   }
-  std::vector<Napi::ThreadSafeFunction> waiting;
+  std::vector<CALTsfn> waiting;
   waiting.swap(gWaiting);
-  for (Napi::ThreadSafeFunction& tsfn : waiting) Deliver(tsfn, a);
+  for (const CALTsfn& tsfn : waiting) Deliver(tsfn, a);
 }
 
 // sampleScreenColor(cb) — show the system sampler and answer once,
@@ -129,8 +128,8 @@ static Napi::Value SampleScreenColor(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   // made in the caller's environment, which is the one answered
-  Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-      env, info[0].As<Napi::Function>(), "appkit:sampleScreenColor", 0, 1);
+  CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                              "appkit:sampleScreenColor");
   CALOnUI(^{
     @autoreleasepool {
       BEnsureApp();

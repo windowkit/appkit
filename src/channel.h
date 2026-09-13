@@ -17,7 +17,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -190,12 +192,70 @@ void CALOnLayers(void (^op)(void));
 // `surface-released { id }`.
 void CALNoteContentsReplaced(id layer, id next);
 
+// A threadsafe function called from a thread other than its environment's —
+// a dispatch queue, a framework's completion handler, the UI thread — which
+// must not be touched once that environment has begun to end. Node without
+// nodejs/node#55877 (every 18, 20 and 22; 24 before 24.14; 25 before 25.4)
+// frees a threadsafe function in its environment's teardown whether or not a
+// thread still holds it: a call that lands afterwards locks a freed mutex
+// inside napi_call_threadsafe_function and aborts the process, before any
+// callback runs, where CALCanCallIntoJS cannot help. Node with it keeps the
+// function for the thread, but a call answered napi_closing has let the
+// thread's reference go and may have freed it: a release after that is the
+// same abort.
+//
+// So the function is used through a record of whether it still may be,
+// under the record's lock. An environment cleanup hook, registered after the
+// function is made and so run before the function's own teardown (hooks run
+// in reverse order), lets the reference go on the holder's behalf and marks
+// the record; a call after that finds it marked and does nothing. Copies
+// share the record.
+class CALTsfn {
+ public:
+  CALTsfn() = default;
+
+  // One answer's function for cb, made in env: holds env's loop open until
+  // it answers or is released.
+  static CALTsfn New(Napi::Env env, Napi::Function cb, const char* name);
+
+  // A long-lived function made elsewhere, whose one reference is never let
+  // go — an event source's — watched from here on: on env's thread, right
+  // after the function is made.
+  static CALTsfn Watch(napi_env env, napi_threadsafe_function f);
+
+  // From any thread: callback(env, cb, data) queued for env's thread, then
+  // the reference let go. False when nothing was queued — env is ending, or
+  // the function was answered or released already — and data is still the
+  // caller's to free.
+  template <typename DataType, typename Callback>
+  bool Answer(DataType* data, Callback callback) const {
+    return Use(true, [&](napi_threadsafe_function f) {
+      return Napi::ThreadSafeFunction(f).BlockingCall(data, callback);
+    });
+  }
+
+  // From any thread: the reference let go without an answer.
+  void Release() const { Use(true, nullptr); }
+
+  // The general form, from any thread: `call` gets the function, under the
+  // record's lock, while its environment has not begun to end and the
+  // reference is held; with `release` the reference goes after it. True when
+  // call answered napi_ok.
+  bool Use(bool release,
+           const std::function<napi_status(napi_threadsafe_function)>& call) const;
+
+ private:
+  struct Life;
+  static void EnvEnding(void* box);
+  static void Finalized(napi_env env, void* box);
+  std::shared_ptr<Life> life_;
+};
+
 // A one-shot callback in the calling environment, answered from any thread:
 // `make` runs there and builds the one argument cb gets. A pending reply
 // holds that environment's loop open, like I/O in flight.
-Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
-                                    const char* name);
-void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make);
+CALTsfn CALReplyTo(Napi::Env env, Napi::Function cb, const char* name);
+void CALReply(const CALTsfn& tsfn, CALValueBlock make);
 
 // Whether JS can still be called in `env`. A worker that is ending (an
 // uncaught error, its own process.exit) can still run a threadsafe

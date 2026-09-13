@@ -296,10 +296,9 @@ struct Reply {
   bool granted;
 };
 
-static void Answer(Napi::ThreadSafeFunction tsfn, const char* status,
-                   bool granted) {
+static void Answer(const CALTsfn& tsfn, const char* status, bool granted) {
   Reply* r = new Reply{status, granted};
-  napi_status st = tsfn.BlockingCall(
+  bool queued = tsfn.Answer(
       r, [](Napi::Env env, Napi::Function cb, Reply* r) {
         // an environment on its way out gets no answer (channel.h)
         if (!CALCanCallIntoJS(env)) {
@@ -310,12 +309,11 @@ static void Answer(Napi::ThreadSafeFunction tsfn, const char* status,
                             Napi::String::New(env, r->status)});
         delete r;
       });
-  if (st != napi_ok) delete r;
-  tsfn.Release();
+  if (!queued) delete r;
 }
 
 // For every kind but the EventKit pair, granted is the one full grant.
-static void Answer(Napi::ThreadSafeFunction tsfn, const char* status) {
+static void Answer(const CALTsfn& tsfn, const char* status) {
   Answer(tsfn, status, strcmp(status, kAuthorized) == 0);
 }
 
@@ -326,7 +324,7 @@ static void Answer(Napi::ThreadSafeFunction tsfn, const char* status) {
 @interface CALLocationRequest : NSObject <CLLocationManagerDelegate> {
  @public
   CLLocationManager* mgr_;
-  Napi::ThreadSafeFunction tsfn_;
+  CALTsfn tsfn_;
   bool done_;
 }
 @end
@@ -348,7 +346,7 @@ static NSMutableArray<CALLocationRequest*>* gLocationRequests = nil;
 // The manager reports on the run loop of the thread that made it, and a
 // worker has none: it is made on the UI thread (inline in pump mode, a
 // command in threaded mode), where the delegate call then arrives.
-static void StartLocationRequest(Napi::ThreadSafeFunction tsfn) {
+static void StartLocationRequest(CALTsfn tsfn) {  // by value: the block copies it
   CALOnUI(^{
     CALLocationRequest* r = [CALLocationRequest new];
     r->tsfn_ = tsfn;
@@ -420,9 +418,8 @@ static Napi::Value RequestAuthorization(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
   @autoreleasepool {
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[cbAt].As<Napi::Function>(), "appkit:requestAuthorization",
-        0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[cbAt].As<Napi::Function>(),
+                                "appkit:requestAuthorization");
     switch (kind) {
       case Kind::Camera:
       case Kind::Microphone: {

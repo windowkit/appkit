@@ -740,8 +740,8 @@ static Napi::Value ErrorJs(Napi::Env env, const CalAnswer& a) {
 // cb(err) or cb(null, ...) on the JS thread, from a background queue, then
 // the thread-safe function goes — which is what was holding the loop open
 // for the length of the fetch or the write.
-static void Deliver(Napi::ThreadSafeFunction tsfn, CalAnswer* a) {
-  napi_status st = tsfn.BlockingCall(
+static void Deliver(const CALTsfn& tsfn, CalAnswer* a) {
+  bool queued = tsfn.Answer(
       a, [](Napi::Env env, Napi::Function cb, CalAnswer* a) {
         // an environment on its way out gets no answer (channel.h)
         if (!CALCanCallIntoJS(env)) {
@@ -773,15 +773,16 @@ static void Deliver(Napi::ThreadSafeFunction tsfn, CalAnswer* a) {
         }
         delete a;
       });
-  if (st != napi_ok) delete a;
-  tsfn.Release();
+  if (!queued) delete a;
 }
 
 // --- the store's change notification ----------------------------------------
 
 static void CallJsChanged(Napi::Env env, Napi::Function, void*, void*);
 using ChangedTsfn = Napi::TypedThreadSafeFunction<void, void, CallJsChanged>;
-static ChangedTsfn gChanged;
+// The main thread's environment's (InitCalendars), called from whichever
+// thread EventKit posts on; null until made. Leaked with the process.
+static std::atomic<CALTsfn*> gChanged{nullptr};
 // One change waiting for a listener. The event carries nothing and the
 // framework coalesces, so what is held is that a change happened at all.
 static bool gHeldChange = false;
@@ -826,10 +827,13 @@ void CALCalendarsObserveStore(EKEventStore* store) {
                   object:store
                    queue:nil
               usingBlock:^(NSNotification*) {
-                if (CALChannelOpen())
+                if (CALChannelOpen()) {
                   CALEmit(CALEvent("calendar-store-changed"));
-                else
-                  gChanged.NonBlockingCall();
+                } else if (CALTsfn* changed = gChanged.load()) {
+                  changed->Use(false, [](napi_threadsafe_function f) {
+                    return ChangedTsfn(f).NonBlockingCall();
+                  });
+                }
               }];
 }
 
@@ -905,8 +909,8 @@ static Napi::Value Calendars(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();  // JS thread: it is a singleton
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[0].As<Napi::Function>(), "appkit:calendars", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                                "appkit:calendars");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -931,8 +935,8 @@ static Napi::Value EventsBetween(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[1].As<Napi::Function>(), "appkit:eventsBetween", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[1].As<Napi::Function>(),
+                                "appkit:eventsBetween");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -1548,8 +1552,8 @@ static Napi::Value DefaultCalendar(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[0].As<Napi::Function>(), "appkit:defaultCalendar", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                                "appkit:defaultCalendar");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -1583,8 +1587,8 @@ static Napi::Value SaveEvent(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[cbAt].As<Napi::Function>(), "appkit:saveEvent", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[cbAt].As<Napi::Function>(),
+                                "appkit:saveEvent");
     dispatch_async(WriteQueue(), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -1619,8 +1623,8 @@ static Napi::Value RemoveEvent(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[cbAt].As<Napi::Function>(), "appkit:removeEvent", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[cbAt].As<Napi::Function>(),
+                                "appkit:removeEvent");
     dispatch_async(WriteQueue(), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -1643,8 +1647,8 @@ static Napi::Value CommitCalendarStore(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[0].As<Napi::Function>(), "appkit:commitCalendarStore", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                                "appkit:commitCalendarStore");
     dispatch_async(WriteQueue(), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -1667,8 +1671,8 @@ static Napi::Value ResetCalendarStore(const Napi::CallbackInfo& info) {
   }
   @autoreleasepool {
     EKEventStore* store = CALEventStore();
-    Napi::ThreadSafeFunction tsfn = Napi::ThreadSafeFunction::New(
-        env, info[0].As<Napi::Function>(), "appkit:resetCalendarStore", 0, 1);
+    CALTsfn tsfn = CALTsfn::New(env, info[0].As<Napi::Function>(),
+                                "appkit:resetCalendarStore");
     dispatch_async(WriteQueue(), ^{
       @autoreleasepool {
         CalAnswer* a = new CalAnswer;
@@ -1702,8 +1706,15 @@ static Napi::Value PostCalendarStoreChanged(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 void InitCalendars(Napi::Env env, Napi::Object exports) {
-  gChanged = ChangedTsfn::New(env, "appkit:calendars-changed", 0, 1);
-  gChanged.Unref(env);  // a change never holds the loop open by itself
+  // Pump mode delivers on the main thread only (CALEmit), so a change
+  // crosses to the main thread's environment: made there, the once. Each
+  // environment used to make its own and replace the last, so a worker's —
+  // gone with the worker — could be the one EventKit's thread then called.
+  if (pthread_main_np() && !gChanged.load()) {
+    ChangedTsfn changed = ChangedTsfn::New(env, "appkit:calendars-changed", 0, 1);
+    changed.Unref(env);  // a change never holds the loop open by itself
+    gChanged.store(new CALTsfn(CALTsfn::Watch(env, changed)));
+  }
   exports.Set("calendars", Napi::Function::New(env, Calendars));
   exports.Set("eventsBetween", Napi::Function::New(env, EventsBetween));
   exports.Set("defaultCalendar", Napi::Function::New(env, DefaultCalendar));

@@ -577,20 +577,109 @@ id CALResolve(id target) {
   return target;
 }
 
+// --- threadsafe functions used from other threads (channel.h) -----------------
+
+struct CALTsfn::Life {
+  std::mutex mu;
+  // null once the reference is let go: answered, released, or the
+  // environment ending
+  napi_threadsafe_function f = nullptr;
+  // the function's finalizer frees the hook's box (a one-shot's); without
+  // one the hook does (a long-lived function's, finalized only after it)
+  bool finalizes = false;
+};
+
+// The environment's cleanup hook, run before the function's own: the
+// reference its holder would have let go goes now, from the environment's
+// thread — so Node that keeps a held function past teardown (#55877) frees
+// it with the rest — and the holder finds the record marked.
+void CALTsfn::EnvEnding(void* arg) {
+  auto* box = static_cast<std::shared_ptr<Life>*>(arg);
+  Life& life = **box;
+  bool finalizes;
+  {
+    std::lock_guard<std::mutex> l(life.mu);
+    if (life.f) napi_release_threadsafe_function(life.f, napi_tsfn_release);
+    life.f = nullptr;
+    finalizes = life.finalizes;
+  }
+  if (!finalizes) delete box;
+}
+
+// The function's finalizer, on its environment's thread: the hook is not
+// needed any more (at teardown it has run already, and removing it is a
+// no-op).
+void CALTsfn::Finalized(napi_env env, void* arg) {
+  auto* box = static_cast<std::shared_ptr<Life>*>(arg);
+  napi_remove_env_cleanup_hook(env, EnvEnding, box);
+  {
+    std::lock_guard<std::mutex> l((*box)->mu);
+    (*box)->f = nullptr;
+  }
+  delete box;
+}
+
+CALTsfn CALTsfn::New(Napi::Env env, Napi::Function cb, const char* name) {
+  auto life = std::make_shared<Life>();
+  life->finalizes = true;
+  auto* box = new std::shared_ptr<Life>(life);
+  Napi::ThreadSafeFunction f = Napi::ThreadSafeFunction::New(
+      env, cb, name, 0, 1, [box](Napi::Env env) { Finalized(env, box); });
+  CALTsfn t;
+  if (!(napi_threadsafe_function)f) {  // not made; the error is pending in env
+    delete box;
+    return t;
+  }
+  life->f = f;
+  // after the function's own hook, so it runs before it
+  napi_add_env_cleanup_hook(env, EnvEnding, box);
+  t.life_ = life;
+  return t;
+}
+
+CALTsfn CALTsfn::Watch(napi_env env, napi_threadsafe_function f) {
+  CALTsfn t;
+  if (!f) return t;
+  auto life = std::make_shared<Life>();
+  life->f = f;
+  napi_add_env_cleanup_hook(env, EnvEnding, new std::shared_ptr<Life>(life));
+  t.life_ = life;
+  return t;
+}
+
+bool CALTsfn::Use(
+    bool release,
+    const std::function<napi_status(napi_threadsafe_function)>& call) const {
+  if (!life_) return false;
+  std::lock_guard<std::mutex> l(life_->mu);
+  napi_threadsafe_function f = life_->f;
+  if (!f) return false;
+  napi_status st = call ? call(f) : napi_ok;
+  if (st == napi_closing) {
+    // the call let the reference go itself, and may have freed the function
+    life_->f = nullptr;
+    return false;
+  }
+  if (release) {
+    napi_release_threadsafe_function(f, napi_tsfn_release);
+    life_->f = nullptr;
+  }
+  return call && st == napi_ok;
+}
+
 // --- one-shot replies ---------------------------------------------------------
 
 struct Reply {
   CALValueBlock make;
 };
 
-Napi::ThreadSafeFunction CALReplyTo(Napi::Env env, Napi::Function cb,
-                                    const char* name) {
-  return Napi::ThreadSafeFunction::New(env, cb, name, 0, 1);
+CALTsfn CALReplyTo(Napi::Env env, Napi::Function cb, const char* name) {
+  return CALTsfn::New(env, cb, name);
 }
 
-void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make) {
+void CALReply(const CALTsfn& tsfn, CALValueBlock make) {
   Reply* r = new Reply{make};
-  napi_status st = tsfn.BlockingCall(r, [](Napi::Env env, Napi::Function cb, Reply* r) {
+  bool queued = tsfn.Answer(r, [](Napi::Env env, Napi::Function cb, Reply* r) {
     // an environment on its way out gets no answer (channel.h)
     if (!CALCanCallIntoJS(env)) {
       delete r;
@@ -600,8 +689,7 @@ void CALReply(Napi::ThreadSafeFunction tsfn, CALValueBlock make) {
     delete r;
     CALCallJS(env, cb, {v});
   });
-  if (st != napi_ok) delete r;
-  tsfn.Release();
+  if (!queued) delete r;
 }
 
 Napi::Value CALAnswer(const Napi::CallbackInfo& info, const char* name,
@@ -618,7 +706,7 @@ Napi::Value CALAnswer(const Napi::CallbackInfo& info, const char* name,
     }
     return compute()(env);
   }
-  Napi::ThreadSafeFunction tsfn = CALReplyTo(env, last.As<Napi::Function>(), name);
+  CALTsfn tsfn = CALReplyTo(env, last.As<Napi::Function>(), name);
   dispatch_block_t work = ^{ CALReply(tsfn, compute()); };
   if (nested) CALOnUIModal(work);
   else CALOnUI(work);

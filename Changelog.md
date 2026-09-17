@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/windowkit/appkit/compare/v0.11.0...v0.12.0) (2026-09-17)
+
+
+### Features
+
+* ctxDrawSymbol and symbolSize, SF Symbols drawn in a surface in the fill colour ([#71](https://github.com/windowkit/appkit/issues/71)) ([6ee673c](https://github.com/windowkit/appkit/commit/6ee673c4791f23912190b49ba3761fe8108983b4))
+
 ## [0.11.0](https://github.com/windowkit/appkit/compare/v0.10.0...v0.11.0) (2026-09-17)
 
 

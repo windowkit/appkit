@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/windowkit/appkit/compare/v0.10.0...v0.11.0) (2026-09-17)
+
+
+### Features
+
+* fontApplyFeatures, and letterSpacing on createLayout spans and fontShapeText ([#70](https://github.com/windowkit/appkit/issues/70)) ([d0a5811](https://github.com/windowkit/appkit/commit/d0a5811bc411a5991a19316de4ccfbc274cf3d93))
+
+
+### Bug Fixes
+
+* no threadsafe function touched once its environment has begun to end — an answer from another thread after a worker ends no longer aborts the process ([#68](https://github.com/windowkit/appkit/issues/68)) ([6906429](https://github.com/windowkit/appkit/commit/690642905679a0431936baf4d8bda7021ca3e36e))
+
 ## [0.10.0](https://github.com/windowkit/appkit/compare/v0.9.0...v0.10.0) (2026-09-11)
 
 

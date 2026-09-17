@@ -4196,19 +4196,24 @@ static Napi::Value ScrollSurface(const Napi::CallbackInfo& info) {
 // fonts + text layout (CoreText)
 // ---------------------------------------------------------------------------
 
+// A CSS weight, 100-900, as the nearest of AppKit's named weights — what a
+// face and an SF Symbol are both configured with.
+static NSFontWeight FontWeightFromCss(double weight) {
+  if (weight <= 150) return NSFontWeightUltraLight;
+  if (weight <= 250) return NSFontWeightThin;
+  if (weight <= 350) return NSFontWeightLight;
+  if (weight <= 450) return NSFontWeightRegular;
+  if (weight <= 550) return NSFontWeightMedium;
+  if (weight <= 650) return NSFontWeightSemibold;
+  if (weight <= 750) return NSFontWeightBold;
+  if (weight <= 850) return NSFontWeightHeavy;
+  return NSFontWeightBlack;
+}
+
 // matchFont({ families: [..], size, weight (100-900), italic }) -> font handle
 static NSFont* ResolveFamily(NSString* family, double size, double weight,
                              bool italic) {
-  NSFontWeight w = NSFontWeightRegular;
-  if (weight <= 150) w = NSFontWeightUltraLight;
-  else if (weight <= 250) w = NSFontWeightThin;
-  else if (weight <= 350) w = NSFontWeightLight;
-  else if (weight <= 450) w = NSFontWeightRegular;
-  else if (weight <= 550) w = NSFontWeightMedium;
-  else if (weight <= 650) w = NSFontWeightSemibold;
-  else if (weight <= 750) w = NSFontWeightBold;
-  else if (weight <= 850) w = NSFontWeightHeavy;
-  else w = NSFontWeightBlack;
+  NSFontWeight w = FontWeightFromCss(weight);
 
   NSFont* font = nil;
   NSString* lower = family.lowercaseString;
@@ -5227,6 +5232,121 @@ static Napi::Value CtxDrawGlyphs(const Napi::CallbackInfo& info) {
   }
   CGContextRestoreGState(ctx);
   return info.Env().Undefined();
+}
+
+// ---------------------------------------------------------------------------
+// SF Symbols, drawn in a surface (sidorares/react-x11#591)
+// ---------------------------------------------------------------------------
+//
+// The system's icons by name — what a status item and a menu item already
+// take — for a renderer drawing its own content. A symbol is a template: its
+// shape, in whatever colour it is drawn with, so it is drawn here the way a
+// glyph run is, in the current fill colour, and tints the way text does.
+
+// The symbol's image for (name, options), or nil for a name the catalogue
+// does not know. Options: pointSize (default 13), weight (100-900, default
+// 400), scale ('small' | 'medium' | 'large', default 'medium'),
+// variableValue (0-1, macOS 13 and later; ignored before).
+static NSImage* SymbolImage(Napi::Value nameValue, Napi::Value optionsValue) {
+  if (!nameValue.IsString()) {
+    Napi::TypeError::New(nameValue.Env(), "expected a symbol name")
+        .ThrowAsJavaScriptException();
+    return nil;
+  }
+  NSString* name = BToNSString(nameValue);
+  double pointSize = 13, weight = 400, variable = NAN;
+  NSImageSymbolScale scale = NSImageSymbolScaleMedium;
+  if (optionsValue.IsObject()) {
+    Napi::Object o = optionsValue.As<Napi::Object>();
+    pointSize = BNumOr(o, "pointSize", 13);
+    weight = BNumOr(o, "weight", 400);
+    NSString* s = BStrOr(o, "scale", @"medium");
+    if ([s isEqualToString:@"small"]) scale = NSImageSymbolScaleSmall;
+    else if ([s isEqualToString:@"large"]) scale = NSImageSymbolScaleLarge;
+    if (o.Has("variableValue") && o.Get("variableValue").IsNumber())
+      variable = o.Get("variableValue").As<Napi::Number>().DoubleValue();
+  }
+  NSImage* img = nil;
+  if (!std::isnan(variable)) {
+    if (@available(macOS 13.0, *)) {
+      img = [NSImage imageWithSystemSymbolName:name
+                                 variableValue:variable
+                      accessibilityDescription:nil];
+    }
+  }
+  if (!img) {
+    img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+  }
+  if (!img) return nil;
+  NSImageSymbolConfiguration* cfg = [NSImageSymbolConfiguration
+      configurationWithPointSize:pointSize
+                          weight:FontWeightFromCss(weight)
+                           scale:scale];
+  return [img imageWithSymbolConfiguration:cfg];
+}
+
+// symbolSize(name, options?) -> { width, height } in points, or null for a
+// name the catalogue does not know. The image's size, the padding the symbol
+// is designed with included: the box a symbol sits in beside text.
+static Napi::Value SymbolSize(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  @autoreleasepool {
+    NSImage* img = SymbolImage(info[0], info.Length() > 1 ? info[1] : env.Undefined());
+    if (env.IsExceptionPending()) return env.Undefined();
+    if (!img) return env.Null();
+    Napi::Object out = Napi::Object::New(env);
+    out.Set("width", img.size.width);
+    out.Set("height", img.size.height);
+    return out;
+  }
+}
+
+// ctxDrawSymbol(surface, name, x, y, width, height, options?) -> boolean
+// The symbol fitted into the rect, centred, keeping its proportions, in the
+// current fill colour — so it follows the surface CTM, clip, global alpha and
+// blend mode like every other ctx verb. Answers false, drawing nothing, for a
+// name the catalogue does not know. Options as symbolSize's.
+static Napi::Value CtxDrawSymbol(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return env.Undefined();
+  @autoreleasepool {
+    NSImage* img = SymbolImage(info[1], info.Length() > 6 ? info[6] : env.Undefined());
+    if (env.IsExceptionPending()) return env.Undefined();
+    if (!img) return Napi::Boolean::New(env, false);
+    double x = info[2].As<Napi::Number>().DoubleValue();
+    double y = info[3].As<Napi::Number>().DoubleValue();
+    double w = info[4].As<Napi::Number>().DoubleValue();
+    double h = info[5].As<Napi::Number>().DoubleValue();
+    NSSize size = img.size;
+    if (!(w > 0 && h > 0 && size.width > 0 && size.height > 0))
+      return Napi::Boolean::New(env, true);
+    double k = std::min(w / size.width, h / size.height);
+    CGRect rect = CGRectMake(x + (w - size.width * k) / 2, y + (h - size.height * k) / 2,
+                             size.width * k, size.height * k);
+    CGContextRef ctx = s->ctx;
+    CGContextSaveGState(ctx);
+    // The template's shape into a layer of its own, then the fill colour
+    // through it: the layer composites once with the context's alpha, blend
+    // mode and clip, as a glyph run's ink does.
+    CGContextBeginTransparencyLayerWithRect(ctx, rect, NULL);
+    // the surface's base CTM is y-down, so the context is a flipped one
+    NSGraphicsContext* g = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:g];
+    [img drawInRect:NSRectFromCGRect(rect)
+           fromRect:NSZeroRect
+          operation:NSCompositingOperationSourceOver
+           fraction:1.0
+     respectFlipped:YES
+              hints:nil];
+    [NSGraphicsContext restoreGraphicsState];
+    CGContextSetBlendMode(ctx, kCGBlendModeSourceIn);
+    CGContextFillRect(ctx, rect);
+    CGContextEndTransparencyLayer(ctx);
+    CGContextRestoreGState(ctx);
+    return Napi::Boolean::New(env, true);
+  }
 }
 
 // drawLayoutGradient(surface, layoutHandle, x, y, x0, y0, x1, y1,
@@ -6518,6 +6638,8 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("createLayout", CreateLayout);
   BFN("drawLayout", DrawLayout);
   BFN("ctxDrawGlyphs", CtxDrawGlyphs);
+  BFN("ctxDrawSymbol", CtxDrawSymbol);
+  BFN("symbolSize", SymbolSize);
   BFN("layoutIndexAt", LayoutIndexAt);
   BFN("layoutCaret", LayoutCaret);
   BFN("pasteboardWriteText", PbWriteTextFn);

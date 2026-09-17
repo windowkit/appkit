@@ -242,6 +242,10 @@ jobs:
         run: node test/ignores-mouse-events.js
       - name: Surface blits and blend modes
         run: node test/surface-blit.js
+      - name: Letter spacing and OpenType features on the text verbs
+        run: node test/text-features.js
+      - name: SF Symbols drawn in a surface, in the fill colour, and from a worker
+        run: node test/symbols.js
       - name: EventKit privacy authorizations, the reading half and the argument shapes
         run: node test/eventkit-permissions.js
       - name: EventKit calendar reads, the ungranted half and the store's change event

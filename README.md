@@ -125,7 +125,7 @@ waits on the UI thread (`test/threaded-verbs.js` covers each row):
 
 | from a worker | verbs |
 | --- | --- |
-| unchanged, on the calling thread | surfaces, every `ctx*`, layouts and fonts, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
+| unchanged, on the calling thread | surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
 | a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardClear`, `cancelPanel`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
 | a handle at the call | `createWindow2`, followed by `window-created { handle, windowNumber }`; every event about the window, input included, carries `handle`, so `ev.handle === win` |
 | | `windowRootLayer`, allocated with the window |
@@ -521,6 +521,41 @@ const readout = native.createLayout({
 });
 const label = native.createLayout({
   spans: [{ text: 'NOISE TYPE', font: small, letterSpacing: 1.26 }],
+});
+```
+
+## SF Symbols in a surface
+
+The system's icons by name — what `createStatusItem`'s `image` and a menu item's `iconName`
+already take — drawn into a surface, for a renderer's own content:
+
+- **`native.ctxDrawSymbol(surface, name, x, y, width, height, options?)`** — the symbol fitted
+  into the rect, centred and keeping its proportions, in the **current fill colour**. A symbol
+  is a template, its shape in whatever colour it is drawn with, so it is drawn the way
+  `ctxDrawGlyphs` draws a run: through the surface's CTM and clip, at its global alpha and
+  blend mode, over what is already there. Answers `false`, drawing nothing, for a name the
+  catalogue does not know — a name from another platform's icon theme simply misses.
+- **`native.symbolSize(name, options?)`** — `{ width, height }` in points, the padding the
+  symbol is designed with included, or `null` for an unknown name: the box a symbol sits in
+  beside text of the same point size.
+
+| option          |                                                                               |
+| --------------- | ----------------------------------------------------------------------------- |
+| `pointSize`     | the size it is designed for, default 13 — the size of the text beside it      |
+| `weight`        | 100-900, default 400: the nearest of AppKit's weights, as `matchFont` maps it |
+| `scale`         | `'small'`, `'medium'` (default) or `'large'`, relative to the point size      |
+| `variableValue` | 0-1, how much of a variable symbol shows — macOS 13 and later, ignored before  |
+
+Both run on the calling thread in threaded mode too, and draw the same pixels there.
+
+```js
+const s = native.createSurface(96, 96, 2);
+native.ctxSetFillColor(s, 0.2, 0.4, 0.8, 1);
+const { width, height } = native.symbolSize('speaker.wave.3.fill', { pointSize: 20 });
+native.ctxDrawSymbol(s, 'speaker.wave.3.fill', 8, 8, width * 2, height * 2, {
+  pointSize: 20,
+  weight: 600,
+  variableValue: 0.66,
 });
 ```
 

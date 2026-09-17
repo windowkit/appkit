@@ -493,6 +493,37 @@ native.ctxDrawSurface(win, grid, 0, 0, 2000, 1620, 40, 30, 2000, 1620);
 native.ctxSetBlendMode(win, 'source-over');
 ```
 
+## Text: letter spacing and OpenType features
+
+The text verbs a renderer lays paragraphs out and shapes glyph runs with —
+`matchFont`, `createLayout`, `fontShapeText` — take the two adjustments a designed
+interface reaches for past the face and the size:
+
+- **`native.fontApplyFeatures(font, features)`** — the font with OpenType features set by
+  tag, the sibling of `fontApplyVariations`. An array turns each tag on (`['tnum']`); an
+  object sets each tag to its value, `true`/`false` or a number for a feature that selects
+  among alternates (`{ tnum: true, liga: false, salt: 2 }`). The settings replace any the
+  font carries, and with nothing to set the font itself comes back, so it can be applied
+  unconditionally. `tnum` is the one a live readout wants: the system face's digits are
+  proportional, and a number that changes while a slider moves reflows with every value.
+- **`letterSpacing`**, in points: a `createLayout` span option, and a third-argument option
+  to `fontShapeText` — `{ letterSpacing }` — so a paragraph and a run shaped alone agree.
+  It is added after every character, the last on a line included, which is what
+  `kCTKernAttributeName` does and what CSS's `letter-spacing` long did; negative values
+  tighten. It says nothing about ligatures: a caller that wants CSS's rule turns the
+  optional ones off through `fontApplyFeatures` on a spaced span.
+
+```js
+const face = native.matchFont({ families: ['system-ui'], size: 30 });
+const small = native.matchFont({ families: ['system-ui'], size: 11, weight: 600 });
+const readout = native.createLayout({
+  spans: [{ text: '487 Hz', font: native.fontApplyFeatures(face, ['tnum']) }],
+});
+const label = native.createLayout({
+  spans: [{ text: 'NOISE TYPE', font: small, letterSpacing: 1.26 }],
+});
+```
+
 ## App lifecycle: open-URL, open-file, reopen, quit
 
 The OS talks to the application as a whole through Apple Events: a URL for a scheme

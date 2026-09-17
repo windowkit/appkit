@@ -4601,7 +4601,7 @@ static Napi::Value FontWithSize(const Napi::CallbackInfo& info) {
   });
 }
 
-// fontShapeText(font, text)
+// fontShapeText(font, text, { letterSpacing }?)
 //   -> { width, runs: [{ font: handle | null, glyphs: Uint16Array,
 //                        positions: Float64Array x0,y0,x1,y1,…,
 //                        advances: Float64Array }] }
@@ -4615,7 +4615,9 @@ static Napi::Value FontWithSize(const Napi::CallbackInfo& info) {
 // right. The typesetter's whole answer for a cluster — a base with its
 // marks positioned, an emoji sequence joined, a variation selector honoured
 // — as ids a caller can hand to ctxDrawGlyphs beside the ids it looked up
-// itself; nothing here decides where a cluster goes.
+// itself; nothing here decides where a cluster goes. `letterSpacing` is
+// the points added after every character, as createLayout's span option
+// adds them, so a run shaped here and a paragraph laid out there agree.
 static Napi::Value FontShapeText(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!BCheckFontArg(info, "fontShapeText")) return env.Undefined();
@@ -4624,9 +4626,15 @@ static Napi::Value FontShapeText(const Napi::CallbackInfo& info) {
   Napi::Object out = Napi::Object::New(env);
   Napi::Array runsOut = Napi::Array::New(env);
   double width = 0;
+  double spacing = info.Length() > 2 && info[2].IsObject()
+                       ? BNumOr(info[2].As<Napi::Object>(), "letterSpacing", 0)
+                       : 0;
   if (text.length > 0) {
-    NSDictionary* attrs =
-        @{(__bridge id)kCTFontAttributeName : (__bridge id)font};
+    NSMutableDictionary* attrs = [NSMutableDictionary dictionary];
+    attrs[(__bridge id)kCTFontAttributeName] = (__bridge id)font;
+    if (spacing != 0 && std::isfinite(spacing)) {
+      attrs[(__bridge id)kCTKernAttributeName] = @(spacing);
+    }
     NSAttributedString* as =
         [[NSAttributedString alloc] initWithString:text attributes:attrs];
     CTLineRef line =
@@ -4803,6 +4811,57 @@ static Napi::Value FontApplyVariations(const Napi::CallbackInfo& info) {
   });
 }
 
+// fontApplyFeatures(font, ['tnum'] | { tnum: true, liga: false, salt: 2 })
+//   -> CTFont
+// OpenType features by tag (kCTFontOpenTypeFeatureTag, macOS 10.13): an
+// array turns each tag on, an object sets each tag to its value — true or
+// false, or a number for a feature that selects among alternates. The
+// settings replace any the font already carries, the way a style names its
+// features whole. Answers the font it was given when there is nothing to
+// set, so a caller can apply it unconditionally.
+static Napi::Value FontApplyFeatures(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!BCheckFontArg(info, "fontApplyFeatures")) return env.Undefined();
+  CTFontRef base = BFontFrom(info[0]);
+  NSMutableArray* settings = [NSMutableArray array];
+  auto add = [&](const std::string& tag, long value) {
+    if (tag.size() != 4) return;
+    [settings addObject:@{
+      (__bridge id)kCTFontOpenTypeFeatureTag :
+          [NSString stringWithUTF8String:tag.c_str()],
+      (__bridge id)kCTFontOpenTypeFeatureValue : @(value),
+    }];
+  };
+  if (info.Length() > 1 && info[1].IsArray()) {
+    Napi::Array tags = info[1].As<Napi::Array>();
+    for (uint32_t i = 0; i < tags.Length(); i++) {
+      if (tags.Get(i).IsString()) {
+        add(tags.Get(i).As<Napi::String>().Utf8Value(), 1);
+      }
+    }
+  } else if (info.Length() > 1 && info[1].IsObject()) {
+    Napi::Object o = info[1].As<Napi::Object>();
+    Napi::Array names = o.GetPropertyNames();
+    for (uint32_t i = 0; i < names.Length(); i++) {
+      std::string tag = names.Get(i).As<Napi::String>().Utf8Value();
+      Napi::Value v = o.Get(tag.c_str());
+      if (v.IsBoolean()) add(tag, v.As<Napi::Boolean>().Value() ? 1 : 0);
+      else if (v.IsNumber()) add(tag, (long)v.As<Napi::Number>().Int64Value());
+    }
+  }
+  if (settings.count == 0) return info[0];
+  CTFontDescriptorRef d = CTFontDescriptorCreateWithAttributes(
+      (__bridge CFDictionaryRef)
+          @{(__bridge id)kCTFontFeatureSettingsAttribute : settings});
+  CTFontRef ct =
+      CTFontCreateCopyWithAttributes(base, CTFontGetSize(base), NULL, d);
+  CFRelease(d);
+  if (!ct) return info[0];
+  return Napi::External<void>::New(env, (void*)ct, [](Napi::Env, void* d2) {
+    CFRelease(d2);
+  });
+}
+
 // listFonts({ family? , limit? }) -> [{ postScriptName, familyName,
 // styleName, path }]. With a family: that family's faces, in CoreText's
 // matching order. Without: every installed face (bounded by limit).
@@ -4951,6 +5010,12 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
     NSMutableDictionary* attrs = [NSMutableDictionary dictionary];
     attrs[(__bridge id)kCTFontAttributeName] = font;
     attrs[NSParagraphStyleAttributeName] = para;
+    // CSS's letter-spacing, in points: added after every character, the
+    // last on a line included — what kCTKernAttributeName does
+    double spacing = BNumOr(span, "letterSpacing", 0);
+    if (spacing != 0 && std::isfinite(spacing)) {
+      attrs[(__bridge id)kCTKernAttributeName] = @(spacing);
+    }
     if (span.Has("color") && span.Get("color").IsArray()) {
       CGColorRef color = BMakeColor(span.Get("color"));
       attrs[(__bridge id)kCTForegroundColorAttributeName] =
@@ -6445,6 +6510,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("cgFontWithSize", CgFontWithSize);
   BFN("fontByPostScriptName", FontByPostScriptName);
   BFN("fontApplyVariations", FontApplyVariations);
+  BFN("fontApplyFeatures", FontApplyFeatures);
   BFN("drawLayoutGradient", DrawLayoutGradient);
   BFN("ctxSetShadow", CtxSetShadow);
   BFN("listFonts", ListFonts);

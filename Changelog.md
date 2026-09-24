@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/windowkit/appkit/compare/v0.12.0...v0.13.0) (2026-09-24)
+
+
+### Features
+
+* layoutCoverage — a layout's coverage without a surface, the outlines' own ([#73](https://github.com/windowkit/appkit/issues/73)) ([9af7051](https://github.com/windowkit/appkit/commit/9af7051cd318b925423b2f34f77255827b94a3ae))
+
 ## [0.12.0](https://github.com/windowkit/appkit/compare/v0.11.0...v0.12.0) (2026-09-17)
 
 

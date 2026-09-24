@@ -5422,6 +5422,307 @@ static Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// ---------------------------------------------------------------------------
+// A layout's coverage, drawn nowhere (sidorares/react-x11#673)
+// ---------------------------------------------------------------------------
+
+// The coverage of closed outlines by signed-area accumulation, the algorithm
+// font-rs and stb_truetype v2 use, ported from ntk's CoverageAccumulator
+// (lib/rasterize.js) so the X11 text engine and this one rasterize alike. Each
+// edge deposits the exact area it sweeps through every pixel row it crosses
+// into a float accumulator, and a prefix sum along each row turns those deltas
+// into winding-weighted coverage, clamped at one: the non-zero rule, analytic,
+// no supersampling. Its one approximation is where two contours overlap and
+// both edges cross the same pixel, as a variable font's stems do at a join:
+// their partial coverages add there, where the union's would not. Geometry is
+// y-down pixels with the grid's top-left at (0, 0); an edge outside the grid
+// piles its coverage onto the border column, as a clipped fill would.
+class CoverageAccumulator {
+ public:
+  CoverageAccumulator(long width, long height)
+      : width_(width),
+        height_(height),
+        stride_(width + 2),  // an edge ending on the right border deposits
+                             // its last fraction one cell past the last pixel
+        acc_((size_t)((width + 2) * height), 0.0f) {}
+
+  // One directed edge. A horizontal one sweeps no area.
+  void Edge(double ax, double ay, double bx, double by) {
+    if (ay == by || !std::isfinite(ax) || !std::isfinite(ay) ||
+        !std::isfinite(bx) || !std::isfinite(by))
+      return;
+    double dir = 1, x0 = ax, y0 = ay, x1 = bx, y1 = by;
+    if (ay > by) {
+      dir = -1;
+      x0 = bx;
+      y0 = by;
+      x1 = ax;
+      y1 = ay;
+    }
+    const double dxdy = (x1 - x0) / (y1 - y0);
+    double x = x0;
+    if (y0 < 0) {  // enter at row 0 rather than accumulate rows nobody reads
+      x -= y0 * dxdy;
+      y0 = 0;
+    }
+    const double w = (double)width_;
+    const long rowEnd = std::min(height_, (long)std::ceil(y1));
+    for (long y = (long)y0; y < rowEnd; ++y) {
+      float* line = acc_.data() + y * stride_;
+      const double dy = std::min((double)y + 1, y1) - std::max((double)y, y0);
+      const double xnext = x + dxdy * dy;
+      const double d = dy * dir;
+      double xa = std::min(x, xnext), xb = std::max(x, xnext);
+      xa = xa < 0 ? 0 : xa > w ? w : xa;
+      xb = xb < 0 ? 0 : xb > w ? w : xb;
+      const double xaFloor = std::floor(xa);
+      const long x0i = (long)xaFloor;
+      const double xbCeil = std::ceil(xb);
+      const long x1i = (long)xbCeil;
+      if (x1i <= x0i + 1) {
+        // the row's span inside one pixel: split at its midpoint
+        const double xmf = 0.5 * (xa + xb) - xaFloor;
+        Add(line[x0i], d - d * xmf);
+        Add(line[x0i + 1], d * xmf);
+      } else {
+        // a trapezoid across the pixels the span crosses
+        const double s = 1 / (xb - xa);
+        const double x0f = xa - xaFloor;
+        const double a0 = 0.5 * s * (1 - x0f) * (1 - x0f);
+        const double x1f = xb - xbCeil + 1;
+        const double am = 0.5 * s * x1f * x1f;
+        Add(line[x0i], d * a0);
+        if (x1i == x0i + 2) {
+          Add(line[x0i + 1], d * (1 - a0 - am));
+        } else {
+          const double a1 = s * (1.5 - x0f);
+          Add(line[x0i + 1], d * (a1 - a0));
+          for (long xi = x0i + 2; xi < x1i - 1; ++xi) Add(line[xi], d * s);
+          const double a2 = a1 + (double)(x1i - x0i - 3) * s;
+          Add(line[x1i - 1], d * (1 - a2 - am));
+        }
+        Add(line[x1i], d * am);
+      }
+      x = xnext;
+    }
+  }
+
+  // The rows integrated into one byte a pixel, width × height into `out`.
+  void ToAlpha(uint8_t* out) const {
+    for (long y = 0; y < height_; ++y) {
+      const float* line = acc_.data() + y * stride_;
+      uint8_t* row = out + y * width_;
+      double sum = 0;
+      for (long x = 0; x < width_; ++x) {
+        sum += line[x];
+        double c = sum < 0 ? -sum : sum;
+        if (c > 1) c = 1;
+        row[x] = (uint8_t)(c * 255 + 0.5);
+      }
+    }
+  }
+
+ private:
+  // A cell is a float, as ntk's Float32Array is, and a deposit is added to it
+  // in double and rounded once, as JavaScript does: the two stay byte-alike.
+  static void Add(float& cell, double v) { cell = (float)(cell + v); }
+
+  long width_, height_, stride_;
+  std::vector<float> acc_;
+};
+
+// A glyph outline walked into the accumulator: every subpath closed, as a
+// fill closes it, and curves cut into chords the way ntk's flatten does — a
+// step for every three pixels of the control points' extent, three to
+// twenty-four of them.
+struct OutlineWalk {
+  CoverageAccumulator* acc;
+  double x = 0, y = 0;    // the pen
+  double sx = 0, sy = 0;  // where the subpath began
+
+  void To(double nx, double ny) {
+    acc->Edge(x, y, nx, ny);
+    x = nx;
+    y = ny;
+  }
+  void Close() { To(sx, sy); }
+
+  static int Steps(std::initializer_list<CGPoint> points) {
+    double x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+    for (const CGPoint& p : points) {
+      x0 = std::min(x0, (double)p.x);
+      x1 = std::max(x1, (double)p.x);
+      y0 = std::min(y0, (double)p.y);
+      y1 = std::max(y1, (double)p.y);
+    }
+    const double extent = std::max(x1 - x0, y1 - y0);
+    return (int)std::min(24.0, std::max(3.0, std::ceil(extent / 3)));
+  }
+
+  static void Apply(void* info, const CGPathElement* e) {
+    auto* w = (OutlineWalk*)info;
+    const CGPoint* p = e->points;
+    switch (e->type) {
+      case kCGPathElementMoveToPoint:
+        w->Close();
+        w->x = w->sx = p[0].x;
+        w->y = w->sy = p[0].y;
+        break;
+      case kCGPathElementAddLineToPoint:
+        w->To(p[0].x, p[0].y);
+        break;
+      case kCGPathElementAddQuadCurveToPoint: {
+        const double x0 = w->x, y0 = w->y;
+        const int steps = Steps({CGPointMake(x0, y0), p[0], p[1]});
+        for (int i = 1; i <= steps; ++i) {
+          const double t = (double)i / steps, mt = 1 - t;
+          w->To(mt * mt * x0 + 2 * mt * t * p[0].x + t * t * p[1].x,
+                mt * mt * y0 + 2 * mt * t * p[0].y + t * t * p[1].y);
+        }
+        break;
+      }
+      case kCGPathElementAddCurveToPoint: {
+        const double x0 = w->x, y0 = w->y;
+        const int steps = Steps({CGPointMake(x0, y0), p[0], p[1], p[2]});
+        for (int i = 1; i <= steps; ++i) {
+          const double t = (double)i / steps, mt = 1 - t;
+          w->To(mt * mt * mt * x0 + 3 * mt * mt * t * p[0].x +
+                    3 * mt * t * t * p[1].x + t * t * t * p[2].x,
+                mt * mt * mt * y0 + 3 * mt * mt * t * p[0].y +
+                    3 * mt * t * t * p[1].y + t * t * t * p[2].y);
+        }
+        break;
+      }
+      case kCGPathElementCloseSubpath:
+        w->Close();
+        break;
+    }
+  }
+};
+
+// A glyph with no outline to fill, drawn instead: Apple Color Emoji's
+// bitmaps, which come out as their silhouettes.
+struct DrawnGlyph {
+  CTFontRef font;  // the run's, alive as long as the layout
+  CGGlyph glyph;
+  CGPoint origin;  // canvas space, y down
+};
+
+// layoutCoverage(layoutHandle, pad?) -> { width, height, data } | null
+//
+// How much of each pixel a layout's glyphs cover, one byte a pixel, without
+// drawing the layout anywhere: for text drawn where a surface is not, such as
+// a GL surface's label atlas or a signed distance field made from a string.
+// The raster is the layout's box in whole pixels, createLayout's width and
+// height rounded up, with `pad` pixels round it (a fraction rounds up too).
+// `data` is width × height bytes, row-major, the top row first, and the
+// layout's origin is at (pad, pad): the glyphs are where
+// drawLayout(surface, layout, pad, pad) would draw them, one pixel to one of
+// the layout's units. Null for anything that is not a layout, and for a layout
+// with no box and no pad to make one.
+//
+// It is the outlines' own coverage, which is what a raster that will be scaled
+// wants, and not the ink the screen gets. Every glyph's outline goes where the
+// typesetter put it, unrounded, and the whole layout is filled once, non-zero,
+// so glyphs that overlap cover a pixel once. CoreText's glyph rasterizer is
+// not used for it, even with font smoothing off: it snaps nothing, but it
+// shrinks a small glyph's counters (Menlo's b at 14px comes out 5% heavier
+// than its outline). CoreGraphics' own path fill is exact to a percent but
+// costs several times the draw and readback this replaces.
+//
+// Ink is the caller's: a span's colour plays no part, so a translucent span
+// covers what an opaque one does. A glyph with no outline but ink of its own
+// (Apple Color Emoji's bitmaps) is drawn over the rest into an alpha-only
+// bitmap, which keeps its alpha: its silhouette.
+static Napi::Value LayoutCoverage(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsExternal()) return env.Null();
+  CALLayout* layout = LayoutFrom(info[0]);
+  const double asked = info.Length() > 1 && info[1].IsNumber()
+                           ? info[1].As<Napi::Number>().DoubleValue()
+                           : 0;
+  const long pad =
+      asked > 0 && std::isfinite(asked) ? (long)std::ceil(asked) : 0;
+  const long width = (long)std::ceil(layout->width) + pad * 2;
+  const long height = (long)std::ceil(layout->height) + pad * 2;
+  if (width <= 0 || height <= 0) return env.Null();
+
+  CoverageAccumulator acc(width, height);
+  OutlineWalk walk{&acc};
+  std::vector<DrawnGlyph> drawn;
+  std::vector<CGGlyph> glyphs;
+  std::vector<CGPoint> positions;
+  for (const CALLine& L : layout->lines) {
+    CFArrayRef runs = CTLineGetGlyphRuns(L.line);
+    for (CFIndex ri = 0; ri < CFArrayGetCount(runs); ri++) {
+      CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, ri);
+      CTFontRef font = (CTFontRef)CFDictionaryGetValue(
+          CTRunGetAttributes(run), kCTFontAttributeName);
+      const CFIndex count = CTRunGetGlyphCount(run);
+      if (!font || count <= 0) continue;
+      glyphs.resize((size_t)count);
+      positions.resize((size_t)count);
+      CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
+      CTRunGetPositions(run, CFRangeMake(0, 0), positions.data());
+      for (size_t g = 0; g < (size_t)count; g++) {
+        // a glyph shaping deleted, such as a ligature's second half
+        if (glyphs[g] == kCGFontIndexInvalid) continue;
+        // positions are from the line's origin, y up; outlines are y up
+        // from the glyph's origin, flipped here into canvas space
+        const double ox = pad + L.x + positions[g].x;
+        const double oy = pad + L.baseline - positions[g].y;
+        const CGAffineTransform t = {1, 0, 0, -1, ox, oy};
+        CGPathRef outline = CTFontCreatePathForGlyph(font, glyphs[g], &t);
+        if (outline) {
+          walk.x = walk.sx = walk.y = walk.sy = 0;
+          CGPathApply(outline, &walk, OutlineWalk::Apply);
+          walk.Close();
+          CGPathRelease(outline);
+          continue;
+        }
+        // no outline: a space, or a glyph whose ink is a bitmap
+        CGRect bounds;
+        CTFontGetBoundingRectsForGlyphs(font, kCTFontOrientationDefault,
+                                        &glyphs[g], &bounds, 1);
+        if (!CGRectIsEmpty(bounds))
+          drawn.push_back({font, glyphs[g], CGPointMake(ox, oy)});
+      }
+    }
+  }
+
+  // A new ArrayBuffer is zeroed, which is "covers nothing".
+  Napi::Uint8Array data = Napi::Uint8Array::New(env, (size_t)(width * height));
+  acc.ToAlpha(data.Data());
+  if (!drawn.empty()) {
+    CGContextRef ctx = CGBitmapContextCreate(
+        data.Data(), (size_t)width, (size_t)height, 8, (size_t)width, NULL,
+        (CGBitmapInfo)kCGImageAlphaOnly);
+    if (ctx) {
+      // top-left origin, y down, as a surface's base CTM has it; the glyph at
+      // the position the run gave it, the way drawLayout draws it
+      CGContextTranslateCTM(ctx, 0, (CGFloat)height);
+      CGContextScaleCTM(ctx, 1, -1);
+      CGContextSetShouldSmoothFonts(ctx, false);
+      CGContextSetShouldSubpixelPositionFonts(ctx, true);
+      CGContextSetShouldSubpixelQuantizeFonts(ctx, false);
+      CGContextSetGrayFillColor(ctx, 0, 1);
+      CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1, -1));
+      for (const DrawnGlyph& d : drawn) {
+        // CTFontDrawGlyphs reads positions in text space, through the flip
+        const CGPoint at = CGPointMake(d.origin.x, -d.origin.y);
+        CTFontDrawGlyphs(d.font, &d.glyph, &at, 1, ctx);
+      }
+      CGContextRelease(ctx);
+    }
+  }
+
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("width", (double)width);
+  out.Set("height", (double)height);
+  out.Set("data", data);
+  return out;
+}
+
 // ctxSetShadow(surface, blur, dx, dy, r, g, b, a) — blur <= 0 clears.
 static Napi::Value CtxSetShadow(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
@@ -6642,6 +6943,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("symbolSize", SymbolSize);
   BFN("layoutIndexAt", LayoutIndexAt);
   BFN("layoutCaret", LayoutCaret);
+  BFN("layoutCoverage", LayoutCoverage);
   BFN("pasteboardWriteText", PbWriteTextFn);
   BFN("pasteboardReadText", PbReadTextFn);
   BFN("pasteboardClear", PbClearFn);

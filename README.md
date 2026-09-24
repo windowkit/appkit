@@ -524,6 +524,37 @@ const label = native.createLayout({
 });
 ```
 
+## Text: a layout's coverage
+
+- **`native.layoutCoverage(layout, pad?)`** — `{ width, height, data }`: how much of each
+  pixel a `createLayout` layout's glyphs cover, one byte a pixel, without drawing the layout
+  anywhere. It is for text drawn where a surface is not, such as a GL surface's label atlas
+  or a signed distance field made from a string. The raster is the layout's box in whole
+  pixels (its `width` and `height` rounded up) with `pad` pixels round it, and a fractional
+  pad rounds up. `data` is a `Uint8Array` of `width × height` bytes, row-major, the top row
+  first, and the layout's origin, the `x, y` that `drawLayout` is handed, is at
+  `(pad, pad)`. `null` for anything that is not a layout, and for an empty layout with no
+  pad.
+
+It is the outlines' own coverage, not the ink the screen gets. Every glyph's outline goes
+where the typesetter put it, unrounded, and the layout is filled once with the non-zero rule,
+so glyphs that overlap cover a pixel once. The fill is signed-area accumulation, the
+rasterizer ntk (react-x11's X11 text engine) uses, so the two give the same bytes for the
+same outlines at the same positions. Nothing is smoothed, nothing is held on a glyph cache's
+subpixel grid, and a span's colour plays no part: a translucent span covers what an opaque
+one does. A glyph with no outline but ink of its own, Apple Color Emoji's bitmaps, comes out
+as its silhouette. The same layout drawn by `drawLayout` onto a transparent surface is
+30–45% heavier at text sizes, which is font smoothing, and its glyphs sit on half pixels.
+
+It runs on the calling thread in threaded mode too, and answers the same bytes there.
+
+```js
+const font = native.matchFont({ families: ['system-ui'], size: 26 });
+const label = native.createLayout({ spans: [{ text: 'Hamburg', font }] });
+const { width, height, data } = native.layoutCoverage(label.handle, 4);
+// data[y * width + x] is 0-255, and the text's origin is at (4, 4)
+```
+
 ## SF Symbols in a surface
 
 The system's icons by name — what `createStatusItem`'s `image` and a menu item's `iconName`

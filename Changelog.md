@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/windowkit/appkit/compare/v0.13.0...v0.14.0) (2026-09-25)
+
+
+### Features
+
+* a paragraph's typesetter, kept and laid out again at another width ([#75](https://github.com/windowkit/appkit/issues/75)) ([63cbc8d](https://github.com/windowkit/appkit/commit/63cbc8d6d4b9db36e8b7a5f3dbe50e1543b28edd))
+
 ## [0.13.0](https://github.com/windowkit/appkit/compare/v0.12.0...v0.13.0) (2026-09-24)
 
 

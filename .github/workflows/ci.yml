@@ -246,6 +246,8 @@ jobs:
         run: node test/text-features.js
       - name: A layout's coverage, drawn nowhere — the outlines' own, from a worker too
         run: node test/text-coverage.js
+      - name: A paragraph's typesetter, kept and laid out again at other widths
+        run: node test/text-typesetter.js
       - name: SF Symbols drawn in a surface, in the fill colour, and from a worker
         run: node test/symbols.js
       - name: EventKit privacy authorizations, the reading half and the argument shapes

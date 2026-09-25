@@ -555,6 +555,38 @@ const { width, height, data } = native.layoutCoverage(label.handle, 4);
 // data[y * width + x] is 0-255, and the text's origin is at (4, 4)
 ```
 
+## Text: a paragraph laid out again
+
+Most of a `createLayout` is the text becoming glyphs: the attributed string built from the
+spans, and the typesetter CoreText shapes it with — two thirds of the call over a long
+document. A layout of the same paragraph at another width breaks the same glyphs into other
+lines, which is what a window resize does to every paragraph of a document, and what a
+paragraph's max-content and wrapped measurements are.
+
+- **`keep: true`** — the result carries the paragraph's typesetter as `typesetter`.
+- **`typesetter`** — handed to a later `createLayout` in place of `spans`, it lays the same
+  text out at that call's `maxWidth`, `align`, `lineHeight`, `maxLines` and `ellipsis`,
+  and the layout is the one the spans would have made, line for line and pixel for pixel.
+  `rtl` is the typesetter's and ignored beside one.
+- **`native.releaseTypesetter(typesetter)`** — frees it now, where a cache lets one go.
+  Idempotent; a released one handed to `createLayout` throws. The finalizer is the safety
+  net, and the memory is reported to V8, at about 25 bytes a UTF-16 unit.
+- **`packed: true`** — the geometry as two `Float64Array`s in place of `lines`: `lineData`,
+  ten numbers a line (`x`, `y`, `width`, `height`, `baseline`, `ascent`, `descent`,
+  `start`, `end`, and how many runs it has), and `runData`, five a run in line order (`x`,
+  `width`, `start`, `end`, and `1` when it runs right to left). An object a line and a run
+  is a call into V8 a field, and for short paragraphs building them was a sixth of the call.
+
+A 50-character paragraph on an M1 Pro: 34 µs a layout from its spans, 16 µs from its kept
+typesetter, 8.6 µs packed.
+
+```js
+const first = native.createLayout({ spans, maxWidth: 600, keep: true });
+const narrower = native.createLayout({ typesetter: first.typesetter, maxWidth: 420, packed: true });
+// narrower.lineData, narrower.runData
+native.releaseTypesetter(first.typesetter);
+```
+
 ## SF Symbols in a surface
 
 The system's icons by name — what `createStatusItem`'s `image` and a menu item's `iconName`

@@ -4981,27 +4981,45 @@ static CALLayout* LayoutFrom(Napi::Value v) {
   return (CALLayout*)v.As<Napi::External<void>>().Data();
 }
 
-// createLayout({ spans: [{text, font (handle), color:[r,g,b,a]}],
-//                maxWidth?, align: 0 left | 0.5 center | 1 right,
-//                lineHeight?, maxLines?, ellipsis?, rtl? })
-// -> { handle, width, height,
-//      lines: [{x,y,width,height,baseline,descent,start,end,
-//               runs:[{x,width,start,end,rtl}]}] }
-static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  Napi::Object o = info[0].As<Napi::Object>();
-  double maxWidth = BNumOr(o, "maxWidth", 0);
-  bool bounded = maxWidth > 0 && std::isfinite(maxWidth);
-  double flush = BNumOr(o, "align", 0);
-  double lineHeight = BNumOr(o, "lineHeight", 0);
-  long maxLines = (long)BNumOr(o, "maxLines", 0);
-  bool ellipsis = BBoolOr(o, "ellipsis", false);
-  bool rtl = BBoolOr(o, "rtl", false);
-  if (ellipsis && maxLines <= 0) maxLines = 1;
+// --- a paragraph's typesetter, kept -----------------------------------------
+//
+// Most of a layout is the text becoming glyphs: the attributed string built
+// from the spans, and the typesetter CoreText shapes it with — two thirds of
+// a createLayout over a long document, the lines broken from it the rest. A
+// layout of the same paragraph at another width breaks the same glyphs into
+// other lines, so a caller that asks with `keep: true` gets the typesetter
+// back (`typesetter` on the result) and hands it to the next createLayout of
+// that text in place of the spans. It holds the shaped text and nothing
+// about a width: align, lineHeight, maxLines and the ellipsis are the
+// layout's own. `releaseTypesetter` frees one now; the finalizer is the
+// safety net, and the bytes are reported to V8 so that it runs.
+struct CALTypesetter {
+  CTTypesetterRef ts = nullptr;
+  NSAttributedString* text = nil;  // strong, under ARC
+  NSDictionary* lastAttrs = nil;   // the last span's: the ellipsis token's
+  bool rtl = false;
+  int64_t bytes = 0;
+  void Release(Napi::Env env) {
+    if (ts) CFRelease(ts);
+    ts = nullptr;
+    text = nil;
+    lastAttrs = nil;
+    if (bytes) Napi::MemoryManagement::AdjustExternalMemory(env, -bytes);
+    bytes = 0;
+  }
+};
 
+// About what CoreText keeps for a shaped paragraph — its glyphs, their
+// positions and advances, the string — measured at 25 bytes a UTF-16 unit.
+static const int64_t kTypesetterBytesPerUnit = 25;
+
+// The attributed string for `spans` and its typesetter; `ts` stays null for
+// an empty paragraph.
+static CALTypesetter* TypesetSpans(Napi::Array spans, bool rtl) {
+  auto* shaped = new CALTypesetter();
+  shaped->rtl = rtl;
   NSMutableAttributedString* as = [[NSMutableAttributedString alloc] init];
   NSDictionary* lastAttrs = nil;
-  Napi::Array spans = o.Get("spans").As<Napi::Array>();
   for (uint32_t i = 0; i < spans.Length(); i++) {
     Napi::Object span = spans.Get(i).As<Napi::Object>();
     NSString* text = span.Has("text") && span.Get("text").IsString()
@@ -5035,12 +5053,88 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
     [as appendAttributedString:[[NSAttributedString alloc] initWithString:text
                                                                attributes:attrs]];
   }
+  shaped->text = as;
+  shaped->lastAttrs = lastAttrs;
+  if (as.length > 0) {
+    shaped->ts = CTTypesetterCreateWithAttributedString(
+        (__bridge CFAttributedStringRef)as);
+  }
+  return shaped;
+}
+
+static void TypesetterFinalize(Napi::Env env, void* d) {
+  auto* shaped = (CALTypesetter*)d;
+  shaped->Release(env);
+  delete shaped;
+}
+
+// releaseTypesetter(handle) — free a kept typesetter now. Idempotent; a
+// createLayout handed a released one throws.
+static Napi::Value ReleaseTypesetter(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsExternal()) {
+    Napi::TypeError::New(env, "releaseTypesetter: expected a typesetter")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  ((CALTypesetter*)info[0].As<Napi::External<void>>().Data())->Release(env);
+  return env.Undefined();
+}
+
+// createLayout({ spans: [{text, font (handle), color:[r,g,b,a]}],
+//                maxWidth?, align: 0 left | 0.5 center | 1 right,
+//                lineHeight?, maxLines?, ellipsis?, rtl?,
+//                keep?, typesetter?, packed? })
+// -> { handle, width, height,
+//      lines: [{x,y,width,height,baseline,descent,start,end,
+//               runs:[{x,width,start,end,rtl}]}],
+//      typesetter? }
+//
+// `keep: true` returns the paragraph's typesetter as `typesetter`, and a
+// later createLayout given it in place of `spans` breaks the same shaped
+// text at its own options — see CALTypesetter; `rtl` is the typesetter's,
+// and ignored beside one. `packed: true` returns the geometry as two
+// Float64Arrays in place of `lines`, which is a tenth of the calls into the
+// engine for a paragraph of a few lines: `lineData`, ten numbers a line —
+// x, y, width, height, baseline, ascent, descent, start, end and how many
+// runs it has — and `runData`, five a run in line order — x, width, start,
+// end, and 1 when it runs right to left.
+static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Object o = info[0].As<Napi::Object>();
+  double maxWidth = BNumOr(o, "maxWidth", 0);
+  bool bounded = maxWidth > 0 && std::isfinite(maxWidth);
+  double flush = BNumOr(o, "align", 0);
+  double lineHeight = BNumOr(o, "lineHeight", 0);
+  long maxLines = (long)BNumOr(o, "maxLines", 0);
+  bool ellipsis = BBoolOr(o, "ellipsis", false);
+  bool rtl = BBoolOr(o, "rtl", false);
+  bool keep = BBoolOr(o, "keep", false);
+  bool packed = BBoolOr(o, "packed", false);
+  if (ellipsis && maxLines <= 0) maxLines = 1;
+
+  CALTypesetter* shaped = nullptr;
+  bool owned = false;
+  if (o.Has("typesetter") && o.Get("typesetter").IsExternal()) {
+    shaped = (CALTypesetter*)o.Get("typesetter")
+                 .As<Napi::External<void>>()
+                 .Data();
+    if (!shaped->text) {
+      Napi::Error::New(env, "createLayout: the typesetter was released")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+  } else {
+    shaped = TypesetSpans(o.Get("spans").As<Napi::Array>(), rtl);
+    owned = true;
+  }
+  NSAttributedString* as = shaped->text;
+  NSDictionary* lastAttrs = shaped->lastAttrs;
+  CTTypesetterRef ts = shaped->ts;
 
   auto* layout = new CALLayout();
   long total = (long)as.length;
-  if (total > 0) {
-    CTTypesetterRef ts =
-        CTTypesetterCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+  if (total > 0 && ts) {
     double y = 0;
     long start = 0;
     long lineIndex = 0;
@@ -5132,7 +5226,6 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       if (maxLines > 0 && lineIndex >= maxLines) break;
     }
     layout->height = y;
-    CFRelease(ts);
   }
 
   Napi::Object r = Napi::Object::New(env);
@@ -5141,6 +5234,46 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
         }));
   r.Set("width", layout->width);
   r.Set("height", layout->height);
+  if (owned && keep) {
+    shaped->bytes = (int64_t)total * kTypesetterBytesPerUnit;
+    if (shaped->bytes)
+      Napi::MemoryManagement::AdjustExternalMemory(env, shaped->bytes);
+    r.Set("typesetter",
+          Napi::External<void>::New(env, shaped, TypesetterFinalize));
+  } else if (owned) {
+    shaped->Release(env);
+    delete shaped;
+  }
+  if (packed) {
+    size_t runCount = 0;
+    for (const CALLine& L : layout->lines) runCount += L.runs.size();
+    Napi::Float64Array lineData =
+        Napi::Float64Array::New(env, layout->lines.size() * 10);
+    Napi::Float64Array runData = Napi::Float64Array::New(env, runCount * 5);
+    size_t li = 0, ri = 0;
+    for (const CALLine& L : layout->lines) {
+      lineData[li++] = L.x;
+      lineData[li++] = L.y;
+      lineData[li++] = L.width;
+      lineData[li++] = L.height;
+      lineData[li++] = L.baseline;
+      lineData[li++] = L.ascent;
+      lineData[li++] = L.descent;
+      lineData[li++] = (double)L.start;
+      lineData[li++] = (double)L.end;
+      lineData[li++] = (double)L.runs.size();
+      for (const CALRun& R : L.runs) {
+        runData[ri++] = R.x;
+        runData[ri++] = R.width;
+        runData[ri++] = (double)R.start;
+        runData[ri++] = (double)R.end;
+        runData[ri++] = R.rtl ? 1 : 0;
+      }
+    }
+    r.Set("lineData", lineData);
+    r.Set("runData", runData);
+    return r;
+  }
   Napi::Array lines = Napi::Array::New(env, layout->lines.size());
   for (size_t i = 0; i < layout->lines.size(); i++) {
     const CALLine& L = layout->lines[i];
@@ -6937,6 +7070,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("listFonts", ListFonts);
   BFN("loadFontData", LoadFontData);
   BFN("createLayout", CreateLayout);
+  BFN("releaseTypesetter", ReleaseTypesetter);
   BFN("drawLayout", DrawLayout);
   BFN("ctxDrawGlyphs", CtxDrawGlyphs);
   BFN("ctxDrawSymbol", CtxDrawSymbol);

@@ -106,6 +106,20 @@ async function run() {
   native.destroyWindow2(win); // counted once
   for (let t = Date.now(); native.windowIsVisible(win) !== null && Date.now() - t < 2000; ) await sleep(10);
   assert.strictEqual(native.getWindowFrame(win), null, 'the published copy is gone with the window');
+
+  // A window taller than any screen: AppKit constrains it while ordering it
+  // in, before it is visible, so its own resize and move report a window
+  // not yet shown and nothing reports it shown. `window-shown` does, after
+  // the visibility it announces is published — a worker that deferred the
+  // window's frames runs them on the batch the event arrives in.
+  const tall = native.createWindow2({ width: 300, height: 5000, title: 'too tall', x: 40, y: 40 });
+  await until((ev) => ev.type === 'window-created' && ev.handle === tall, 'the tall window made');
+  native.showWindow(tall, false);
+  await until((ev) => ev.type === 'window-shown' && ev.handle === tall, 'window-shown naming the handle');
+  assert.strictEqual(native.windowIsVisible(tall), true, 'visible when window-shown arrives');
+  const constrained = native.getWindowFrame(tall);
+  assert(constrained.height < 5000, `constrained to the screen (${constrained.height} tall)`);
+  native.destroyWindow2(tall);
   say('windows: ok');
 
   // --- menus, the Dock, the app ---------------------------------------------

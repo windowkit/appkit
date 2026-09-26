@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/windowkit/appkit/compare/v0.14.1...v0.15.0) (2026-09-26)
+
+
+### Bug Fixes
+
+* a line's glyphs sit in the middle of its line box, as ntk sets them ([#80](https://github.com/windowkit/appkit/issues/80)) ([aac1c23](https://github.com/windowkit/appkit/commit/aac1c2355f094929a438f2949c262b392e7d374e))
+* a line's width leaves out the white space it ends on, as ntk's does ([#81](https://github.com/windowkit/appkit/issues/81)) ([22313f4](https://github.com/windowkit/appkit/commit/22313f4420f5bf72ddf1f73e0e1b2cca7958fcc1))
+
 ## [0.14.1](https://github.com/windowkit/appkit/compare/v0.14.0...v0.14.1) (2026-09-26)
 
 

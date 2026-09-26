@@ -5115,7 +5115,11 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
   double maxWidth = BNumOr(o, "maxWidth", 0);
   bool bounded = maxWidth > 0 && std::isfinite(maxWidth);
   double flush = BNumOr(o, "align", 0);
-  double lineHeight = BNumOr(o, "lineHeight", 0);
+  // A multiplier over each line's natural height, as ntk's is: absent is 1,
+  // and 0 is a line box of no height — CSS's `line-height: 0`, which the
+  // glyphs overflow evenly — not an option left unset.
+  double lineHeight = BNumOr(o, "lineHeight", 1);
+  if (!(lineHeight >= 0)) lineHeight = 1;
   long maxLines = (long)BNumOr(o, "maxLines", 0);
   bool ellipsis = BBoolOr(o, "ellipsis", false);
   bool rtl = BBoolOr(o, "rtl", false);
@@ -5181,7 +5185,15 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       CGFloat ascent = 0, descent = 0, leading = 0;
       double lw = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
       double natural = ascent + descent + leading;
-      double advance = natural * (lineHeight > 0 ? lineHeight : 1);
+      double advance = natural * lineHeight;
+      // Half-leading, where ntk and CSS put a line's glyphs: whatever the
+      // line box has beyond their ascent and descent — the font's own line
+      // gap, and what the multiplier adds or takes away — is split evenly
+      // above and below them. It all went under the text here, so a
+      // paragraph set at 1.5 sat at the top of its lines on this backend and
+      // in their middle on X11, and a line shorter than its glyphs
+      // overflowed downwards only.
+      double halfLeading = (advance - (ascent + descent)) / 2;
       CALLine L;
       L.line = line;
       L.width = lw;
@@ -5189,7 +5201,7 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       L.ascent = ascent;
       L.descent = descent;
       L.y = y;
-      L.baseline = y + ascent;
+      L.baseline = y + halfLeading + ascent;
       L.start = start;
       L.end = lineEnd;
       if (lineEnd > start) {

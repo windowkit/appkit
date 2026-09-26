@@ -5127,6 +5127,41 @@ static double HangingWhitespaceWidth(CTLineRef line, NSString* text,
   return width;
 }
 
+// Where a line that CoreText broke inside a word should end instead.
+// CoreText breaks a word wider than the line between two of its clusters,
+// as ntk does; but where not even the word's first cluster fits it gives
+// the line that one cluster anyway, so a word in a box narrower than its
+// first letter came out a letter a line — and a width of 1, which is how a
+// layout is asked for its narrowest (a table column's minimum, the longest
+// word), measured the widest letter here and the longest word on X11. ntk
+// lets such a word overflow whole, and so does CSS: the line runs on to the
+// next place a line may break. Only a line of one cluster is looked at, so
+// ordinary wrapping costs a comparison.
+static long UnfitClusterRunsOn(CTTypesetterRef ts, NSString* text,
+                               CFStringTokenizerRef* breaks, long start,
+                               long count, long total, double width) {
+  if (count > 16) return count;
+  if ((long)CTTypesetterSuggestClusterBreak(ts, start, 0) != count) {
+    return count;
+  }
+  CTLineRef probe = CTTypesetterCreateLine(ts, CFRangeMake(start, count));
+  double w = CTLineGetTypographicBounds(probe, nullptr, nullptr, nullptr) -
+             HangingWhitespaceWidth(probe, text, start, start + count);
+  CFRelease(probe);
+  if (w <= width) return count;
+  if (!*breaks) {
+    *breaks = CFStringTokenizerCreate(
+        nullptr, (__bridge CFStringRef)text, CFRangeMake(0, total),
+        kCFStringTokenizerUnitLineBreak, nullptr);
+  }
+  if (!*breaks) return count;
+  CFStringTokenizerGoToTokenAtIndex(*breaks, start);
+  CFRange word = CFStringTokenizerGetCurrentTokenRange(*breaks);
+  if (word.location == kCFNotFound) return count;
+  long end = std::min(total, (long)(word.location + word.length));
+  return std::max(count, end - start);
+}
+
 // createLayout({ spans: [{text, font (handle), color:[r,g,b,a]}],
 //                maxWidth?, align: 0 left | 0.5 center | 1 right,
 //                lineHeight?, maxLines?, ellipsis?, rtl?,
@@ -5189,10 +5224,15 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
     long start = 0;
     long lineIndex = 0;
     double breakWidth = bounded ? maxWidth : 1e9;
+    CFStringTokenizerRef breaks = nullptr;
     while (start < total) {
       long count =
           (long)CTTypesetterSuggestLineBreak(ts, start, breakWidth);
       if (count <= 0) count = 1;
+      if (bounded && start + count < total) {
+        count = UnfitClusterRunsOn(ts, as.string, &breaks, start, count, total,
+                                   breakWidth);
+      }
       bool lastAllowed = maxLines > 0 && lineIndex == maxLines - 1;
       bool more = start + count < total;
       CTLineRef line = nullptr;
@@ -5293,6 +5333,7 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       start = lineEnd;
       if (maxLines > 0 && lineIndex >= maxLines) break;
     }
+    if (breaks) CFRelease(breaks);
     layout->height = y;
   }
 

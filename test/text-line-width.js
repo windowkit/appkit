@@ -6,7 +6,8 @@
 // one, and every wrapped line counted the space it broke at.
 //
 // Checked: text measures the same with one trailing space, several, a tab,
-// or none;
+// a line break or none, and a no-break space it ends on is measured, as CSS
+// measures it;
 // each line of a wrapped paragraph is as wide as its words laid out alone; a
 // line of nothing but spaces is 0 wide; flush right still sets each line's
 // ink against the edge; and nothing drawn changes. Exits 0 when every
@@ -31,13 +32,22 @@ const layoutOf = (text, extra = {}) =>
 // --- trailing space ------------------------------------------------------------
 
 const bare = layoutOf('ab');
-for (const text of ['ab ', 'ab   ', 'ab\t']) {
+for (const text of ['ab ', 'ab   ', 'ab\t', 'ab\n', 'ab \n']) {
   const spaced = layoutOf(text);
   ok(near(spaced.width, bare.width), 'a trailing space is not measured', JSON.stringify(text), spaced.width, bare.width);
   ok(near(spaced.lines[0].width, bare.lines[0].width), 'nor in its line', JSON.stringify(text));
 }
 const blank = layoutOf('   ');
 ok(near(blank.lines[0].width, 0) && near(blank.width, 0), 'a line of spaces is 0 wide', blank.width);
+
+// --- a no-break space -------------------------------------------------------------
+// is not white space a line hangs: CSS measures it wherever it stands, and
+// CTLineGetTrailingWhitespaceWidth counted it in with the spaces.
+
+const nbsp = layoutOf('\u00a0ab').width - bare.width;
+ok(nbsp > 1, 'the face has a no-break space', nbsp);
+ok(near(layoutOf('ab\u00a0').width, bare.width + nbsp, 0.01), 'a trailing no-break space is measured', layoutOf('ab\u00a0').width, bare.width + nbsp);
+ok(near(layoutOf('ab\u00a0 ').width, bare.width + nbsp, 0.01), 'and a space after it still hangs', layoutOf('ab\u00a0 ').width);
 
 // --- wrapped ---------------------------------------------------------------------
 

@@ -32,6 +32,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <vector>
 
 #include "channel.h"
 
@@ -5091,6 +5092,41 @@ static Napi::Value ReleaseTypesetter(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// The advance of the spaces, tabs and line breaks a line ends on — what
+// hangs past it, as ntk and CSS hang white space. CTLineGetTrailingWhitespace
+// Width counts everything CoreText calls white space, the no-break space
+// among it, where CSS measures a no-break space wherever it stands: `&nbsp;`
+// at the end of a cell or a span is there to take room. So the run is found
+// in the text, and its glyphs' advances summed, whichever way the line reads.
+static double HangingWhitespaceWidth(CTLineRef line, NSString* text,
+                                     long start, long end) {
+  long hang = end;
+  while (hang > start) {
+    unichar c = [text characterAtIndex:(NSUInteger)(hang - 1)];
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != 0x2028 &&
+        c != 0x2029)
+      break;
+    hang--;
+  }
+  if (hang == end) return 0;
+  double width = 0;
+  CFArrayRef runs = CTLineGetGlyphRuns(line);
+  CFIndex n = CFArrayGetCount(runs);
+  for (CFIndex i = 0; i < n; i++) {
+    CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, i);
+    CFIndex count = CTRunGetGlyphCount(run);
+    if (count <= 0) continue;
+    std::vector<CGSize> advances((size_t)count);
+    std::vector<CFIndex> indices((size_t)count);
+    CTRunGetAdvances(run, CFRangeMake(0, 0), advances.data());
+    CTRunGetStringIndices(run, CFRangeMake(0, 0), indices.data());
+    for (CFIndex g = 0; g < count; g++) {
+      if (indices[g] >= hang && indices[g] < end) width += advances[g].width;
+    }
+  }
+  return width;
+}
+
 // createLayout({ spans: [{text, font (handle), color:[r,g,b,a]}],
 //                maxWidth?, align: 0 left | 0.5 center | 1 right,
 //                lineHeight?, maxLines?, ellipsis?, rtl?,
@@ -5161,7 +5197,9 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       bool more = start + count < total;
       CTLineRef line = nullptr;
       long lineEnd = start + count;
+      bool elided = false;
       if (lastAllowed && more && ellipsis && lastAttrs) {
+        elided = true;
         // shape the whole remainder, then truncate it into the width
         CTLineRef whole =
             CTTypesetterCreateLine(ts, CFRangeMake(start, total - start));
@@ -5188,8 +5226,10 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       // ends on hangs past it. CoreText counts that space in, so a paragraph
       // ending in one measured a space wider here than on X11 — and a box
       // sized to it grew by one — and every wrapped line counted the space
-      // it broke at. Flush alignment already leaves it out.
-      lw -= CTLineGetTrailingWhitespaceWidth(line);
+      // it broke at. Flush alignment already leaves it out. An elided line
+      // ends on its ellipsis, whose glyph is no part of the text.
+      lw -= elided ? CTLineGetTrailingWhitespaceWidth(line)
+                   : HangingWhitespaceWidth(line, as.string, start, lineEnd);
       double natural = ascent + descent + leading;
       double advance = natural * lineHeight;
       // Half-leading, where ntk and CSS put a line's glyphs: whatever the

@@ -531,6 +531,17 @@ const label = native.createLayout({
 });
 ```
 
+## Text: where a line's glyphs sit
+
+`createLayout`'s `lineHeight` is a multiplier over each line's natural height — its
+ascent, descent and the face's line gap — and a line's box is that tall. Whatever the box
+has beyond the glyphs' ascent and descent is split evenly above and below them: each line's
+`baseline` is its `y`, plus half that leading, plus its `ascent`. That is CSS's
+half-leading, and it is ntk's, the engine react-x11 draws text with on X11 and Wayland, so
+one tree sets its text in the same place on both. Below 1 the same split takes room from
+both sides and the glyphs overflow a short box evenly; `0` is a box of no height, as CSS's
+`line-height: 0` is. An absent multiplier is 1.
+
 ## Text: a layout's coverage
 
 - **`native.layoutCoverage(layout, pad?)`** — `{ width, height, data }`: how much of each

@@ -222,6 +222,13 @@ nothing. While `runMain` runs, `listScreens`, `accessibilityDisplayOptions` and
 `pasteboardChangeCount` answer from it when called off the main thread. On the main
 thread they still ask AppKit live, as in pump mode.
 
+A copy that changes with no event after it is a renderer left waiting, so `showWindow`
+sends `window-shown { handle }` once the window is on screen and published. AppKit's own
+notifications usually say as much, since the window moves as it is ordered in, but a
+window taller than its screen is constrained, resized and moved before it is visible, and
+nothing after that says it is shown. A worker that holds the frames of a window it cannot
+see waited on that window for good.
+
 **Exit and signals.** Before the run stops, menu tracking is cancelled and an app-modal
 loop stopped, since `[NSApp stop:]` only ends the innermost loop. A drag session or a live
 resize cannot be ended from code, so the exit waits for the button to come up. While the run lasts,

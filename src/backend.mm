@@ -1054,6 +1054,15 @@ static double BNumArg(const Napi::CallbackInfo& info, size_t i) {
 }
 
 // showWindow(win, activate) — map. Popups order front without activating.
+//
+// Then `window-shown`, once the window is on screen and published: a worker
+// reads a window's visibility from what was published last, and defers the
+// frames of a window it cannot see until an event says otherwise. The event
+// that usually says so is AppKit's own — the move that follows ordering the
+// window in — but a window AppKit constrains to the screen is resized and
+// moved while it is still being ordered in, before it is visible, and
+// nothing follows. Its frames waited for good, and a `<glarea>` in it never
+// drew a frame.
 static Napi::Value ShowWindowFn(const Napi::CallbackInfo& info) {
   bool activate = info.Length() > 1 && info[1].ToBoolean().Value();
   OnWindow(info[0], ^(NSWindow* win) {
@@ -1064,6 +1073,7 @@ static Napi::Value ShowWindowFn(const Napi::CallbackInfo& info) {
       [win orderFrontRegardless];
     }
     PublishWindow(win);
+    CALEmit(WindowEvent(win, "window-shown"));
   });
   return info.Env().Undefined();
 }

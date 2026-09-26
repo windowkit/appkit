@@ -170,9 +170,16 @@ function checkEvent(e, byId) {
     console.log('calendars: granted —', list.length, 'calendars,', events.length, 'occurrences in 120 days,', allDay.length, 'of them all-day');
   } else {
     // without the grant both verbs answer an error naming the status: "no
-    // events" and "not allowed to look" must not read the same
-    for (const [what, p] of [['list', calendars.list()], ['eventsBetween', calendars.eventsBetween({ start: far, end: far + DAY })]]) {
-      const err = await p.then((v) => v, (e) => e);
+    // events" and "not allowed to look" must not read the same. Each answer
+    // is settled as it is asked for: awaited one after the other, the second
+    // could reject before the first had answered, with nothing yet handling
+    // it — and an unhandled rejection ends the process.
+    const answers = [
+      ['list', calendars.list().then((v) => v, (e) => e)],
+      ['eventsBetween', calendars.eventsBetween({ start: far, end: far + DAY }).then((v) => v, (e) => e)],
+    ];
+    for (const [what, answer] of answers) {
+      const err = await answer;
       if (!(err instanceof Error)) fail(what + ' answered a value without a grant', err);
       if (!err.message.includes(status)) fail(what + ' did not name the status', err.message);
     }

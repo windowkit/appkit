@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/windowkit/appkit/compare/v0.14.0...v0.14.1) (2026-09-26)
+
+
+### Bug Fixes
+
+* showWindow announces the window as shown, once it is published ([#77](https://github.com/windowkit/appkit/issues/77)) ([837d73e](https://github.com/windowkit/appkit/commit/837d73e60f0e156bd67cb0a56d78ff16b6ee1eb8))
+
 ## [0.14.0](https://github.com/windowkit/appkit/compare/v0.13.0...v0.14.0) (2026-09-25)
 
 

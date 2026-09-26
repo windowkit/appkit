@@ -5184,6 +5184,12 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       }
       CGFloat ascent = 0, descent = 0, leading = 0;
       double lw = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+      // A line is as wide as its ink, as ntk measures it: the white space it
+      // ends on hangs past it. CoreText counts that space in, so a paragraph
+      // ending in one measured a space wider here than on X11 — and a box
+      // sized to it grew by one — and every wrapped line counted the space
+      // it broke at. Flush alignment already leaves it out.
+      lw -= CTLineGetTrailingWhitespaceWidth(line);
       double natural = ascent + descent + leading;
       double advance = natural * lineHeight;
       // Half-leading, where ntk and CSS put a line's glyphs: whatever the

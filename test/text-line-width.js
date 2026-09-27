@@ -9,7 +9,8 @@
 // a line break or none, and a no-break space it ends on is measured, as CSS
 // measures it;
 // each line of a wrapped paragraph is as wide as its words laid out alone; a
-// line of nothing but spaces is 0 wide; flush right still sets each line's
+// line of nothing but spaces is 0 wide; a word too wide for the line breaks
+// between its clusters, and runs on whole where not even one fits; flush right still sets each line's
 // ink against the edge; and nothing drawn changes. Exits 0 when every
 // expectation held.
 
@@ -66,6 +67,25 @@ ok(near(wrapped.width, widest), 'and the paragraph as its widest line');
 const right = layoutOf(text, { maxWidth: 120, align: 1 });
 for (const line of right.lines) {
   ok(Math.abs(line.x + line.width - 120) < 0.5, 'flush right sets the ink against the edge', line.x, line.width);
+}
+
+// --- a word too wide for its line -------------------------------------------------
+// breaks between its clusters where some of it fits, as ntk breaks it. Where not
+// even its first cluster fits, CoreText gave the line that one cluster anyway,
+// and at a width of 1 — how a layout is asked for its longest word — a word came
+// out a letter a line. It runs on to the next place a line may break instead, as
+// ntk lets it and as CSS has it.
+
+const glued = layoutOf('ab\u00a0cd', { maxWidth: 1 });
+ok(glued.lines.length === 1, 'a word with no break in it is one line', glued.lines.length);
+ok(near(glued.width, layoutOf('ab\u00a0cd').width), 'as wide as it is');
+const each = layoutOf('ab cdef', { maxWidth: 1 });
+ok(each.lines.length === 2, 'a line a word', each.lines.length);
+ok(near(each.width, layoutOf('cdef').width), 'and the paragraph as its longest word', each.width);
+const split = layoutOf('abcdefghijklmnop', { maxWidth: 40 });
+ok(split.lines.length > 1, 'a word part of which fits still breaks inside it', split.lines.length);
+for (const line of split.lines) {
+  ok(line.width <= 40 + 1e-6, 'each piece fits', line.width);
 }
 
 // --- drawn -------------------------------------------------------------------------

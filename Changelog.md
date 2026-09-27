@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.2](https://github.com/windowkit/appkit/compare/v0.15.1...v0.15.2) (2026-09-27)
+
+
+### Bug Fixes
+
+* a word no part of which fits its line runs on whole ([#86](https://github.com/windowkit/appkit/issues/86)) ([88a2119](https://github.com/windowkit/appkit/commit/88a21191ab5b88513ed72b08c6cf82d830633572))
+
 ## [0.15.1](https://github.com/windowkit/appkit/compare/v0.15.0...v0.15.1) (2026-09-26)
 
 

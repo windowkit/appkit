@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/windowkit/appkit/compare/v0.15.2...v0.16.0) (2026-09-28)
+
+
+### Features
+
+* a push bezel as tall as its frame, for a title that wraps ([#88](https://github.com/windowkit/appkit/issues/88)) ([7c38b72](https://github.com/windowkit/appkit/commit/7c38b7252ea4809e6c2beab5015dcde0b1addf8c))
+
 ## [0.15.2](https://github.com/windowkit/appkit/compare/v0.15.1...v0.15.2) (2026-09-27)
 
 

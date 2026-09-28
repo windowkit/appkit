@@ -1401,7 +1401,7 @@ static NSView* DummyDrawView() {
 
 // drawControl({kind, title, state, pressed, enabled, isDefault, value,
 //              controlSize, appearance, width, height, scale})
-//   kind: 'push' | 'checkbox' | 'radio' | 'popup' | 'slider'
+//   kind: 'push' | 'flexiblePush' | 'checkbox' | 'radio' | 'popup' | 'slider'
 //   -> { image: External<CGImage>, width, height, scale }  (points)
 // width/height default to the cell's natural cellSize (slider must pass them).
 static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
@@ -1418,7 +1418,7 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
 
   NSCell* cell = nil;
   if ([kind isEqualToString:@"checkbox"] || [kind isEqualToString:@"radio"] ||
-      [kind isEqualToString:@"push"]) {
+      [kind isEqualToString:@"push"] || [kind isEqualToString:@"flexiblePush"]) {
     NSButtonCell* c = [[NSButtonCell alloc] initTextCell:title];
     if ([kind isEqualToString:@"checkbox"]) {
       c.buttonType = NSButtonTypeSwitch;
@@ -1426,7 +1426,9 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
       c.buttonType = NSButtonTypeRadio;
     } else {
       c.buttonType = NSButtonTypeMomentaryPushIn;
-      c.bezelStyle = NSBezelStylePush;
+      // one height, or stretched to the frame (src/backend.mm, BuildBezel)
+      c.bezelStyle = [kind isEqualToString:@"flexiblePush"] ? NSBezelStyleFlexiblePush
+                                                             : NSBezelStylePush;
       if (BoolOr(o, "isDefault", false)) c.keyEquivalent = @"\r";  // accent fill
     }
     c.state = state == 1 ? NSControlStateValueOn : NSControlStateValueOff;

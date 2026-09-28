@@ -255,8 +255,9 @@ async function run() {
   const { createHash } = require('crypto');
   const { spawnSync } = require('child_process');
   const jobs = [];
-  for (const kind of ['push', 'checkbox', 'switch', 'slider']) {
-    const spec = { kind, controlSize: 'regular', state: 1, value: 0.5, enabled: true, appearance: 'light', title: kind === 'push' ? 'OK' : '' };
+  for (const kind of ['push', 'flexiblePush', 'checkbox', 'switch', 'slider']) {
+    const titled = kind === 'push' || kind === 'flexiblePush';
+    const spec = { kind, controlSize: 'regular', state: 1, value: 0.5, enabled: true, appearance: 'light', title: titled ? 'OK' : '' };
     const m = await answer((cb) => native.measureControl(spec, cb));
     assert(m.width > 0 && m.height > 0, `${kind}: measured`);
     const pw = Math.round(m.width * 2), ph = Math.round(m.height * 2);

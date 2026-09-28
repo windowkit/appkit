@@ -3479,7 +3479,7 @@ static bool ParseBezelSpec(Napi::Env env, Napi::Value v, BezelSpec* s) {
   }
   Napi::Object o = v.As<Napi::Object>();
   s->kind = BStrOr(o, "kind", @"push");
-  if (![@[ @"push", @"checkbox", @"radio", @"popup", @"slider", @"switch" ]
+  if (![@[ @"push", @"flexiblePush", @"checkbox", @"radio", @"popup", @"slider", @"switch" ]
           containsObject:s->kind]) {
     Napi::Error::New(env, "unknown control kind").ThrowAsJavaScriptException();
     return false;
@@ -3500,7 +3500,7 @@ static BezelControl BuildBezel(const BezelSpec& s) {
   BezelControl out;
   NSString* kind = s.kind;
   if ([kind isEqualToString:@"checkbox"] || [kind isEqualToString:@"radio"] ||
-      [kind isEqualToString:@"push"]) {
+      [kind isEqualToString:@"push"] || [kind isEqualToString:@"flexiblePush"]) {
     NSButtonCell* c = [[NSButtonCell alloc] initTextCell:s.title];
     if ([kind isEqualToString:@"checkbox"]) {
       c.buttonType = NSButtonTypeSwitch;
@@ -3508,7 +3508,12 @@ static BezelControl BuildBezel(const BezelSpec& s) {
       c.buttonType = NSButtonTypeRadio;
     } else {
       c.buttonType = NSButtonTypeMomentaryPushIn;
-      c.bezelStyle = NSBezelStylePush;
+      // A push bezel is one height, whatever frame it is drawn into: asked
+      // for a taller one it draws its own, centred. The flexible push is the
+      // same button stretched to the frame — the bezel AppKit gives a title
+      // that wraps, and the one WebKit and Gecko draw a tall button with.
+      c.bezelStyle = [kind isEqualToString:@"flexiblePush"] ? NSBezelStyleFlexiblePush
+                                                             : NSBezelStylePush;
       // the Return key equivalent is what makes AppKit fill it with the
       // user's accent — the "default button" look
       if (s.isDefault) c.keyEquivalent = @"\r";

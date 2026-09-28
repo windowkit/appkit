@@ -412,7 +412,7 @@ and returns a `CGImage` for `layer.contents`:
 
 ```js
 const img = ca.controls.render({
-  kind: 'push',            // 'push' | 'checkbox' | 'radio' | 'popup' | 'slider' | 'switch'
+  kind: 'push',            // 'push' | 'flexiblePush' | 'checkbox' | 'radio' | 'popup' | 'slider' | 'switch'
   title: 'Click me',
   pressed: false,          // drive this from your own mouse events
   state: 1,                // on/off for checkbox/radio/switch
@@ -435,6 +435,12 @@ Two render paths inside `drawControl`:
   draws offscreen (it defers to the view's layer machinery), and `NSSwitch` has no cell
   at all, so these render a real unparented `NSControl` via
   `displayRectIgnoringOpacity:inContext:`.
+
+A `push` bezel is one height: drawn into a taller frame, AppKit draws its own 22pt bezel
+centred in it. `flexiblePush` is `NSBezelStyleFlexiblePush`, the same button stretched to
+its frame — the bezel AppKit gives a title that wraps, and what WebKit and Gecko draw a
+push button taller than a push button with. At the push's height the two are the same
+pixels, except that the default button's accent fill is flat in the flexible bezel.
 
 The demo re-renders a control's image on each state change; a real renderer would cache
 per `(kind, size, state, appearance)` and nine-slice-stretch bezels with

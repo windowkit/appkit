@@ -3745,6 +3745,46 @@ static Napi::Value CtxRoundRect(const Napi::CallbackInfo& info) {
   CGPathRelease(p);
   return info.Env().Undefined();
 }
+// roundRectXY(surface, x, y, w, h, tlx, tly, trx, try, brx, bry, blx, bly)
+// — a rounded rect whose corners are elliptical, each with its own pair of
+// radii: canvas's roundRect with `{ x, y }` radii, and CSS's
+// `border-radius: 40px / 20px`. The caller has scaled them to fit, as
+// canvas scales them. A corner with no extent on one of its axes is no curve
+// at all, and is square — drawn as two lines it would cut the corner off
+// diagonally. Each quarter ellipse is one cubic, its handles a KAPPA of the
+// radius along each tangent, as WebKit draws an elliptical corner.
+static Napi::Value CtxRoundRectXY(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
+  double v[12];
+  for (int i = 0; i < 12; i++) v[i] = info[i + 1].As<Napi::Number>().DoubleValue();
+  const double x = v[0], y = v[1], r = v[0] + v[2], b = v[1] + v[3];
+  double c[8];
+  for (int i = 0; i < 4; i++) {
+    const bool curved = v[4 + i * 2] > 0 && v[5 + i * 2] > 0;
+    c[i * 2] = curved ? v[4 + i * 2] : 0;
+    c[i * 2 + 1] = curved ? v[5 + i * 2] : 0;
+  }
+  const double tlx = c[0], tly = c[1], trx = c[2], trY = c[3];
+  const double brx = c[4], brY = c[5], blx = c[6], blY = c[7];
+  // how far in from the corner's own point a handle sits, as a fraction of
+  // the radius along it
+  const double k = 1 - 0.5522847498307936;
+  CGMutablePathRef p = CGPathCreateMutable();
+  CGPathMoveToPoint(p, NULL, x + tlx, y);
+  CGPathAddLineToPoint(p, NULL, r - trx, y);
+  if (trx > 0) CGPathAddCurveToPoint(p, NULL, r - trx * k, y, r, y + trY * k, r, y + trY);
+  CGPathAddLineToPoint(p, NULL, r, b - brY);
+  if (brx > 0) CGPathAddCurveToPoint(p, NULL, r, b - brY * k, r - brx * k, b, r - brx, b);
+  CGPathAddLineToPoint(p, NULL, x + blx, b);
+  if (blx > 0) CGPathAddCurveToPoint(p, NULL, x + blx * k, b, x, b - blY * k, x, b - blY);
+  CGPathAddLineToPoint(p, NULL, x, y + tly);
+  if (tlx > 0) CGPathAddCurveToPoint(p, NULL, x, y + tly * k, x + tlx * k, y, x + tlx, y);
+  CGPathCloseSubpath(p);
+  CGContextAddPath(s->ctx, p);
+  CGPathRelease(p);
+  return info.Env().Undefined();
+}
 static Napi::Value CtxArc(const Napi::CallbackInfo& info) {
   // arc(surface, x, y, r, a0, a1, anticlockwise). Angles live in user
   // space, where canvas's y-down "clockwise" sweep is the INCREASING-angle
@@ -7140,6 +7180,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("ctxLineTo", CtxLineTo);
   BFN("ctxRect", CtxRect);
   BFN("ctxRoundRect", CtxRoundRect);
+  BFN("ctxRoundRectXY", CtxRoundRectXY);
   BFN("ctxArc", CtxArc);
   BFN("ctxEllipse", CtxEllipse);
   BFN("ctxCurveTo", CtxCurveTo);

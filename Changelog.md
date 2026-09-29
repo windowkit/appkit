@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/windowkit/appkit/compare/v0.16.0...v0.17.0) (2026-09-29)
+
+
+### Features
+
+* ctxRoundRectXY, a rounded rect whose corners are elliptical ([#90](https://github.com/windowkit/appkit/issues/90)) ([0727e06](https://github.com/windowkit/appkit/commit/0727e064cc4a06b04380edc65ac17c4c67172ae3))
+
 ## [0.16.0](https://github.com/windowkit/appkit/compare/v0.15.2...v0.16.0) (2026-09-28)
 
 

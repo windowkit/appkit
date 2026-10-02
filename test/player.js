@@ -98,6 +98,34 @@ function readPng(file) {
   return { width, height, rgb };
 }
 
+// test/video-surface.js's
+// Whether this Mac is a guest of a hypervisor, and what said so: the
+// kernel's flag, the model Apple's Virtualization framework gives a guest
+// (VirtualMac2,1), a CPU brand ending "(Virtual)", or a paravirtual GPU in
+// the IO registry — CI's macOS runners are guests, and not every one sets
+// the first.
+function isVirtualMachine() {
+  const read = (name) => {
+    try {
+      return require('child_process').execSync(`sysctl -n ${name}`, { encoding: 'utf8' }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const flag = read('kern.hv_vmm_present');
+  const model = read('hw.model');
+  const brand = read('machdep.cpu.brand_string');
+  let paravirt = false;
+  try {
+    paravirt = require('child_process').execSync('ioreg -rc AppleParavirtGPU', { encoding: 'utf8' }).trim() !== '';
+  } catch {}
+  const yes = flag === '1' || /^VirtualMac/.test(model) || /\(Virtual\)/.test(brand) || paravirt;
+  return {
+    yes,
+    why: `kern.hv_vmm_present=${flag || '?'}, hw.model=${model || '?'}, cpu=${brand || '?'}, paravirtual GPU=${paravirt}`,
+  };
+}
+
 const W = 220;
 const H = 120;
 
@@ -197,14 +225,15 @@ const H = 120;
   // on a virtual machine whose compositor shows YCbCr through 601 whatever
   // it is tagged, AVPlayerLayer does too, and the copy — which reads the
   // frame's own tags — cannot agree with it; on hardware it must
-  let vm = false;
-  try {
-    vm = require('child_process').execSync('sysctl -n kern.hv_vmm_present', { encoding: 'utf8' }).trim() === '1';
-  } catch {}
+  const vm = isVirtualMachine();
   const probeLifted = at(30, 85);
-  const matrixIgnored = vm && near(probeLifted, at(130, 85), 2) && !near(probeLifted, at(80, 85), 2);
+  const matrixIgnored = vm.yes && near(probeLifted, at(130, 85), 2) && !near(probeLifted, at(80, 85), 2);
   if (!matrixIgnored && !near(onLayer, drawn, 3)) {
-    fail('the clip on a layer shows', onLayer, 'and copied into a bitmap', drawn);
+    fail(
+      'the clip on a layer shows', onLayer, 'and copied into a bitmap', drawn,
+      `(${vm.why}; a BT.709 probe on a layer ${JSON.stringify(probeLifted)}, converted under 709 ` +
+        `${JSON.stringify(at(80, 85))} and under 601 ${JSON.stringify(at(130, 85))})`,
+    );
   }
   native.releaseVideoSurface(probe.handle);
 

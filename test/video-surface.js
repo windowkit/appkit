@@ -269,14 +269,18 @@ const WIN_H = 10 + ROWS * (TILE + 8);
 
   // A macOS virtual machine's compositor — a paravirtual GPU, without the
   // display scaler real hardware converts YCbCr with — shows every YCbCr
-  // surface through BT.601's matrix, whatever the surface names: a CI
-  // runner's showed the BT.709 orange exactly as VideoToolbox converts the
-  // same bytes under 601. Nothing a bridge sets reaches it, so there the
+  // surface through BT.601's matrix, whatever the surface names, keeping
+  // the primaries it names: a CI runner's showed the BT.709 orange as
+  // (217, 136, 77), which is 601's matrix on 709's primaries to the level,
+  // against (225, 141, 73) converted as 709 and (213, 138, 76) as 601 with
+  // SMPTE C's primaries. Nothing a bridge sets reaches it, so there the
   // matrix cannot be compared, and is said not to have been. Only where the
-  // machine is a VM *and* that is what it did: on hardware a surface showing
-  // 601 for 709 is this bridge's bug, and fails.
+  // machine is a VM *and* the tile is nearer the 601 conversion than the
+  // 709 one: on hardware a surface showing 601 for 709 is this bridge's bug,
+  // and fails.
   const vm = isVirtualMachine();
-  const matrixIgnored = vm.yes && near(lifted[0], drawn[2]) && !near(lifted[0], drawn[0]);
+  const apart = (a, b) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+  const matrixIgnored = vm.yes && apart(lifted[0], drawn[2]) < apart(lifted[0], drawn[0]);
   const evidence = () =>
     `(${vm.why}; the BT.709 tile beside the same bytes converted under 601: ${JSON.stringify(drawn[2])})`;
   // the cases a matrix-blind compositor cannot show as named: YCbCr surfaces

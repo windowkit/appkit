@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.0](https://github.com/windowkit/appkit/compare/v0.18.0...v0.19.0) (2026-10-02)
+
+
+### Features
+
+* a layer transform is a matrix, CSS's matrix() and matrix3d() on setLayerProps and as animation values, transformForms() says so, and a negative animation delay starts it that far in ([#97](https://github.com/windowkit/appkit/issues/97)) ([985ca2b](https://github.com/windowkit/appkit/commit/985ca2b0045c0c0a862a24fbeb4fc0717622bf00))
+
+
+### Bug Fixes
+
+* the IOSurfaces the bridge presents name sRGB as their colour space, so a window's bitmap is colour-managed as its layers are, where on a wide-gamut display it went to the panel as the panel's own numbers ([#99](https://github.com/windowkit/appkit/issues/99)) ([5351f7b](https://github.com/windowkit/appkit/commit/5351f7bfb56790228add5f68e54e27254a1322c8))
+
 ## [0.18.0](https://github.com/windowkit/appkit/compare/v0.17.0...v0.18.0) (2026-10-02)
 
 

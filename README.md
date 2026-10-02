@@ -607,6 +607,38 @@ Two things the verbs exist to get right, both measured on screen (`test/video-su
   agree to within a level or two. What cannot match is gamut: a layer keeps a 2020
   colour outside sRGB on a wide-gamut panel, and an sRGB bitmap clips it.
 
+## Text: at a display's scale
+
+A text verb's size is the caller's pixels, and a renderer that draws in device pixels hands
+over device pixels: a 13px label on a 2x display is 26. CoreText reads some of a face's data
+by point size, though — the optical size and tracking San Francisco is set at, the tracking
+Apple Color Emoji's `trak` table adds below 29pt — so a font made at 26 is San Francisco as
+it is set at 26pt, 8% narrower than AppKit sets the 13pt label, and a 19px emoji is 1em wide
+where it is 23pt at 19pt. Faces with no such data (Helvetica, Menlo) measure the same either
+way.
+
+- **`scale`** — the display's backing scale, as a `matchFont` option and a third argument
+  to `cgFontWithSize(cg, size, scale)` and `fontByPostScriptName(name, size, scale)`. The
+  font is made at `size / scale` points under a matrix that scales it by `scale`, so CoreText
+  reads the face at its point size, and every verb answers in the caller's pixels as before:
+  metrics, advances, `fontShapeText`'s runs, a layout's lines, runs, carets and hit testing,
+  and `drawLayout`, `ctxDrawGlyphs`, `drawLayoutGradient` and `layoutCoverage` draw it there.
+  `fontMetrics(font).size` is the size asked for. A copy — `fontWithSize`, variations,
+  features, a `fontFallbackFor` face, a face a layout substitutes — keeps the scale. Absent
+  or 1, nothing changes.
+
+Two answers are the scaled face's own rather than the point-size face's times the scale. An
+emoji's advance: CoreText rounds a bitmap glyph's to a whole pixel of the font it is set in,
+a whole point at 1x and half of one at 2x, so a 19px emoji is 45 pixels at 2x where the
+point-size face's 23 points are 46. And the system face's `postScriptName` is
+`.SFNS-Regular`, CoreText's name for it, where NSFont calls the unscaled one by its alias,
+`.AppleSystemUIFont`.
+
+```js
+// 13px at 2x: San Francisco as AppKit sets 13pt, measured in device pixels
+const label = native.matchFont({ families: ['system-ui'], size: 26, scale: 2 });
+```
+
 ## Text: letter spacing and OpenType features
 
 The text verbs a renderer lays paragraphs out and shapes glyph runs with —

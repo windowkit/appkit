@@ -4671,7 +4671,60 @@ static NSFontWeight FontWeightFromCss(double weight) {
   return NSFontWeightBlack;
 }
 
-// matchFont({ families: [..], size, weight (100-900), italic }) -> font handle
+// --- a font at a display's scale ---------------------------------------------
+//
+// A size here is in the caller's pixels, and on a Retina display those are
+// device pixels: a 13px label is 26. A font made at 26 is a 26pt font to
+// CoreText, which reads some of a face's data by point size — the optical
+// size and tracking San Francisco is set at, the tracking Apple Color Emoji's
+// trak table adds below 29pt — so the label was set as SF is at 26pt, 8%
+// narrower than AppKit sets it at 13, and a 19px emoji was 1em wide where it
+// is 23pt at 19pt. Faces with no such data measure the same either way.
+//
+// So a font may be made at a `scale`: at size / scale points, under a matrix
+// that scales it by `scale`. CoreText reads the face at its point size and
+// answers in the caller's pixels — metrics, advances, bounds, a line's width,
+// a caret's offset — through the matrix. Two things it does not take through
+// it, and every reader of them here goes through the helpers below: a run's
+// glyph origins, which are in text space, before the font matrix
+// (BRunPositions); and a bitmap glyph, which CoreText draws at the font's
+// point size whatever its matrix (BDrawGlyphsAtScale). A copy of a scaled
+// font — another size, variations, features, a fallback face — keeps the
+// scale. A font made without one has the identity matrix, and nothing here
+// changes for it.
+
+/** The scale a font was made at: its matrix's, or 1. */
+static double BFontScale(CTFontRef font) {
+  if (!font) return 1;
+  const CGAffineTransform m = CTFontGetMatrix(font);
+  return m.a > 0 && m.a == m.d && m.b == 0 && m.c == 0 && m.tx == 0 &&
+                 m.ty == 0
+             ? m.a
+             : 1;
+}
+
+/** A scale argument: a finite number above 0, else 1. */
+static double BScaleOf(Napi::Value v) {
+  if (!v.IsNumber()) return 1;
+  const double scale = v.As<Napi::Number>().DoubleValue();
+  return scale > 0 && std::isfinite(scale) ? scale : 1;
+}
+
+/** `font` (owned, released) as the same face under the matrix of `scale`,
+ *  at the point size it already has. */
+static CTFontRef BAtScale(CTFontRef font, double scale) {
+  if (!font || scale == 1) return font;
+  const CGAffineTransform m = CGAffineTransformMakeScale(scale, scale);
+  CTFontRef scaled = CTFontCreateCopyWithAttributes(font, 0, &m, NULL);
+  if (!scaled) return font;
+  CFRelease(font);
+  return scaled;
+}
+
+// matchFont({ families: [..], size, weight (100-900), italic, scale? })
+//   -> font handle
+// `size` is in the caller's pixels; `scale`, the display's, makes the font
+// at size / scale points under a matrix of `scale` (see above).
 static NSFont* ResolveFamily(NSString* family, double size, double weight,
                              bool italic) {
   NSFontWeight w = FontWeightFromCss(weight);
@@ -4733,7 +4786,8 @@ static NSFont* ResolveFamily(NSString* family, double size, double weight,
 static Napi::Value MatchFont(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Napi::Object o = info[0].As<Napi::Object>();
-  double size = BNumOr(o, "size", 14);
+  const double scale = BScaleOf(o.Get("scale"));
+  double size = BNumOr(o, "size", 14) / scale;
   double weight = BNumOr(o, "weight", 400);
   bool italic = BBoolOr(o, "italic", false);
   NSFont* font = nil;
@@ -4748,9 +4802,18 @@ static Napi::Value MatchFont(const Napi::CallbackInfo& info) {
     NSFontWeight w = weight >= 550 ? NSFontWeightSemibold : NSFontWeightRegular;
     font = [NSFont systemFontOfSize:size weight:w];
   }
+  if (scale != 1 && font) {
+    CTFontRef scaled =
+        BAtScale((CTFontRef)CFBridgingRetain(font), scale);
+    font = (__bridge_transfer NSFont*)scaled;
+  }
   return BWrapRetained(env, font);
 }
 
+// fontMetrics(font) -> { ascent, descent, leading, capHeight, xHeight, size,
+//                        familyName, postScriptName }
+// In the caller's pixels, a scaled font's included: `size` is the one the
+// font was asked for.
 static Napi::Value FontMetrics(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   NSFont* font = BDeref<NSFont*>(info[0]);
@@ -4761,7 +4824,7 @@ static Napi::Value FontMetrics(const Napi::CallbackInfo& info) {
   r.Set("leading", CTFontGetLeading(ct));
   r.Set("capHeight", CTFontGetCapHeight(ct));
   r.Set("xHeight", CTFontGetXHeight(ct));
-  r.Set("size", CTFontGetSize(ct));
+  r.Set("size", CTFontGetSize(ct) * BFontScale(ct));
   r.Set("familyName", font.familyName ? font.familyName.UTF8String : "");
   r.Set("postScriptName", font.fontName.UTF8String);
   return r;
@@ -4803,6 +4866,71 @@ static bool BCheckFontArg(const Napi::CallbackInfo& info, const char* fn) {
   Napi::TypeError::New(info.Env(), std::string(fn) + ": expected a font handle")
       .ThrowAsJavaScriptException();
   return false;
+}
+
+static CTFontRef BRunFont(CTRunRef run) {
+  return (CTFontRef)CFDictionaryGetValue(CTRunGetAttributes(run),
+                                         kCTFontAttributeName);
+}
+
+// A run's glyph origins from its line's origin, y up, in the caller's pixels.
+// CTRunGetPositions answers in text space, before the font matrix, where
+// everything else CoreText measures of a scaled font has the matrix applied;
+// so a scaled run's origins are multiplied by its scale here. A line set in
+// faces of one scale, which is every line a caller makes, is in one space.
+static void BRunPositions(CTRunRef run, std::vector<CGPoint>* out) {
+  const CFIndex count = CTRunGetGlyphCount(run);
+  out->resize(count > 0 ? (size_t)count : 0);
+  if (count <= 0) return;
+  CTRunGetPositions(run, CFRangeMake(0, 0), out->data());
+  const double scale = BFontScale(BRunFont(run));
+  if (scale == 1) return;
+  for (CGPoint& p : *out) {
+    p.x *= scale;
+    p.y *= scale;
+  }
+}
+
+// A scaled font as its point-size face: the same font with the identity
+// matrix. Kept, because a terminal draws its runs every frame. +1.
+static CTFontRef BAtPointSize(CTFontRef font) {
+  static NSCache* kept = [[NSCache alloc] init];
+  id key = (__bridge id)font;
+  id hit = [kept objectForKey:key];
+  if (!hit) {
+    const CGAffineTransform identity = CGAffineTransformIdentity;
+    CTFontRef plain = CTFontCreateCopyWithAttributes(font, 0, &identity, NULL);
+    if (!plain) return (CTFontRef)CFRetain(font);
+    hit = (__bridge_transfer id)plain;
+    [kept setObject:hit forKey:key];
+  }
+  return (CTFontRef)CFBridgingRetain(hit);
+}
+
+// A scaled font's glyphs drawn the way AppKit draws text to a Retina backing
+// store: the face at its point size, under a CTM scaled by the scale. Drawn
+// through the font's matrix instead, an outline came out right and a bitmap
+// glyph — Apple Color Emoji's — at the font's point size, so an emoji was
+// half its size at 2x. `origins` are from `at`, in the caller's pixels, y up,
+// as BRunPositions answers them; `at` is in the context's user space, and the
+// text matrix is the y-flip every draw here sets.
+static void BDrawGlyphsAtScale(CGContextRef ctx, CTFontRef font,
+                               const CGGlyph* glyphs, const CGPoint* origins,
+                               size_t count, CGPoint at) {
+  if (count == 0) return;
+  const double scale = BFontScale(font);
+  std::vector<CGPoint> points(count);
+  for (size_t i = 0; i < count; i++) {
+    points[i] = CGPointMake(origins[i].x / scale, origins[i].y / scale);
+  }
+  CTFontRef plain = BAtPointSize(font);
+  CGContextSaveGState(ctx);
+  CGContextTranslateCTM(ctx, at.x, at.y);
+  CGContextScaleCTM(ctx, scale, scale);
+  CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1, -1));
+  CTFontDrawGlyphs(plain, glyphs, points.data(), (CFIndex)count, ctx);
+  CGContextRestoreGState(ctx);
+  CFRelease(plain);
 }
 
 // One code point -> its UTF-16 form. False for a surrogate or an
@@ -5049,7 +5177,8 @@ static Napi::Value FontFallbackFor(const Napi::CallbackInfo& info) {
 // substitution — fontFallbackFor's answer, a fontShapeText run's font — has
 // no family to re-match by, and asking the cascade again at the new size is
 // a different question with a possibly different answer. This is how such a
-// face answers metrics and advances at every size, as itself.
+// face answers metrics and advances at every size, as itself. `size` is in
+// the caller's pixels, and a scaled font's copy keeps its scale.
 static Napi::Value FontWithSize(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!BCheckFontArg(info, "fontWithSize")) return env.Undefined();
@@ -5059,8 +5188,11 @@ static Napi::Value FontWithSize(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  CTFontRef sized = CTFontCreateCopyWithAttributes(BFontFrom(info[0]),
-                                                   (CGFloat)size, NULL, NULL);
+  CTFontRef font = BFontFrom(info[0]);
+  const double scale = BFontScale(font);
+  const CGAffineTransform m = CGAffineTransformMakeScale(scale, scale);
+  CTFontRef sized =
+      CTFontCreateCopyWithAttributes(font, (CGFloat)(size / scale), &m, NULL);
   if (!sized) return env.Null();
   return Napi::External<void>::New(env, (void*)sized, [](Napi::Env, void* d) {
     CFRelease(d);
@@ -5116,7 +5248,7 @@ static Napi::Value FontShapeText(const Napi::CallbackInfo& info) {
       std::vector<CGPoint> positions((size_t)count);
       std::vector<CGSize> advances((size_t)count);
       CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
-      CTRunGetPositions(run, CFRangeMake(0, 0), positions.data());
+      BRunPositions(run, &positions);
       CTRunGetAdvances(run, CFRangeMake(0, 0), advances.data());
       CFDictionaryRef rattrs = CTRunGetAttributes(run);
       CTFontRef rfont =
@@ -5214,27 +5346,33 @@ static Napi::Value FontFromData(const Napi::CallbackInfo& info) {
   return r;
 }
 
-// cgFontWithSize(cgExternal, size) -> CTFont handle (what layouts take)
+// cgFontWithSize(cgExternal, size, scale?) -> CTFont handle (what layouts
+// take), at a scale as matchFont makes one
 static Napi::Value CgFontWithSize(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   CGFontRef cg = (CGFontRef)info[0].As<Napi::External<void>>().Data();
   double size = info[1].As<Napi::Number>().DoubleValue();
-  CTFontRef ct = CTFontCreateWithGraphicsFont(cg, size, NULL, NULL);
+  const double scale = BScaleOf(info[2]);
+  const CGAffineTransform m = CGAffineTransformMakeScale(scale, scale);
+  CTFontRef ct = CTFontCreateWithGraphicsFont(cg, size / scale,
+                                              scale == 1 ? NULL : &m, NULL);
   if (!ct) return env.Null();
   return Napi::External<void>::New(env, (void*)ct, [](Napi::Env, void* d) {
     CFRelease(d);
   });
 }
 
-// fontByPostScriptName(name, size) -> CTFont handle or null. Exact: a
-// fallback answer (a substituted face) reads as null so the caller can try
-// the next route.
+// fontByPostScriptName(name, size, scale?) -> CTFont handle or null, at a
+// scale as matchFont makes one. Exact: a fallback answer (a substituted
+// face) reads as null so the caller can try the next route.
 static Napi::Value FontByPostScriptName(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   NSString* name = BToNSString(info[0]);
   double size = info[1].As<Napi::Number>().DoubleValue();
-  CTFontRef ct =
-      CTFontCreateWithName((__bridge CFStringRef)name, size, NULL);
+  const double scale = BScaleOf(info[2]);
+  const CGAffineTransform m = CGAffineTransformMakeScale(scale, scale);
+  CTFontRef ct = CTFontCreateWithName((__bridge CFStringRef)name,
+                                      size / scale, scale == 1 ? NULL : &m);
   if (!ct) return env.Null();
   CFStringRef got = CTFontCopyPostScriptName(ct);
   bool exact = got && [(__bridge NSString*)got isEqualToString:name];
@@ -5426,6 +5564,9 @@ struct CALLine {
          descent = 0;
   long start = 0, end = 0;  // UTF-16 units
   bool hardBreak = false;   // the line ends with a newline it owns
+  // a run of bitmap glyphs in a scaled face, which drawLayout draws apart
+  // (BDrawGlyphsAtScale)
+  bool bitmapsAtScale = false;
   std::vector<CALRun> runs;
 };
 
@@ -5767,6 +5908,14 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
             CTRunGetPositions(run, CFRangeMake(0, 1), &first);
             rx = first.x;
           }
+          // in text space, before a scaled face's matrix (BRunPositions)
+          CTFontRef rfont = BRunFont(run);
+          const double rscale = BFontScale(rfont);
+          rx *= rscale;
+          if (rscale != 1 &&
+              (CTFontGetSymbolicTraits(rfont) & kCTFontTraitColorGlyphs)) {
+            L.bitmapsAtScale = true;
+          }
         }
         CALRun R;
         R.x = rx;
@@ -5877,9 +6026,40 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
   // per glyph run. Standard recipe: flip the text matrix, position each
   // line at its baseline in the flipped space.
   CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1, -1));
+  std::vector<CGPoint> positions;
   for (const CALLine& L : layout->lines) {
-    CGContextSetTextPosition(ctx, x + L.x, y + L.baseline);
-    CTLineDraw(L.line, ctx);
+    if (!L.bitmapsAtScale) {
+      CGContextSetTextPosition(ctx, x + L.x, y + L.baseline);
+      CTLineDraw(L.line, ctx);
+      continue;
+    }
+    // a line with a scaled face's bitmap glyphs in it is drawn a run at a
+    // time, and a scaled run at its face's point size under a scaled CTM:
+    // CTRunDraw, unlike CTLineDraw, does not draw through the font matrix
+    // either, outlines included
+    CFArrayRef runs = CTLineGetGlyphRuns(L.line);
+    for (CFIndex ri = 0; ri < CFArrayGetCount(runs); ri++) {
+      CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, ri);
+      CTFontRef font = BRunFont(run);
+      if (!font || BFontScale(font) == 1) {
+        CGContextSetTextPosition(ctx, x + L.x, y + L.baseline);
+        CTRunDraw(run, ctx, CFRangeMake(0, 0));
+        continue;
+      }
+      const CFIndex count = CTRunGetGlyphCount(run);
+      if (count <= 0) continue;
+      std::vector<CGGlyph> glyphs((size_t)count);
+      CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
+      BRunPositions(run, &positions);
+      CGContextSaveGState(ctx);
+      CGColorRef ink = (CGColorRef)CFDictionaryGetValue(
+          CTRunGetAttributes(run), kCTForegroundColorAttributeName);
+      if (ink) CGContextSetFillColorWithColor(ctx, ink);
+      BDrawGlyphsAtScale(ctx, font, glyphs.data(), positions.data(),
+                         (size_t)count,
+                         CGPointMake(x + L.x, y + L.baseline));
+      CGContextRestoreGState(ctx);
+    }
   }
   CGContextRestoreGState(ctx);
   return info.Env().Undefined();
@@ -5919,8 +6099,14 @@ static Napi::Value CtxDrawGlyphs(const Napi::CallbackInfo& info) {
     BGlyphOriginsArg(run.Get("positions"), &positionStore);
     size_t count = std::min(nGlyphs, positionStore.size());
     if (count == 0) continue;
-    CTFontDrawGlyphs(BFontFrom(fv), glyphs, positionStore.data(),
-                     (CFIndex)count, ctx);
+    CTFontRef font = BFontFrom(fv);
+    if (BFontScale(font) != 1) {
+      // the origins are the caller's pixels, in text space through the flip
+      BDrawGlyphsAtScale(ctx, font, glyphs, positionStore.data(), count,
+                         CGPointZero);
+      continue;
+    }
+    CTFontDrawGlyphs(font, glyphs, positionStore.data(), (CFIndex)count, ctx);
   }
   CGContextRestoreGState(ctx);
   return info.Env().Undefined();
@@ -6082,7 +6268,7 @@ static Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
       std::vector<CGGlyph> glyphs((size_t)count);
       std::vector<CGPoint> positions((size_t)count);
       CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
-      CTRunGetPositions(run, CFRangeMake(0, 0), positions.data());
+      BRunPositions(run, &positions);
       for (CFIndex g = 0; g < count; g++) {
         CGAffineTransform t = {1, 0, 0, -1,
                                x + L.x + positions[(size_t)g].x,
@@ -6355,7 +6541,7 @@ static Napi::Value LayoutCoverage(const Napi::CallbackInfo& info) {
       glyphs.resize((size_t)count);
       positions.resize((size_t)count);
       CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
-      CTRunGetPositions(run, CFRangeMake(0, 0), positions.data());
+      BRunPositions(run, &positions);
       for (size_t g = 0; g < (size_t)count; g++) {
         // a glyph shaping deleted, such as a ligature's second half
         if (glyphs[g] == kCGFontIndexInvalid) continue;
@@ -6400,6 +6586,11 @@ static Napi::Value LayoutCoverage(const Napi::CallbackInfo& info) {
       CGContextSetGrayFillColor(ctx, 0, 1);
       CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1, -1));
       for (const DrawnGlyph& d : drawn) {
+        if (BFontScale(d.font) != 1) {
+          const CGPoint here = CGPointZero;
+          BDrawGlyphsAtScale(ctx, d.font, &d.glyph, &here, 1, d.origin);
+          continue;
+        }
         // CTFontDrawGlyphs reads positions in text space, through the flip
         const CGPoint at = CGPointMake(d.origin.x, -d.origin.y);
         CTFontDrawGlyphs(d.font, &d.glyph, &at, 1, ctx);

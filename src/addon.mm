@@ -71,6 +71,21 @@ static Napi::Value ColorSpace(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), "sRGB");
 }
 
+// The forms a layer transform takes on its way in, as setLayerProps'
+// `transform` and as an animation's values: Core Animation's translate,
+// rotate and scale components, and a whole matrix in either of CSS's
+// spellings (`MatrixFrom`). A caller that hands over a matrix it computed —
+// a CSS transform, sampled — feature-detects `matrix` here: before 0.19 a
+// bridge read an object holding one as no transform at all, and refused it
+// as an animation value.
+static Napi::Value TransformForms(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  static const char* forms[] = {"translate", "rotate", "scale", "matrix", "matrix3d"};
+  Napi::Array a = Napi::Array::New(env, 5);
+  for (uint32_t i = 0; i < 5; i++) a.Set(i, Napi::String::New(env, forms[i]));
+  return a;
+}
+
 static CGPoint PointFrom(Napi::Value v) {
   Napi::Array a = v.As<Napi::Array>();
   return CGPointMake(a.Get(0u).As<Napi::Number>().DoubleValue(),
@@ -478,10 +493,49 @@ static Napi::Value RemoveFromSuperlayer(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// A transform given as a matrix, in CSS's two spellings: `matrix` is
+// `matrix(a, b, c, d, e, f)`, a point (x, y) going to (a·x + c·y + e,
+// b·x + d·y + f), and `matrix3d` is `matrix3d()`'s sixteen numbers, which
+// are CATransform3D's m11…m44 in that order (a transform read back through
+// presentationValue comes out in it). The root layer is geometry-flipped, so
+// y grows down here as it does in CSS: no sign changes on the way in.
+// Returns 0 when `t` holds neither, 1 when it held one and `out` is set, and
+// -1 for a matrix of the wrong shape.
+static int MatrixFrom(Napi::Object t, CATransform3D* out) {
+  bool two = t.Has("matrix");
+  if (!two && !t.Has("matrix3d")) return 0;
+  Napi::Value mv = t.Get(two ? "matrix" : "matrix3d");
+  uint32_t n = two ? 6 : 16;
+  if (!mv.IsArray() || mv.As<Napi::Array>().Length() != n) return -1;
+  Napi::Array a = mv.As<Napi::Array>();
+  double c[16];
+  for (uint32_t i = 0; i < n; i++) {
+    Napi::Value e = a.Get(i);
+    if (!e.IsNumber()) return -1;
+    c[i] = e.As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(c[i])) return -1;
+  }
+  CATransform3D m = CATransform3DIdentity;
+  if (two) {
+    m.m11 = c[0];
+    m.m12 = c[1];
+    m.m21 = c[2];
+    m.m22 = c[3];
+    m.m41 = c[4];
+    m.m42 = c[5];
+  } else {
+    CGFloat* f = &m.m11;
+    for (uint32_t i = 0; i < 16; i++) f[i] = c[i];
+  }
+  *out = m;
+  return 1;
+}
+
 static CATransform3D TransformFrom(Napi::Value v) {
   if (v.IsNull() || v.IsUndefined()) return CATransform3DIdentity;
   Napi::Object t = v.As<Napi::Object>();
   CATransform3D m = CATransform3DIdentity;
+  if (MatrixFrom(t, &m) == 1) return m;
   m = CATransform3DTranslate(m, NumOr(t, "translateX", 0), NumOr(t, "translateY", 0), 0);
   double rot = NumOr(t, "rotate", 0);  // radians
   if (rot != 0) m = CATransform3DRotate(m, rot, 0, 0, 1);
@@ -521,6 +575,7 @@ struct LayerPropsSpec {
   bool hasMasks = false, hasShadowOpacity = false, hasShadowRadius = false;
   bool hasShadowOffset = false, hasContentsScale = false, hasName = false;
   bool hasMask = false, hasTransform = false, clearContents = false;
+  bool badTransform = false;  // a matrix of the wrong shape: a TypeError, nothing applied
   double corner = 0, borderWidth = 0, shadowRadius = 3, contentsScale = 1;
   float opacity = 1, shadowOpacity = 0;
   bool hidden = false, masks = false;
@@ -586,7 +641,12 @@ static LayerPropsSpec ParseLayerProps(Napi::Object o) {
     Napi::Value v = o.Get("mask");
     s.mask = (v.IsNull() || v.IsUndefined()) ? nil : CALHandleTarget(v);
   }
-  if ((s.hasTransform = o.Has("transform"))) s.transform = TransformFrom(o.Get("transform"));
+  if ((s.hasTransform = o.Has("transform"))) {
+    Napi::Value tv = o.Get("transform");
+    CATransform3D m;
+    if (tv.IsObject() && MatrixFrom(tv.As<Napi::Object>(), &m) == -1) s.badTransform = true;
+    else s.transform = TransformFrom(tv);
+  }
   if (o.Has("contents")) s.clearContents = o.Get("contents").IsNull();
   return s;
 }
@@ -622,6 +682,11 @@ static void ApplyLayerProps(CALayer* L, const LayerPropsSpec& s) {
 static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
   id target = CALHandleTarget(info[0]);
   LayerPropsSpec s = ParseLayerProps(info[1].As<Napi::Object>());
+  if (s.badTransform) {
+    Napi::TypeError::New(info.Env(), "transform: matrix is six finite numbers, matrix3d sixteen")
+        .ThrowAsJavaScriptException();
+    return info.Env().Undefined();
+  }
   CALOnLayers(^{
     CALayer* L = CALResolve(target);
     if (L) ApplyLayerProps(L, s);
@@ -806,10 +871,16 @@ static bool ThrowType(Napi::Env env, const char* msg) {
   return false;
 }
 
-// A number, a point [x, y] or a colour [r, g, b(, a)] — the value types a key
-// path takes here. nil for anything else, which the caller reports.
+// A number, a point [x, y], a colour [r, g, b(, a)] or a transform
+// { matrix } / { matrix3d } — the value types a key path takes here. nil for
+// anything else, which the caller reports.
 static id AnimValue(Napi::Value v) {
   if (v.IsNumber()) return @(v.As<Napi::Number>().DoubleValue());
+  if (v.IsObject() && !v.IsArray()) {
+    CATransform3D m;
+    if (MatrixFrom(v.As<Napi::Object>(), &m) != 1) return nil;
+    return [NSValue valueWithCATransform3D:m];
+  }
   if (v.IsArray()) {
     Napi::Array a = v.As<Napi::Array>();
     if (a.Length() == 2) {
@@ -944,12 +1015,12 @@ static bool ApplyTiming(Napi::Env env, CAPropertyAnimation* a, Napi::Object o,
 static bool ReadFromTo(Napi::Env env, CABasicAnimation* a, Napi::Object o) {
   if (o.Has("from")) {
     id v = AnimValue(o.Get("from"));
-    if (!v) return ThrowType(env, "from: expected a number, [x, y] or [r, g, b, a]");
+    if (!v) return ThrowType(env, "from: expected a number, [x, y], [r, g, b, a] or { matrix }");
     a.fromValue = v;
   }
   if (o.Has("to")) {
     id v = AnimValue(o.Get("to"));
-    if (!v) return ThrowType(env, "to: expected a number, [x, y] or [r, g, b, a]");
+    if (!v) return ThrowType(env, "to: expected a number, [x, y], [r, g, b, a] or { matrix }");
     a.toValue = v;
   }
   return true;
@@ -998,7 +1069,7 @@ static Napi::Value AddAnimation(const Napi::CallbackInfo& info) {
     for (uint32_t i = 0; i < varr.Length(); i++) {
       id v = AnimValue(varr.Get(i));
       if (!v) {
-        ThrowType(env, "values: each entry is a number, [x, y] or [r, g, b, a]");
+        ThrowType(env, "values: each entry is a number, [x, y], [r, g, b, a] or { matrix }");
         return env.Undefined();
       }
       [values addObject:v];
@@ -1091,8 +1162,12 @@ static Napi::Value AddAnimation(const Napi::CallbackInfo& info) {
     CALayer* L = CALResolve(target);
     if (!L) return;
     // in the layer's own time — the media time unless the layer itself has
-    // been slowed or offset
-    if (delay > 0) a.beginTime = [L convertTime:CACurrentMediaTime() fromLayer:nil] + delay;
+    // been slowed or offset. A negative delay is a begin time in the past,
+    // CSS's negative animation-delay: the animation joined that far in, and
+    // over that much sooner. Not a timeOffset, which moves where in its
+    // cycle an animation is and not when it ends, so a one-shot animation
+    // joined half way would run to its end and wrap round to its start.
+    if (delay != 0) a.beginTime = [L convertTime:CACurrentMediaTime() fromLayer:nil] + delay;
     [L addAnimation:a forKey:key];
   });
   return Napi::Number::New(env, duration);
@@ -1667,6 +1742,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   FN("txCommit", TxCommit);
   FN("presentationValue", PresentationValue);
   FN("colorSpace", ColorSpace);
+  FN("transformForms", TransformForms);
   FN("hitTest", HitTest);
   FN("measureText", MeasureText);
   FN("createTextImage", CreateTextImage);

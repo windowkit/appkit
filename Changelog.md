@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/windowkit/appkit/compare/v0.21.0...v0.22.0) (2026-10-02)
+
+
+### Features
+
+* createPlayer, a file or URL played by AVFoundation on an AVPlayerLayer a renderer places among its own layers, with the frame showing copied into a surface in the same colours and its state as events, re-landed on main, where [#104](https://github.com/windowkit/appkit/issues/104) merged into [#103](https://github.com/windowkit/appkit/issues/103)'s branch after [#103](https://github.com/windowkit/appkit/issues/103) had merged and 0.21.0 shipped without it ([#107](https://github.com/windowkit/appkit/issues/107)) ([76e520e](https://github.com/windowkit/appkit/commit/76e520e0e3375c2e21856b786d61ee4a8809ef34))
+
 ## [0.21.0](https://github.com/windowkit/appkit/compare/v0.20.0...v0.21.0) (2026-10-02)
 
 

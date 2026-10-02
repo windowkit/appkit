@@ -4094,6 +4094,80 @@ static Napi::Value CtxDrawSurface(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// drawSurfaceFaded(dst, src, sx, sy, sw, sh, dx, dy, dw, dh, alpha)
+//
+// drawSurface at `alpha` — the alpha the caller set with ctxSetGlobalAlpha,
+// passed again because CoreGraphics keeps no getter for it. CoreGraphics
+// draws an image under an alpha below 1 at some fifteen times what the same
+// draw costs at 1 — a 556x300 surface, 1.3ms against 0.09 on an M1 Pro — and
+// composites a transparency layer the same way, so a group faded on a
+// surface (CSS opacity, a fade) cost more than drawing what was on it again.
+// The source rect's premultiplied pixels scaled by the alpha into a bitmap
+// of their own, and that drawn at 1, come to the same colours within a unit
+// for 0.25ms. A rect off the pixel grid or past the source, an IOSurface the
+// CPU would have to lock, a surface onto itself and an alpha of 1 or 0 are
+// drawn as drawSurface draws them, under the alpha already set.
+static Napi::Value CtxDrawSurfaceFaded(const Napi::CallbackInfo& info) {
+  CALSurface* dst = SurfaceFrom(info[0]);
+  if (!dst) return info.Env().Undefined();
+  CALSurface* src = SurfaceFrom(info[1]);
+  if (!src) return info.Env().Undefined();
+  double sx = info[2].As<Napi::Number>().DoubleValue();
+  double sy = info[3].As<Napi::Number>().DoubleValue();
+  double sw = info[4].As<Napi::Number>().DoubleValue();
+  double sh = info[5].As<Napi::Number>().DoubleValue();
+  double dx = info[6].As<Napi::Number>().DoubleValue();
+  double dy = info[7].As<Napi::Number>().DoubleValue();
+  double dw = info[8].As<Napi::Number>().DoubleValue();
+  double dh = info[9].As<Napi::Number>().DoubleValue();
+  double alpha = info[10].As<Napi::Number>().DoubleValue();
+  bool rows = sx == floor(sx) && sy == floor(sy) && sw == floor(sw) &&
+              sh == floor(sh) && sx >= 0 && sy >= 0 && sw >= 1 && sh >= 1 &&
+              sx + sw <= (double)src->width && sy + sh <= (double)src->height;
+  if (!(alpha > 0 && alpha < 1) || !rows || src->iosurface || src == dst) {
+    return CtxDrawSurface(info);
+  }
+  size_t w = (size_t)sw;
+  size_t h = (size_t)sh;
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CGContextRef faded = CGBitmapContextCreate(
+      NULL, w, h, 8, 0, cs,
+      kCGImageAlphaPremultipliedFirst | (CGBitmapInfo)kCGBitmapByteOrder32Host);
+  CGColorSpaceRelease(cs);
+  const uint8_t* from = (const uint8_t*)CGBitmapContextGetData(src->ctx);
+  uint8_t* to = faded ? (uint8_t*)CGBitmapContextGetData(faded) : nullptr;
+  if (!from || !to) {
+    if (faded) CGContextRelease(faded);
+    return CtxDrawSurface(info);
+  }
+  size_t fromStride = CGBitmapContextGetBytesPerRow(src->ctx);
+  size_t toStride = CGBitmapContextGetBytesPerRow(faded);
+  // premultiplied, so every channel scales with the alpha, whatever order
+  // the host keeps them in: c * a / 255, rounded, in shifts
+  const unsigned a = (unsigned)(alpha * 255 + 0.5);
+  for (size_t y = 0; y < h; y++) {
+    const uint8_t* row = from + ((size_t)sy + y) * fromStride + (size_t)sx * 4;
+    uint8_t* out = to + y * toStride;
+    for (size_t k = 0; k < w * 4; k++) {
+      unsigned t = row[k] * a + 128;
+      out[k] = (uint8_t)((t + (t >> 8)) >> 8);
+    }
+  }
+  CGImageRef image = CGBitmapContextCreateImage(faded);
+  CGContextRelease(faded);
+  if (!image) return CtxDrawSurface(info);
+  CGContextSaveGState(dst->ctx);
+  CGContextSetAlpha(dst->ctx, 1);
+  // the base CTM is flipped; flip back around the destination rect so the
+  // image lands upright
+  CGContextTranslateCTM(dst->ctx, dx, dy + dh);
+  CGContextScaleCTM(dst->ctx, 1, -1);
+  CGContextDrawImage(dst->ctx, CGRectMake(0, 0, dw, dh), image);
+  CGContextRestoreGState(dst->ctx);
+  CGImageRelease(image);
+  return info.Env().Undefined();
+}
+
 // putImageData(surface, buffer RGBA straight, w, h, dx, dy) — writes pixels
 // directly, transform- and clip-free, per the canvas contract.
 static Napi::Value CtxPutImageData(const Napi::CallbackInfo& info) {
@@ -7203,6 +7277,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("ctxFillRects", CtxFillRects);
   BFN("ctxFillLinearGradient", CtxFillLinearGradient);
   BFN("ctxDrawSurface", CtxDrawSurface);
+  BFN("ctxDrawSurfaceFaded", CtxDrawSurfaceFaded);
   BFN("ctxPutImageData", CtxPutImageData);
   BFN("ctxGetImageData", CtxGetImageData);
   BFN("surfaceToLayer", SurfaceToLayer);

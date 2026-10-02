@@ -506,6 +506,26 @@ native.ctxDrawSurface(win, grid, 0, 0, 2000, 1620, 40, 30, 2000, 1620);
 native.ctxSetBlendMode(win, 'source-over');
 ```
 
+- **`native.ctxDrawSurfaceFaded(dst, src, sx, sy, sw, sh, dx, dy, dw, dh, alpha)`** —
+  `ctxDrawSurface` under an alpha below 1, which the caller passes again because it is
+  the alpha it set with `ctxSetGlobalAlpha` and CoreGraphics keeps no getter for it.
+  CoreGraphics draws an image under an alpha below 1 at some fifteen times what the same
+  draw costs at 1, and composites a transparency layer the same way, so a group faded on
+  a surface of its own — CSS `opacity`, a fade — cost more than drawing again what was
+  on it. This scales the source rect's premultiplied pixels by the alpha into a bitmap
+  of their own and draws that at 1: the same colours within a unit a channel, and a
+  556x300 surface in 0.25ms where the alpha path takes 1.24ms on an M1 Pro. The
+  destination keeps the alpha it was set to. A source rect off the pixel grid or past
+  the source, an IOSurface-backed source, a surface drawn onto itself and an alpha of 1
+  or 0 are drawn as `ctxDrawSurface` draws them, under the alpha already set — so a
+  caller can call it for every draw under an alpha, and feature-detect the verb to know
+  whether a faded surface is cheap here.
+
+```js
+native.ctxSetGlobalAlpha(win, 0.6);
+native.ctxDrawSurfaceFaded(win, card, 0, 0, 556, 300, 100, 100, 556, 300, 0.6);
+```
+
 ## Text: letter spacing and OpenType features
 
 The text verbs a renderer lays paragraphs out and shapes glyph runs with —

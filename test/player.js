@@ -153,6 +153,33 @@ const H = 120;
   await pumpUntil(() => (other = native.playerCopyFrame(id, small)) !== null).catch(() => {});
   if (other && other.written !== false) fail('a frame was written into a surface of another size', other);
 
+  // a probe beneath: one BT.709 video surface on a layer, beside the same
+  // bytes converted under 709 and under 601 — whether this compositor shows
+  // a YCbCr surface through the matrix it names (test/video-surface.js says
+  // why a virtual machine's does not)
+  const PW = 32, PH = 16;
+  const py = Buffer.alloc(PW * PH, 140);
+  const puv = Buffer.alloc(PW * (PH / 2));
+  for (let i = 0; i < puv.length; i += 2) {
+    puv[i] = 90;
+    puv[i + 1] = 170;
+  }
+  const probe = native.createVideoSurface(PW, PH);
+  native.writeVideoSurface(probe.handle, 'NV12', [py, puv]);
+  const probeTile = (x) => {
+    const l = native.createLayer();
+    native.setLayerProps(l, { frame: [x, 70, 40, 30] });
+    native.addSublayer(root, l);
+    return l;
+  };
+  native.setLayerContentsIOSurface(probeTile(10), probe.iosurfaceId);
+  const as709 = native.createSurface(PW, PH, 1);
+  native.writeVideoSurface(as709, 'NV12', [py, puv]);
+  native.surfaceToLayer(as709, probeTile(60));
+  const as601 = native.createSurface(PW, PH, 1);
+  native.writeVideoSurface(as601, 'NV12', [py, puv], { colorSpace: 'bt601' });
+  native.surfaceToLayer(as601, probeTile(110));
+
   native.pump2();
   await pumpFor(500);
   const shot = path.join(os.tmpdir(), `appkit-player-${process.pid}.png`);
@@ -167,7 +194,19 @@ const H = 120;
   const drawn = at(150, 32);
   const near = (a, b, d) => a.every((v, i) => Math.abs(v - b[i]) <= d);
   if (near(onLayer, [255, 255, 255], 8)) fail('the player layer showed nothing', onLayer);
-  if (!near(onLayer, drawn, 3)) fail('the clip on a layer shows', onLayer, 'and copied into a bitmap', drawn);
+  // on a virtual machine whose compositor shows YCbCr through 601 whatever
+  // it is tagged, AVPlayerLayer does too, and the copy — which reads the
+  // frame's own tags — cannot agree with it; on hardware it must
+  let vm = false;
+  try {
+    vm = require('child_process').execSync('sysctl -n kern.hv_vmm_present', { encoding: 'utf8' }).trim() === '1';
+  } catch {}
+  const probeLifted = at(30, 85);
+  const matrixIgnored = vm && near(probeLifted, at(130, 85), 2) && !near(probeLifted, at(80, 85), 2);
+  if (!matrixIgnored && !near(onLayer, drawn, 3)) {
+    fail('the clip on a layer shows', onLayer, 'and copied into a bitmap', drawn);
+  }
+  native.releaseVideoSurface(probe.handle);
 
   // --- looping: past the end it starts again, and says nothing of an end ----------
   const wrapped = () => {
@@ -202,6 +241,11 @@ const H = 120;
   if (events.slice(after).some((e) => e.id === id)) fail('a released player went on talking');
   if (native.playerCopyFrame(id, surface) !== null) fail('a released player had a frame');
   native.destroyWindow2(win);
-  console.log('player: ok', JSON.stringify({ meta, onLayer, drawn, landed }));
+  console.log(
+    matrixIgnored
+      ? "player: ok (this virtual machine's compositor shows YCbCr through BT.601's matrix whatever a frame names, so the layer and the copy were not compared)"
+      : 'player: ok',
+    JSON.stringify({ meta, onLayer, drawn, landed }),
+  );
   process.exit(0);
 })().catch((e) => fail(e && e.stack ? e.stack : e));

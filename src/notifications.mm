@@ -31,10 +31,12 @@
 // which is what the framework requires for a response that launched the
 // app (a click on a banner while the app was not running) to be delivered
 // at all. Its methods carry no thread guarantee, so a response crosses to
-// node's loop through a thread-safe function and is then emitted through
-// the same backend callback every other event takes; whatever arrives
-// before setBackendEventCallback() is held and replayed, in order, at the
-// start of the first pump2() with a listener.
+// node's loop through a thread-safe function — the main thread's
+// environment's, made the once, since pump mode delivers on the main thread
+// and nowhere else — and is then emitted through the same backend callback
+// every other event takes; whatever arrives before setBackendEventCallback()
+// is held and replayed, in order, at the start of the first pump2() with a
+// listener.
 //
 // Categories are handed to the system as a whole set, and the system keeps
 // none for an app it has not yet authorized — notificationCategories reads
@@ -57,6 +59,10 @@
 #import <Cocoa/Cocoa.h>
 #import <UserNotifications/UserNotifications.h>
 
+#include <pthread.h>
+
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -132,7 +138,14 @@ static Napi::Value StringOrNull(Napi::Env env, NSString* s) {
 
 @class CALNotificationDelegate;
 
-static bool gProbed = false;
+// The centre, the delegate and the bundle check are the process's, not an
+// environment's, so they go up the once — in whichever environment loads the
+// module first, since the delegate has to be in place before
+// finishLaunching whoever got here first. call_once rather than a bare bool:
+// it publishes the outcome below to every later loader's thread, and a verb
+// only ever runs in an environment that has loaded the module, so its read
+// of gCenter is behind this.
+static std::once_flag gProbeOnce;
 static UNUserNotificationCenter* gCenter = nil;
 static NSString* gUnavailable = nil;               // why, when gCenter is nil
 static CALNotificationDelegate* gDelegate = nil;   // the centre's delegate is weak
@@ -157,10 +170,13 @@ struct NotifEvent {
 
 static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev);
 using EventTsfn = Napi::TypedThreadSafeFunction<void, NotifEvent, CallJsEvent>;
-// Made in the first environment to reach the centre (ProbeCenter) and called
-// from the centre's own thread, so through CALTsfn: once that environment
-// has begun to end, an event is dropped rather than sent into it.
-static CALTsfn gEvents;
+// The main thread's environment's (InitNotifications), called from the
+// centre's own thread, so through CALTsfn: once that environment has begun
+// to end, an event is dropped rather than sent into it. Null until made;
+// leaked with the process.
+static std::atomic<CALTsfn*> gEvents{nullptr};
+// What arrived before a listener, in arrival order. The main thread's: both
+// the function's callback and pump2's replay run there.
 static std::vector<NotifEvent*> gHeld;
 
 static CALEvent EventRecord(const NotifEvent& ev) {
@@ -209,16 +225,19 @@ static void CallJsEvent(Napi::Env env, Napi::Function, void*, NotifEvent* ev) {
   CALRaiseUncaughtIfPending(env);
 }
 
-// From any thread: onto node's loop, then to the listener or the held list
-// — in pump mode. With threaded mode's channel open the record goes straight
-// into it from the centre's own thread.
+// From any thread: onto the main thread's loop, then to the listener or the
+// held list — in pump mode. With threaded mode's channel open the record
+// goes straight into it from the centre's own thread. There is no function
+// to cross on until the main thread has loaded the module, and until then
+// nothing on the main thread could be listening either: dropped.
 static void QueueEvent(NotifEvent* ev) {
   if (CALChannelOpen()) {
     CALEmit(EventRecord(*ev));
     delete ev;
     return;
   }
-  bool queued = gEvents.Use(false, [ev](napi_threadsafe_function f) {
+  CALTsfn* events = gEvents.load();
+  bool queued = events && events->Use(false, [ev](napi_threadsafe_function f) {
     return EventTsfn(f).NonBlockingCall(ev);
   });
   if (!queued) delete ev;
@@ -290,12 +309,7 @@ static UNNotificationCategory* DefaultCategory() {
                      options:UNNotificationCategoryOptionCustomDismissAction];
 }
 
-static void ProbeCenter(Napi::Env env) {
-  if (gProbed) return;
-  gProbed = true;
-  EventTsfn events = EventTsfn::New(env, "appkit:notifications", 0, 1);
-  events.Unref(env);  // events never hold the loop open by themselves
-  gEvents = CALTsfn::Watch(env, events);
+static void Probe() {
   @autoreleasepool {
     NSBundle* main = NSBundle.mainBundle;
     if (!main.bundleIdentifier) {
@@ -327,6 +341,8 @@ static void ProbeCenter(Napi::Env env) {
     [gCenter setNotificationCategories:gCategories];
   }
 }
+
+static void ProbeCenter() { std::call_once(gProbeOnce, Probe); }
 
 // The centre, or a thrown Error naming why there is none.
 static UNUserNotificationCenter* CenterOrThrow(Napi::Env env, const char* fn) {
@@ -957,7 +973,19 @@ static Napi::Value PostNotificationResponse(const Napi::CallbackInfo& info) {
 // ---------------------------------------------------------------------------
 
 void InitNotifications(Napi::Env env, Napi::Object exports) {
-  ProbeCenter(env);
+  ProbeCenter();
+  // The event function is the main thread's, made the once: pump mode calls
+  // the listener inline and only the main thread may (CALEmit), and the held
+  // list is the main thread's too. It used to be made in whichever
+  // environment loaded the module first — a worker's, if a worker got there
+  // first, and then every pump-mode response crossed to the worker's thread
+  // and was dropped there, for good once that worker ended, while the main
+  // thread sat with a listener installed.
+  if (pthread_main_np() && !gEvents.load()) {
+    EventTsfn events = EventTsfn::New(env, "appkit:notifications", 0, 1);
+    events.Unref(env);  // events never hold the loop open by themselves
+    gEvents.store(new CALTsfn(CALTsfn::Watch(env, events)));
+  }
   exports.Set("notificationSettings",
               Napi::Function::New(env, NotificationSettings));
   exports.Set("requestNotificationAuthorization",

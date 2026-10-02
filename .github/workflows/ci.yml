@@ -258,6 +258,8 @@ jobs:
         run: node test/calendar-writes.js
       - name: The screen colour sampler's argument shapes (the sampler itself needs a person)
         run: node test/screencolor.js
+      - name: Notification responses — the event function is the main thread's even when a worker loads the module first
+        run: node test/notifications.js
       - name: Threaded mode's core — runMain, commands through the common modes, batched events, exit and signals
         run: node test/threaded.js
       - name: The AppKit verbs from a worker — handles at the call, commands, published reads, callback answers

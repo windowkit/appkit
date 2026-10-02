@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.18.0](https://github.com/windowkit/appkit/compare/v0.17.0...v0.18.0) (2026-10-02)
+
+
+### Features
+
+* ctxDrawSurfaceFaded, a surface drawn under an alpha from its pixels scaled, at a fifth of what CoreGraphics' own alpha costs ([#94](https://github.com/windowkit/appkit/issues/94)) ([0b3f0ce](https://github.com/windowkit/appkit/commit/0b3f0ce3d2f3dc593f6acb2d280d5d09b1bf2135))
+
+
+### Bug Fixes
+
+* fontFromData reads a face and no longer registers it with CoreText ([#93](https://github.com/windowkit/appkit/issues/93)) ([41c64ff](https://github.com/windowkit/appkit/commit/41c64ff9d1e928e59f7590c6a6ea8785211ff6cf)), closes [#92](https://github.com/windowkit/appkit/issues/92)
+* the notification event function is the main thread's environment's, made once — a worker that loads the module first no longer swallows every response ([#96](https://github.com/windowkit/appkit/issues/96)) ([9c5010f](https://github.com/windowkit/appkit/commit/9c5010f2dfb70bbf9c4440fad2a6a22e8abd39ae))
+
 ## [0.17.0](https://github.com/windowkit/appkit/compare/v0.16.0...v0.17.0) (2026-09-29)
 
 

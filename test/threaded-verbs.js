@@ -215,6 +215,64 @@ async function run() {
   assert.strictEqual(await cancelled(true, { title: 'threaded-verbs' }), null, 'an app-modal panel cancelled from the worker');
   say('panels: ok');
 
+  // --- pop-up menus --------------------------------------------------------------
+
+  // opened from a callout of its own, a handle at the call, the answer
+  // through the callback; read, chosen and cancelled from the worker while
+  // it tracks
+  const popUp = (spec) => {
+    let resolve;
+    const answered = new Promise((r) => (resolve = r));
+    const menu = native.popUpMenu(w2, spec, (v) => resolve(v));
+    return { menu, answered };
+  };
+  const openInfo = async (menu) => {
+    for (let t = Date.now(); Date.now() - t < 3000; ) {
+      const info = await answer((cb) => native.popUpMenuInfo(menu, cb));
+      if (info) return info;
+      await sleep(20);
+    }
+    throw new Error('the pop-up never opened');
+  };
+  const popItems = [
+    { id: 21, title: 'Default' },
+    { id: 22, title: 'Retro' },
+    { separator: true },
+    { id: 23, title: 'Chaos', enabled: false },
+  ];
+  let pop = popUp({ items: popItems, frame: [20, 30, 180, 24], selected: 22, fontSize: 15, appearance: 'dark', rtl: true });
+  assert.strictEqual(typeof pop.menu, 'object', 'a menu handle at the call');
+  const info = await openInfo(pop.menu);
+  assert.deepStrictEqual(
+    info.items.map((i) => [i.id, i.checked, i.enabled, i.separator]),
+    [[21, false, true, false], [22, true, true, false], [0, false, false, true], [23, false, false, false]],
+    'the items, the current one checked',
+  );
+  assert.strictEqual(info.fontSize, 15, 'at the size asked for');
+  assert.strictEqual(info.appearance, 'NSAppearanceNameDarkAqua', 'in the appearance asked for');
+  assert.strictEqual(info.rtl, true, 'and the direction');
+  assert.strictEqual(await answer((cb) => native.activatePopUpMenuItem(pop.menu, 0, cb)), true, 'chosen from the worker');
+  assert.strictEqual(await pop.answered, 21, 'answers the id chosen');
+  assert.strictEqual(await answer((cb) => native.popUpMenuInfo(pop.menu, cb)), null, 'and is gone');
+
+  pop = popUp({ items: popItems, frame: [20, 30, 180, 24] });
+  await openInfo(pop.menu);
+  native.cancelPopUpMenu(pop.menu);
+  assert.strictEqual(await pop.answered, null, 'cancelled from the worker: null');
+  // a family the system knows is the menu's font; one it does not is the
+  // menu font at that size
+  pop = popUp({ items: popItems, frame: [20, 30, 180, 24], fontFamily: 'Menlo', fontSize: 12 });
+  assert.strictEqual((await openInfo(pop.menu)).fontFamily, 'Menlo', 'a family the system has');
+  native.cancelPopUpMenu(pop.menu);
+  await pop.answered;
+  pop = popUp({ items: popItems, frame: [20, 30, 180, 24], fontFamily: 'No Such Family Anywhere', fontSize: 12 });
+  const fallback = await openInfo(pop.menu);
+  assert.notStrictEqual(fallback.fontFamily, 'No Such Family Anywhere', 'one it has not');
+  assert.strictEqual(fallback.fontSize, 12, 'still at the size');
+  native.cancelPopUpMenu(pop.menu);
+  await pop.answered;
+  say('pop-up menus: ok');
+
   // --- drag and drop, test posts -------------------------------------------------
 
   const T = 'public.utf8-plain-text';

@@ -571,8 +571,7 @@ layer shows, converted and scaled by the render server. The CPU's share is the c
   and go on it as the attachments CoreVideo gives a decoded frame: the YCbCr matrix, the
   primaries and the transfer function, which Core Animation reads. Shown through
   `setLayerContentsIOSurface(layer, iosurfaceId)`, which keeps a colour a surface names
-  (since this release, primaries and a transfer function count as naming one). A new
-  surface is black.
+  (or derives from CoreVideo's tags: see below). A new surface is black.
 - **`native.writeVideoSurface(target, format, planes, options?)`** — one frame, `planes`
   an array of Buffers or typed arrays: `'NV12'` (Y, then CbCr pairs), `'I420'` (Y, Cb, Cr)
   or `'BGRA'`, each plane `options.strides[i]` bytes a row (packed by default) and checked
@@ -597,15 +596,16 @@ Two things the verbs exist to get right, both measured on screen (`test/video-su
 - **Three planes draw nothing.** A layer shows `420v`, `420f` and `2vuy` surfaces and shows
   `y420`/`f420` as transparent, so an I420 frame is interleaved into NV12, in the copy
   the write makes anyway — 0.27ms at 1080p on an M1 Pro, against 0.07ms for NV12 as it is.
-- **The same colours on a layer and in a bitmap.** Core Animation linearises a surface
-  tagged BT.709 throughout with the exact 709 curve, where VideoToolbox's pixel transfer,
-  Core Image and Core Animation's own matching of 601 use a 1.961 gamma — a video-range
-  grey of Y′=50 is sRGB 55 on a layer and 44 through VideoToolbox. A 709 frame is
-  therefore converted into a bitmap by vImage with that curve as a lookup (0.5ms at
-  1080p), and anything else by VideoToolbox, colour-matched to sRGB (about 1ms); either
-  way a frame moving between the two presentations keeps its colours, to within a level
-  or two. What cannot match is gamut: a layer keeps a 2020 colour outside sRGB on a
-  wide-gamut panel, and an sRGB bitmap clips it.
+- **The same colours on a layer, in a bitmap and under `AVPlayerLayer`.** An NV12 surface
+  is named the colour space CoreVideo makes of its tags, and `setLayerContentsIOSurface`
+  names one the same way for a tagged surface it is handed by id. Shown with the tags
+  alone, Core Animation linearises a frame tagged BT.709 throughout with the exact 709
+  curve, where `AVPlayerLayer` — the platform's player — VideoToolbox's pixel transfer
+  and Core Image all use Apple's 1.961 gamma: a video-range grey of Y′=50 was sRGB 55 on
+  such a layer and 44 everywhere else. Named, a frame on a layer, the same frame
+  converted into a bitmap by VideoToolbox (about 1ms at 1080p) and the player showing it
+  agree to within a level or two. What cannot match is gamut: a layer keeps a 2020
+  colour outside sRGB on a wide-gamut panel, and an sRGB bitmap clips it.
 
 ## Text: letter spacing and OpenType features
 

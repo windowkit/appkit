@@ -1679,10 +1679,10 @@ static Napi::Value CreateSurface(const Napi::CallbackInfo& info) {
 // only handed to show (setLayerContentsIOSurface — a GL target, another
 // process's buffer, a video frame) keeps a space its producer named, and is
 // taken to be sRGB, like everything else here, when it names none. A video
-// frame names its colour the way CoreVideo writes a decoded buffer's
-// attachments onto its IOSurface — primaries and a transfer function, beside
-// the YCbCr matrix — and naming sRGB over those would show BT.709 video as
-// sRGB numbers, which is not what AVPlayerLayer shows for the same frame.
+// frame says what it is the way CoreVideo writes a decoded buffer's
+// attachments onto its IOSurface — matrix, primaries, transfer function —
+// and is named the colour space those make (video.mm says why).
+bool CALNameVideoColorSpace(IOSurfaceRef ios);
 void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep) {
   static const CFPropertyListRef srgb = [] {
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -1692,14 +1692,14 @@ void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep) {
   }();
   if (!ios || !srgb) return;
   if (keep) {
-    for (CFStringRef key : {kIOSurfaceColorSpace, kIOSurfaceICCProfile,
-                            CFSTR("IOSurfaceColorPrimaries"),
-                            CFSTR("IOSurfaceTransferFunction")}) {
+    for (CFStringRef key : {kIOSurfaceColorSpace, kIOSurfaceICCProfile}) {
       CFTypeRef named = IOSurfaceCopyValue(ios, key);
       if (!named) continue;
       CFRelease(named);
       return;
     }
+    // a video frame's tags, named as the colour space they make (video.mm)
+    if (CALNameVideoColorSpace(ios)) return;
   }
   IOSurfaceSetValue(ios, kIOSurfaceColorSpace, srgb);
 }

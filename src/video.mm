@@ -44,7 +44,6 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <VideoToolbox/VideoToolbox.h>
-#import <Accelerate/Accelerate.h>
 
 #include <cmath>
 
@@ -62,6 +61,8 @@ struct CALSurfaceBits {
 bool CALSurfaceBitmap(Napi::Value v, CALSurfaceBits* out);
 // Name an IOSurface's colour space sRGB (backend.mm).
 void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep);
+// Name an IOSurface's colour space from its video tags (below).
+bool CALNameVideoColorSpace(IOSurfaceRef ios);
 
 namespace {
 
@@ -350,98 +351,16 @@ void CopyOpaqueRows(uint8_t* dst, size_t dstStride, const Plane& p, size_t w) {
 // Into a bitmap, a frame has to come out the colours Core Animation shows
 // for the same frame on a layer, or a video moving between the two — which
 // a renderer does whenever something is drawn over it — visibly changes
-// shade. Two routes, because Core Animation itself takes two:
-//
-// - **BT.709**, the whole of HD and the colour every decoder tags by
-//   default. Core Animation linearises a surface tagged 709 throughout with
-//   the exact BT.709 curve (its linear toe included), where VideoToolbox's
-//   pixel transfer, Core Image and Core Animation's own matching of any
-//   other tagging use a pure 1.961 gamma: a video-range grey of Y'=50 shows
-//   as sRGB 55 on a layer and 44 converted. Measured on screen on macOS 15
-//   (test/video-surface.js holds a ramp to it). So a 709 frame is converted
-//   here: vImage's matrix for the range, then that curve into sRGB as a
-//   lookup — 709's primaries are sRGB's, so nothing else changes.
-// - **Anything else** (601, 2020), through VideoToolbox's pixel transfer,
-//   colour-matched to sRGB, which agrees with Core Animation's matching of
-//   those taggings to within a level.
+// shade. Since a surface is named the colour space its tags make
+// (CALNameVideoColorSpace, below), Core Animation shows it as AVPlayerLayer
+// shows a frame and as VideoToolbox's pixel transfer converts one, so the
+// conversion is VideoToolbox's, colour-matched to sRGB, for every tagging.
+// Measured on screen against a ramp and five hues (test/video-surface.js),
+// the two agree to within two levels.
 //
 // What still differs is gamut: a layer keeps a colour that is outside sRGB
 // and shows it on a wide-gamut panel, and an 8-bit sRGB bitmap clips it, so
 // a saturated frame can lose a few levels in the drawn half.
-
-// BT.709's opto-electronic curve undone, then sRGB's applied: the 8-bit
-// lookup a 709 frame's R'G'B' goes through on its way into an sRGB bitmap.
-const uint8_t* Rec709ToSRGB() {
-  static uint8_t table[256];
-  static bool made = false;
-  if (made) return table;
-  for (int i = 0; i < 256; i++) {
-    double v = i / 255.0;
-    double l = v < 0.081 ? v / 4.5 : pow((v + 0.099) / 1.099, 1 / 0.45);
-    double o = l <= 0.0031308 ? 12.92 * l : 1.055 * pow(l, 1 / 2.4) - 0.055;
-    long q = lround(o * 255);
-    table[i] = (uint8_t)(q < 0 ? 0 : q > 255 ? 255 : q);
-  }
-  made = true;
-  return table;
-}
-
-bool Convert709(Napi::Env env, const char* verb, Format format, const std::vector<Plane>& planes,
-                size_t w, size_t h, bool full, uint8_t* dst, size_t dstStride) {
-  // vImage's ranges: bias, the span the bias is taken from, and the clamp
-  vImage_YpCbCrPixelRange range = full ? vImage_YpCbCrPixelRange{0, 128, 255, 255, 255, 0, 255, 0}
-                                       : vImage_YpCbCrPixelRange{16, 128, 235, 240, 235, 16, 240, 16};
-  vImageYpCbCrType in = format == Format::NV12 ? kvImage420Yp8_CbCr8 : kvImage420Yp8_Cb8_Cr8;
-  // made per thread and per layout and range, since the arguments differ
-  thread_local vImage_YpCbCrToARGB infos[4];
-  thread_local bool made[4] = {false, false, false, false};
-  int slot = (format == Format::NV12 ? 0 : 2) + (full ? 1 : 0);
-  if (!made[slot]) {
-    if (vImageConvert_YpCbCrToARGB_GenerateConversion(kvImage_YpCbCrToARGBMatrix_ITU_R_709_2,
-                                                      &range, &infos[slot], in, kvImageARGB8888,
-                                                      kvImageNoFlags) != kvImageNoError) {
-      Napi::Error::New(env, std::string(verb) + ": vImage could not make a BT.709 conversion")
-          .ThrowAsJavaScriptException();
-      return false;
-    }
-    made[slot] = true;
-  }
-  vImage_Buffer out = {dst, (vImagePixelCount)h, (vImagePixelCount)w, dstStride};
-  vImage_Buffer y = {(void*)planes[0].data, (vImagePixelCount)h, (vImagePixelCount)w,
-                     planes[0].stride};
-  const size_t cw = (w + 1) / 2, ch = (h + 1) / 2;
-  // ARGB out of vImage, BGRA in memory: what a premultiplied-first bitmap in
-  // host byte order holds
-  const uint8_t permute[4] = {3, 2, 1, 0};
-  vImage_Error err;
-  if (format == Format::NV12) {
-    vImage_Buffer uv = {(void*)planes[1].data, (vImagePixelCount)ch, (vImagePixelCount)cw,
-                        planes[1].stride};
-    err = vImageConvert_420Yp8_CbCr8ToARGB8888(&y, &uv, &out, &infos[slot], permute, 255,
-                                               kvImageNoFlags);
-  } else {
-    vImage_Buffer cb = {(void*)planes[1].data, (vImagePixelCount)ch, (vImagePixelCount)cw,
-                        planes[1].stride};
-    vImage_Buffer cr = {(void*)planes[2].data, (vImagePixelCount)ch, (vImagePixelCount)cw,
-                        planes[2].stride};
-    err = vImageConvert_420Yp8_Cb8_Cr8ToARGB8888(&y, &cb, &cr, &out, &infos[slot], permute, 255,
-                                                 kvImageNoFlags);
-  }
-  if (err == kvImageNoError) {
-    static uint8_t identity[256];
-    for (int i = 0; i < 256; i++) identity[i] = (uint8_t)i;
-    const uint8_t* curve = Rec709ToSRGB();
-    // the table slots follow memory order, which is B, G, R, A here
-    err = vImageTableLookUp_ARGB8888(&out, &out, curve, curve, curve, identity, kvImageNoFlags);
-  }
-  if (err != kvImageNoError) {
-    Napi::Error::New(env, std::string(verb) + ": vImage could not convert the frame (" +
-                              std::to_string(err) + ")")
-        .ThrowAsJavaScriptException();
-    return false;
-  }
-  return true;
-}
 
 // One per thread: a session is not safe to share across threads, and a
 // worker's renderer converts on its own. Its destination is always plain
@@ -530,10 +449,6 @@ bool ConvertMatched(Napi::Env env, const char* verb, Format format,
 bool ConvertToBGRA(Napi::Env env, const char* verb, Format format,
                    const std::vector<Plane>& planes, size_t w, size_t h, const Colour& colour,
                    uint8_t* dst, size_t dstStride) {
-  bool rec709 = CFEqual(colour.matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) &&
-                CFEqual(colour.primaries, kCVImageBufferColorPrimaries_ITU_R_709_2) &&
-                CFEqual(colour.transfer, kCVImageBufferTransferFunction_ITU_R_709_2);
-  if (rec709) return Convert709(env, verb, format, planes, w, h, colour.full, dst, dstStride);
   return ConvertMatched(env, verb, format, planes, w, h, colour, dst, dstStride);
 }
 
@@ -601,6 +516,8 @@ Napi::Value CreateVideoSurface(const Napi::CallbackInfo& info) {
   }
   CVPixelBufferUnlockBaseAddress(pb, 0);
   if (nv12) {
+    // named the colour space these make when it is shown
+    // (setLayerContentsIOSurface, CALNameVideoColorSpace)
     Attach(pb, colour);
   } else {
     // what is written into it is what an sRGB bitmap holds
@@ -746,6 +663,42 @@ Napi::Value VideoFormats(const Napi::CallbackInfo& info) {
 }
 
 }  // namespace
+
+// Name `ios`'s colour space from the video tags CoreVideo writes onto a
+// frame's IOSurface — its matrix, primaries and transfer function — as the
+// space CoreVideo makes of them (CVImageBufferCreateColorSpaceFromAttachments).
+// True when it named one; false for a surface with no such tags.
+//
+// Why a surface needs the space as well as the tags: shown with only the
+// tags, Core Animation linearises a frame tagged BT.709 throughout with the
+// exact 709 curve, while AVPlayerLayer — the platform's own player — shows
+// the same frame through the space, on Apple's 1.961 gamma, as VideoToolbox's
+// pixel transfer and Core Image convert it. A video-range grey of Y'=47 was
+// sRGB 51 on a tagged layer and 40 under AVPlayerLayer (test/video-surface.js
+// and test/player.js hold both to the player's). Named, a frame on a layer,
+// the same frame drawn into a bitmap, and AVPlayerLayer playing it agree.
+bool CALNameVideoColorSpace(IOSurfaceRef ios) {
+  if (!ios) return false;
+  CFTypeRef primaries = IOSurfaceCopyValue(ios, CFSTR("IOSurfaceColorPrimaries"));
+  if (!primaries) return false;
+  CFTypeRef matrix = IOSurfaceCopyValue(ios, CFSTR("IOSurfaceYCbCrMatrix"));
+  CFTypeRef transfer = IOSurfaceCopyValue(ios, CFSTR("IOSurfaceTransferFunction"));
+  NSMutableDictionary* tags = [NSMutableDictionary dictionary];
+  tags[(id)kCVImageBufferColorPrimariesKey] = (__bridge id)primaries;
+  if (matrix) tags[(id)kCVImageBufferYCbCrMatrixKey] = (__bridge id)matrix;
+  if (transfer) tags[(id)kCVImageBufferTransferFunctionKey] = (__bridge id)transfer;
+  CGColorSpaceRef cs = CVImageBufferCreateColorSpaceFromAttachments((__bridge CFDictionaryRef)tags);
+  CFRelease(primaries);
+  if (matrix) CFRelease(matrix);
+  if (transfer) CFRelease(transfer);
+  if (!cs) return false;
+  CFPropertyListRef named = CGColorSpaceCopyPropertyList(cs);
+  CGColorSpaceRelease(cs);
+  if (!named) return false;
+  IOSurfaceSetValue(ios, kIOSurfaceColorSpace, named);
+  CFRelease(named);
+  return true;
+}
 
 void InitVideo(Napi::Env env, Napi::Object exports) {
   exports.Set("createVideoSurface", Napi::Function::New(env, CreateVideoSurface));

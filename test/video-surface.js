@@ -133,9 +133,10 @@ const bgra = ([r, g, b]) => {
 const ORANGE = [150, 60, 190]; // Y, Cb, Cr: an orange in video range
 const ORANGE_FULL = [160, 50, 200];
 // A dark grey is where the two ways to linearise BT.709 part furthest: Core
-// Animation shows a surface tagged 709 throughout with the exact curve, and
-// converts 601 — like VideoToolbox and Core Image convert everything — with
-// a 1.961 gamma. Y'=50 is sRGB 55 on the one and 44 on the other.
+// Animation shows a surface carrying 709's tags alone with the exact curve,
+// and one whose colour space is named — as AVPlayerLayer shows every frame,
+// and as VideoToolbox and Core Image convert one — with a 1.961 gamma. Y'=50
+// is sRGB 55 on the one and 44 on the other.
 const DARK = [50, 128, 128];
 const CASES = [
   ['NV12 bt709 video', {}, 'NV12', nv12(ORANGE), {}],
@@ -245,8 +246,10 @@ const WIN_H = 10 + ROWS * (TILE + 8);
     fail('a BT.601 surface shows', lifted[2], 'the same as a BT.709 one', lifted[0], '— its colour tags were not read');
   }
   if (!near(lifted[4], drawn[4], 1)) fail('a BGRA frame on a layer and in a bitmap differ', lifted[4], drawn[4]);
-  if (near(lifted[6], lifted[7], 4)) {
-    fail('a dark grey shows', lifted[6], 'tagged BT.709 and', lifted[7], 'tagged BT.601: the curve each is shown with is no longer the one this bridge converts by');
+  // the platform's curve for both, whatever the matrix: no grey of Y'=50
+  // the exact 709 curve would have made (55)
+  if (!near(lifted[6], lifted[7], 2) || lifted[6][0] > 50) {
+    fail('a dark grey shows', lifted[6], 'tagged BT.709 and', lifted[7], 'tagged BT.601: not the 1.961 gamma AVPlayerLayer shows video on');
   }
 
   for (const { v, s } of shown) {

@@ -346,9 +346,9 @@ async function run() {
 
   // --- video surfaces ----------------------------------------------------------
   // On the calling thread, like every surface: a worker writes a frame into a
-  // video surface and converts one into its own bitmap — both conversion
-  // routes, vImage's for BT.709 and VideoToolbox's for the rest, the latter on
-  // a session of the worker's own — to the same pixels as pump mode.
+  // video surface and converts one into its own bitmap — BT.709 and BT.601,
+  // through VideoToolbox on a session of the worker's own — to the same
+  // pixels as pump mode.
   const videoFrame = `
     const W = 64, H = 32;
     const planes = [Buffer.alloc(W * H, 50), Buffer.alloc(W * 16 * 2, 0).map((_, i) => (i % 2 ? 190 : 60))];
@@ -372,6 +372,6 @@ async function run() {
   `], { encoding: 'utf8', timeout: 20000 });
   assert.strictEqual(pumpedVideo.status, 0, `the pump-mode child: ${pumpedVideo.stderr}`);
   assert.deepStrictEqual(video, JSON.parse(pumpedVideo.stdout), 'video frames: the same pixels as pump mode');
-  assert.notDeepStrictEqual(video.rec709, video.rec601, 'the two conversion routes');
+  assert.notDeepStrictEqual(video.rec709, video.rec601, 'the two matrices');
   say('video surfaces: ok');
 }

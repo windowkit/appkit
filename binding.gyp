@@ -31,7 +31,6 @@
           "-framework IOSurface",
           "-framework CoreVideo",
           "-framework VideoToolbox",
-          "-framework Accelerate",
           "-framework UniformTypeIdentifiers",
           "-framework AVFoundation",
           "-framework CoreLocation",

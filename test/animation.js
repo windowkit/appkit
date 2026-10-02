@@ -10,7 +10,8 @@
 // twin against a reference, and against CA's named easeIn); a keyframe
 // animation follows its keyTimes and per-segment curves; an additive
 // animation is a delta over the model value; a spring settles on `to` in the
-// time it reports; a delay shows `from` while it waits and the model after;
+// time it reports; a delay shows `from` while it waits and the model after,
+// and a negative one starts it that far in and ends it that much sooner;
 // completion arrives as an event with the id, key, key path and whether it
 // finished; the value types round-trip (point, colour, a transform
 // component); and a bad shape is a TypeError with no animation added.
@@ -130,6 +131,19 @@ function throwsType(fn, what) {
   await pumpFor(1200);
   const afterDelay = native.presentationValue(layer, 'opacity');
   if (!near(afterDelay, 1, 0.01)) fail('after the delayed animation the model shows', afterDelay);
+
+  // 5b. a negative delay: joined that far in, and over that much sooner —
+  //     CSS's negative animation-delay. Half a second after it was added a
+  //     second-long fade begun 0.6 s ago is over and the model shows; one
+  //     merely offset in its cycle would have wrapped round to its start,
+  //     and one whose delay was dropped would be half way
+  commit(() => native.addAnimation(layer, 'opacity', { from: 0, to: 0.5, duration: 1, delay: -0.6, timing: 'linear' }, 'joined'));
+  native.pump2();
+  const joined = native.presentationValue(layer, 'opacity');
+  if (!(joined >= 0.29 && joined < 0.5)) fail('a negative delay starts it that far in', joined);
+  await pumpFor(500);
+  const overSooner = native.presentationValue(layer, 'opacity');
+  if (!near(overSooner, 1, 0.01)) fail('a negative delay ends it that much sooner', overSooner);
 
   // 6. completion: an id makes the end an event; finished says whether it
   //    ran out or was removed

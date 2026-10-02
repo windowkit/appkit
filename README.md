@@ -283,6 +283,10 @@ card.animate('transform.rotation.z',
 card.animate('transform.translation.y',
              { values: [0, -6, 6, -6, 0], duration: 0.3, timing: [0.33, 1, 0.68, 1], id: 'shake' });
 
+// a transform as a whole matrix, CSS's matrix(a, b, c, d, e, f) or matrix3d(…) —
+// y grows down, as in CSS; see "Transforms as matrices"
+card.set({ transform: { matrix: [0.87, 0.5, -0.5, 0.87, 0, 0] } });
+
 // text, two ways
 const label = new TextLayer();
 label.set({ frame: [0, 14, 228, 22], contentsScale: win.scale })
@@ -342,8 +346,9 @@ Three kinds, told apart by which option is present:
 | `{ values, keyTimes?, timings?, calculationMode? }`      | `CAKeyframeAnimation` | `keyTimes` one per value in 0..1, never decreasing (evenly spaced when omitted); `timings` one curve per segment; `calculationMode` `linear` (default), `discrete`, `paced`, `cubic`, `cubicPaced` |
 | `{ spring: { mass, stiffness, damping, initialVelocity } \| true, from, to }` | `CASpringAnimation` | CA's defaults for what is omitted (`true` is all of them); the duration is the settling time unless a `duration` cuts it short |
 
-A value — `from`, `to`, an entry of `values` — is a number, a point `[x, y]`, or a colour
-`[r, g, b, a]` in generic RGB like every colour in this API.
+A value — `from`, `to`, an entry of `values` — is a number, a point `[x, y]`, a colour
+`[r, g, b, a]` in sRGB like every colour in this API, or a transform `{ matrix }` /
+`{ matrix3d }` (below).
 
 Options every kind takes:
 
@@ -354,7 +359,7 @@ Options every kind takes:
 | `autoreverse` | turn around at the end of each pass                                                                                                                      |
 | `additive`    | the values are deltas over the model value, and several in flight on one key path sum                                                                    |
 | `cumulative`  | each repetition starts where the last ended                                                                                                              |
-| `delay`       | seconds before it starts; the layer shows `from` while it waits (`fillMode: backwards`)                                                                  |
+| `delay`       | seconds before it starts; the layer shows `from` while it waits (`fillMode: backwards`). A negative delay is CSS's: the animation starts that far in and ends that much sooner, a begin time in the past rather than a `timeOffset`, which would wrap a one-shot animation round to its start |
 | `speed`, `timeOffset` | `CAMediaTiming`'s; `speed: 0` with a `timeOffset` is an animation paused at that time                                                             |
 | `hold`        | keep the final value on screen after the end (`removedOnCompletion: NO`, `fillMode: forwards`) — the model value stays what it was                        |
 | `id`          | report the end as a backend event (below)                                                                                                                |
@@ -389,6 +394,25 @@ on a layer showed as (228, 236, 245) beside a surface's (219, 231, 244), and a c
 animation landed on a model value that did not match its own `to`. A caller that draws
 both ways — react-x11's layer promotion — feature-detects the verb.) `speed: 0, timeOffset: t` plus a read is how a curve is sampled without
 waiting for it, which is how `test/animation.js` checks every curve above.
+
+**Transforms as matrices.** `setLayerProps`' `transform` takes Core Animation's
+components — `{ translateX, translateY, rotate, scale, scaleX, scaleY }` — or a whole
+matrix, in CSS's two spellings: `{ matrix: [a, b, c, d, e, f] }` is `matrix()`, a point
+`(x, y)` going to `(a·x + c·y + e, b·x + d·y + f)` with the translation in points, and
+`{ matrix3d: [m11, m12, …, m44] }` is `matrix3d()`, whose sixteen numbers are
+`CATransform3D`'s in the order `presentationValue` reads one back. The same objects are
+animation values, so a key path of `transform` can run keyframes a caller computed — a
+CSS transform list sampled where CSS interpolates it, which `CATransform3D`'s own
+interpolation would not reproduce for a turn of a whole circle or a mixed list. The
+window's root layer is geometry-flipped, so y grows down here as it does in CSS: a
+positive angle turns clockwise and a positive translation moves down, with no sign to
+change on the way in. A matrix of the wrong length or with a number that is not finite
+is a `TypeError`, and nothing is applied.
+
+**`native.transformForms()`** — `['translate', 'rotate', 'scale', 'matrix', 'matrix3d']`:
+the forms a transform takes on its way in. A caller that hands over matrices
+feature-detects `matrix` here; before 0.19 an object holding one was read as no transform
+at all, and refused as an animation value.
 
 **The end of an animation.** With an `id`, the animation's delegate forwards
 `animationDidStop:finished:` through `setBackendEventCallback` as

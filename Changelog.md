@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.0](https://github.com/windowkit/appkit/compare/v0.20.0...v0.21.0) (2026-10-02)
+
+
+### Features
+
+* a font made at a display's scale, so text on a Retina display is set as AppKit sets it, where a font made at its device pixel size read San Francisco's optical size and tracking and Apple Color Emoji's at twice the point size ([#106](https://github.com/windowkit/appkit/issues/106)) ([ca80cf0](https://github.com/windowkit/appkit/commit/ca80cf0d657d61c3e4d576e7e18811b60a94bc3c))
+* video surfaces, a YCbCr or BGRA IOSurface a layer shows as it is with the frame written in, and the same frame converted into a 2D surface in the colours the layer shows it in ([#103](https://github.com/windowkit/appkit/issues/103)) ([6974ed8](https://github.com/windowkit/appkit/commit/6974ed892416cd63f328fbaf5b4ba9534a47c60e))
+
 ## [0.20.0](https://github.com/windowkit/appkit/compare/v0.19.0...v0.20.0) (2026-10-02)
 
 

@@ -2260,6 +2260,278 @@ static Napi::Value ActivateMenuItemFn(const Napi::CallbackInfo& info) {
 }
 
 // ---------------------------------------------------------------------------
+// pop-up menus — a menu that drops from a control in a window, the way an
+// NSPopUpButton's does: the chosen item placed over the control, the menu
+// at least the control's width, the current item checked. What a <select>
+// and a context menu want, and what a drawn menu can only imitate: its
+// vibrancy needs private API to reproduce, and its tracking (type-select,
+// the scroll arrows of a long menu, VoiceOver) is AppKit's.
+//
+// Run through an NSPopUpButtonCell that is never drawn, which is what a
+// browser does for a <select>: performClickWithFrame:inView: places and
+// tracks the menu exactly as the control would, over the frame given, in
+// the cell's font. Tracking is a modal loop, so the answer is a callback:
+// in pump mode it runs before the call returns, the thread having been
+// AppKit's for the length of the gesture; from a worker the menu is opened
+// from a callout of its own (CALOnUIModal) and answers through a
+// threadsafe function, and cancelPopUpMenu can end it.
+// ---------------------------------------------------------------------------
+
+static Napi::Value BCommandAnswer(Napi::Env env, bool ok);
+
+// An item's action records the choice rather than emitting `menu-activate`:
+// a pop-up answers its caller, once, and a dismissal is an answer too.
+@interface CALPopUpTarget : CALMenuTarget {
+ @public
+  bool picked_;
+  NSInteger chosen_;
+}
+@end
+@implementation CALPopUpTarget
+- (void)activate:(NSMenuItem*)sender {
+  picked_ = true;
+  chosen_ = sender.tag;
+}
+@end
+
+struct PopUpSpec {
+  std::vector<MenuItemSpec> items;
+  double frame[4] = {0, 0, 0, 0};  // the control: x, y, width, height
+  bool hasSelected = false;
+  NSInteger selected = 0;
+  double fontSize = 0;          // 0: the menu font's own size
+  NSString* fontFamily = @"";   // a family the system knows, or the menu font
+  NSString* appearance = @"";   // "light" | "dark" | "": the window's
+  bool rtl = false;
+};
+
+static PopUpSpec ParsePopUpSpec(Napi::Object o) {
+  PopUpSpec s;
+  Napi::Value items = o.Get("items");
+  if (items.IsArray()) s.items = ParseMenuItems(items.As<Napi::Array>());
+  Napi::Value frame = o.Get("frame");
+  if (frame.IsArray()) {
+    Napi::Array a = frame.As<Napi::Array>();
+    for (uint32_t i = 0; i < 4 && i < a.Length(); i++) {
+      Napi::Value v = a.Get(i);
+      if (v.IsNumber()) s.frame[i] = v.As<Napi::Number>().DoubleValue();
+    }
+  }
+  Napi::Value sel = o.Get("selected");
+  if (sel.IsNumber()) {
+    s.hasSelected = true;
+    s.selected = (NSInteger)sel.As<Napi::Number>().Int64Value();
+  }
+  s.fontSize = BNumOr(o, "fontSize", 0);
+  s.fontFamily = BStrOr(o, "fontFamily", @"");
+  s.appearance = BStrOr(o, "appearance", @"");
+  s.rtl = BBoolOr(o, "rtl", false);
+  return s;
+}
+
+// The family asked for when the system has it — a face it matched under
+// another name is not it — and the menu font at that size otherwise.
+static NSFont* PopUpFont(NSString* family, double size) {
+  CGFloat sz = size > 0 ? size : [NSFont systemFontSize];
+  if (family.length) {
+    NSFontDescriptor* d = [NSFontDescriptor
+        fontDescriptorWithFontAttributes:@{NSFontFamilyAttribute : family}];
+    NSFont* f = [NSFont fontWithDescriptor:d size:sz];
+    if (f && [f.familyName caseInsensitiveCompare:family] == NSOrderedSame) return f;
+  }
+  return [NSFont menuFontOfSize:size > 0 ? size : 0];
+}
+
+// What a pop-up owes JS, hung on its menu: pump mode's callback, or a
+// worker's threadsafe function.
+@interface CALPopUpPending : NSObject {
+ @public
+  napi_env env_;
+  Napi::FunctionReference cb_;
+  bool threaded_;
+  CALTsfn tsfn_;
+}
+@end
+@implementation CALPopUpPending
+@end
+
+static char kPopUpPendingKey;
+
+// The menu as the spec describes it, and the cell that will run it.
+static NSPopUpButtonCell* MakePopUp(const PopUpSpec& spec, CALPopUpTarget* target) {
+  NSMenu* menu = BuildMenu(spec.items, target);
+  NSFont* font = PopUpFont(spec.fontFamily, spec.fontSize);
+  menu.font = font;
+  if ([spec.appearance isEqualToString:@"dark"]) {
+    menu.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  } else if ([spec.appearance isEqualToString:@"light"]) {
+    menu.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+  }
+  if (spec.rtl) {
+    menu.userInterfaceLayoutDirection = NSUserInterfaceLayoutDirectionRightToLeft;
+  }
+  NSPopUpButtonCell* cell = [[NSPopUpButtonCell alloc] initTextCell:@"" pullsDown:NO];
+  cell.autoenablesItems = NO;
+  cell.font = font;
+  cell.menu = menu;
+  NSInteger at = spec.hasSelected ? [menu indexOfItemWithTag:spec.selected] : -1;
+  if (at >= 0) [cell selectItemAtIndex:at];
+  else [cell selectItem:nil];
+  return cell;
+}
+
+// Track it over the control, on the UI thread, and say what was chosen.
+static CALValueBlock TrackPopUp(NSPopUpButtonCell* cell, CALPopUpTarget* target,
+                                NSWindow* win, const PopUpSpec& spec) {
+  if (win && win.contentView) {
+    NSView* view = win.contentView;
+    double x = spec.frame[0], y = spec.frame[1];
+    double w = spec.frame[2], h = spec.frame[3];
+    // the frame is top-left, as every rect here is
+    NSRect r = NSMakeRect(x, view.isFlipped ? y : view.bounds.size.height - y - h, w, h);
+    [cell attachPopUpWithFrame:r inView:view];
+    [cell performClickWithFrame:r inView:view];
+    [cell dismissPopUp];
+  }
+  bool picked = target->picked_;
+  double chosen = (double)target->chosen_;
+  return ^Napi::Value(Napi::Env e) {
+    return picked ? Napi::Value(Napi::Number::New(e, chosen)) : Napi::Value(e.Null());
+  };
+}
+
+// The one place a pop-up answers; the pending record comes off first.
+static void FinishPopUp(NSMenu* menu, CALValueBlock answer) {
+  CALPopUpPending* p = objc_getAssociatedObject(menu, &kPopUpPendingKey);
+  if (!p) return;
+  objc_setAssociatedObject(menu, &kPopUpPendingKey, nil,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  if (p->threaded_) {
+    CALReply(p->tsfn_, answer);
+    return;
+  }
+  Napi::Env env(p->env_);
+  Napi::HandleScope scope(env);
+  Napi::Value result = answer(env);
+  Napi::FunctionReference cb = std::move(p->cb_);
+  cb.Call({result});
+}
+
+// popUpMenu(win, spec, cb) -> menu handle
+//   spec: { items,                 // setMainMenu's item vocabulary
+//           frame: [x, y, w, h],   // the control, in the window's content,
+//                                  // top-left, points
+//           selected?,             // the id placed over the control, checked
+//           fontSize?, fontFamily?,// the menu's font; the menu font otherwise
+//           appearance?: 'light' | 'dark', rtl? }
+//   cb(id | null) — the item chosen, or null for a menu dismissed
+static Napi::Value PopUpMenuFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsExternal() || !info[1].IsObject() || !info[2].IsFunction()) {
+    Napi::TypeError::New(env, "popUpMenu(win, spec, cb): window handle, spec object and callback required")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  id owner = CALHandleTarget(info[0]);
+  PopUpSpec spec = ParsePopUpSpec(info[1].As<Napi::Object>());
+
+  if (pthread_main_np()) {
+    BEnsureApp();
+    CALPopUpTarget* target = [CALPopUpTarget new];
+    target->source_ = "popup";
+    NSPopUpButtonCell* cell = MakePopUp(spec, target);
+    CALPopUpPending* p = [CALPopUpPending new];
+    p->env_ = (napi_env)env;
+    p->cb_ = Napi::Persistent(info[2].As<Napi::Function>());
+    p->threaded_ = false;
+    objc_setAssociatedObject(cell.menu, &kPopUpPendingKey, p,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    Napi::Value handle = BWrapRetained(env, cell.menu);
+    FinishPopUp(cell.menu, TrackPopUp(cell, target, owner ? CALResolve(owner) : nil, spec));
+    return handle;
+  }
+
+  CALHandle* h = CALNewHandle();
+  Napi::Value handle = CALWrapHandle(env, h, false);
+  CALTsfn tsfn = CALReplyTo(env, info[2].As<Napi::Function>(), "appkit:popUpMenu");
+  CALOnUIModal(^{
+    BEnsureApp();
+    CALPopUpTarget* target = [CALPopUpTarget new];
+    target->source_ = "popup";
+    NSPopUpButtonCell* cell = MakePopUp(spec, target);
+    CALPopUpPending* p = [CALPopUpPending new];
+    p->threaded_ = true;
+    p->tsfn_ = tsfn;
+    objc_setAssociatedObject(cell.menu, &kPopUpPendingKey, p,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    h->object_ = cell.menu;
+    FinishPopUp(cell.menu, TrackPopUp(cell, target, owner ? CALResolve(owner) : nil, spec));
+  });
+  return handle;
+}
+
+// cancelPopUpMenu(menu) -> bool — end the tracking: the pop-up answers null.
+// A pop-up that has answered already is left alone.
+static Napi::Value CancelPopUpMenuFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!info[0].IsExternal()) {
+    Napi::TypeError::New(env, "cancelPopUpMenu: menu handle required")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  id target = CALHandleTarget(info[0]);
+  __block bool ok = false;
+  CALOnUI(^{
+    NSMenu* menu = CALResolve(target);
+    if (!menu || !objc_getAssociatedObject(menu, &kPopUpPendingKey)) return;
+    [menu cancelTrackingWithoutAnimation];
+    ok = true;
+  });
+  return BCommandAnswer(env, ok);
+}
+
+// popUpMenuInfo(menu, cb?) — an open pop-up as data, for tests: the tree in
+// mainMenuInfo's shape, its font and its appearance; null once it answered.
+static Napi::Value PopUpMenuInfoFn(const Napi::CallbackInfo& info) {
+  id target = CALHandleTarget(info[0]);
+  return CALAnswer(info, "popUpMenuInfo", ^CALValueBlock {
+    NSMenu* menu = CALResolve(target);
+    if (!menu || !objc_getAssociatedObject(menu, &kPopUpPendingKey)) {
+      return ^Napi::Value(Napi::Env e) { return e.Null(); };
+    }
+    std::shared_ptr<MenuInfoData> data = MenuInfoOf(menu);
+    std::string family = menu.font.familyName.UTF8String ?: "";
+    double size = menu.font.pointSize;
+    std::string appearance = menu.appearance.name.UTF8String ?: "";
+    bool rtl = menu.userInterfaceLayoutDirection == NSUserInterfaceLayoutDirectionRightToLeft;
+    return ^Napi::Value(Napi::Env e) {
+      Napi::Object o = MenuInfoValue(e, *data);
+      o.Set("fontFamily", family);
+      o.Set("fontSize", size);
+      o.Set("appearance", appearance);
+      o.Set("rtl", rtl);
+      return o;
+    };
+  });
+}
+
+// activatePopUpMenuItem(menu, index, cb?) -> bool — choose an open pop-up's
+// item by index, the way tracking would, and end the tracking. For tests.
+static Napi::Value ActivatePopUpMenuItemFn(const Napi::CallbackInfo& info) {
+  id target = CALHandleTarget(info[0]);
+  NSInteger index = info.Length() > 1 && info[1].IsNumber()
+                        ? (NSInteger)info[1].As<Napi::Number>().Int64Value()
+                        : -1;
+  return CALAnswer(info, "activatePopUpMenuItem", ^CALValueBlock {
+    NSMenu* menu = CALResolve(target);
+    bool ok = menu && objc_getAssociatedObject(menu, &kPopUpPendingKey) &&
+              ActivateInMenu(menu, {index});
+    if (ok) [menu cancelTrackingWithoutAnimation];
+    return BoolAnswer(ok);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // status items — NSStatusItem, the menu-bar extra (the "tray"). The cocoa
 // counterpart of the freedesktop StatusNotifierItem: an icon or a title in
 // the system status bar, a tooltip, and either a menu or clicks. The menu
@@ -7367,6 +7639,10 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("setDockMenu", SetDockMenuFn);
   BFN("dockMenuInfo", DockMenuInfoFn);
   BFN("activateDockMenuItem", ActivateDockMenuItemFn);
+  BFN("popUpMenu", PopUpMenuFn);
+  BFN("cancelPopUpMenu", CancelPopUpMenuFn);
+  BFN("popUpMenuInfo", PopUpMenuInfoFn);
+  BFN("activatePopUpMenuItem", ActivatePopUpMenuItemFn);
   BFN("initApp", InitAppFn);
   BFN("setActivationPolicy", SetActivationPolicyFn);
   BFN("setDockBadge", SetDockBadgeFn);

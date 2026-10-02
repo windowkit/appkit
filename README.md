@@ -126,14 +126,15 @@ waits on the UI thread (`test/threaded-verbs.js` covers each row):
 | from a worker | verbs |
 | --- | --- |
 | unchanged, on the calling thread | surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
-| a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardClear`, `cancelPanel`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
+| a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardClear`, `cancelPanel`, `cancelPopUpMenu`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
 | a handle at the call | `createWindow2`, followed by `window-created { handle, windowNumber }`; every event about the window, input included, carries `handle`, so `ev.handle === win` |
 | | `windowRootLayer`, allocated with the window |
 | | `createStatusItem`: its clicks carry the handle, and it is held until `removeStatusItem` |
 | | `requestUserAttention`: a bridge id |
 | | `openPanel` / `savePanel`: the answer through the callback, as before |
+| | `popUpMenu`: the menu opens from a callout of its own, and answers through the callback |
 | the published copy | `getWindowFrame`, `windowIsVisible`, `windowNumber` (all `null` until the window is made), `listScreens`, `accessibilityDisplayOptions`, `activationPolicy`, `appInfo`, `pasteboardChangeCount` |
-| a callback, the last argument | `pasteboardReadText`, `snapshotWindow`, `snapshotStatusItem`, `windowNumberAtPoint`, `mainMenuInfo`, `dockMenuInfo`, `statusItemInfo`, `activateMenuItem`, `activateDockMenuItem`, `activateStatusItemMenuItem`, `clickStatusItem`, `dragItems`, `dragItemData`, `dragItemString`, `postDragEvent`. On the main thread each still answers synchronously when no callback is given. |
+| a callback, the last argument | `pasteboardReadText`, `snapshotWindow`, `snapshotStatusItem`, `windowNumberAtPoint`, `mainMenuInfo`, `dockMenuInfo`, `statusItemInfo`, `activateMenuItem`, `activateDockMenuItem`, `activateStatusItemMenuItem`, `popUpMenuInfo`, `activatePopUpMenuItem`, `clickStatusItem`, `dragItems`, `dragItemData`, `dragItemString`, `postDragEvent`. On the main thread each still answers synchronously when no callback is given. |
 | events | `beginDrag`: `drag-session-began`, or `drag-session-ended` with nothing dropped. Its `provide` is a TypeError; give every value up front. |
 
 A few verbs behave differently from a worker:
@@ -1204,6 +1205,50 @@ index path, `clickStatusItem(item, kind)` posts a real press-and-release into
 the item's window (pump afterwards; declined for left/right while a menu is
 set, since that click would open it), and `snapshotStatusItem(item, file)`
 writes the composited item to a PNG.
+
+## Pop-up menu (a control's menu)
+
+The menu that drops from a control in a window — a `<select>`'s list, a
+pop-up button's — the way `NSPopUpButton`'s does: the current item placed
+over the control and checked, the menu at least the control's width, in the
+font asked for. It is run through an `NSPopUpButtonCell` that is never drawn,
+`performClickWithFrame:inView:`, which is what a browser does for a
+`<select>` on macOS, so the placement, the tracking (type-select, the scroll
+arrows of a long menu, VoiceOver) and the look are AppKit's own. The items
+are `setMainMenu`'s vocabulary.
+
+```js
+const menu = native.popUpMenu(win, {
+  items: [                     // setMainMenu's item vocabulary
+    { id: 1, title: 'Default' },
+    { id: 2, title: 'Retro' },
+    { separator: true },
+    { id: 3, title: 'Chaos', enabled: false },
+  ],
+  frame: [40, 60, 220, 24],    // the control, in the window's content, top-left, points
+  selected: 2,                 // placed over the control, checked; absent: none is
+  fontSize: 13,                // the menu's font; the menu font at its own size by default
+  fontFamily: 'Avenir Next',   // a family the system has, else the menu font at fontSize
+  appearance: 'dark',          // 'light' | 'dark'; absent: the window's
+  rtl: false,
+}, (id) => {
+  // the id chosen, or null for a menu dismissed (Escape, a click outside, cancelPopUpMenu)
+});
+native.cancelPopUpMenu(menu); // ends the tracking: the callback answers null
+```
+
+Tracking is a modal loop. In pump mode it runs inside the call, the thread
+being AppKit's for the length of the gesture, and the callback has run when
+the call returns. From a worker the handle is answered at the call, the menu
+opens from a callout of its own, the answer arrives through the callback, and
+`cancelPopUpMenu` can end it while it is open.
+
+For tests: `popUpMenuInfo(menu)` returns an open pop-up as `mainMenuInfo`'s
+shape plus `fontFamily`, `fontSize`, `appearance` and `rtl`, and null once
+it has answered; `activatePopUpMenuItem(menu, index)` chooses an item the
+way tracking would and ends the tracking. In pump mode, keys posted with
+`postKeyEvent` before the call are read by the tracking as a person's would
+be (`test/popup-menu.js`).
 
 ## Dock & app presence
 

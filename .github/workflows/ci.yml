@@ -242,6 +242,8 @@ jobs:
         run: node test/accessibility-display.js
       - name: A window the pointer passes through, and the hit test that shows it
         run: node test/ignores-mouse-events.js
+      - name: A pop-up menu over a control, chosen and dismissed by keys, answered before the call returns
+        run: node test/popup-menu.js
       - name: Surface blits and blend modes
         run: node test/surface-blit.js
       - name: An IOSurface on a layer is colour-managed as a CGImage and a layer colour are

@@ -4774,9 +4774,10 @@ static double CssWeightOfCTFont(CTFontRef ct) {
 
 // fontFromData(buffer) -> { cg: External<CGFont>, familyName,
 // postScriptName, weight, italic }. The CGFont is the process's own handle
-// to the face — no registry round trip, so a face CoreText refuses to
-// register (in-memory data) still renders. Registration is attempted as a
-// best effort so descriptor matching elsewhere can also find it.
+// to the face — no registry round trip. It reads the face and installs
+// nothing: the face is never registered with CoreText, so matchFont,
+// fontByPostScriptName and listFonts go on answering exactly what they did
+// before the bytes were read (windowkit/appkit#92).
 static Napi::Value FontFromData(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
@@ -4786,7 +4787,6 @@ static Napi::Value FontFromData(const Napi::CallbackInfo& info) {
   CGFontRef cg = provider ? CGFontCreateWithDataProvider(provider) : NULL;
   if (provider) CGDataProviderRelease(provider);
   if (!cg) return env.Null();
-  CTFontManagerRegisterGraphicsFont(cg, NULL);  // best effort
   CTFontRef ct = CTFontCreateWithGraphicsFont(cg, 12, NULL, NULL);
   Napi::Object r = Napi::Object::New(env);
   r.Set("cg", Napi::External<void>::New(env, (void*)cg, [](Napi::Env, void* d) {

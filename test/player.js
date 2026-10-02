@@ -227,7 +227,10 @@ const H = 120;
   // frame's own tags — cannot agree with it; on hardware it must
   const vm = isVirtualMachine();
   const probeLifted = at(30, 85);
-  const matrixIgnored = vm.yes && near(probeLifted, at(130, 85), 2) && !near(probeLifted, at(80, 85), 2);
+  // nearer the 601 conversion than the 709 one: 601's matrix on the
+  // surface's own primaries, which is what a VM's compositor shows
+  const apart = (a, b) => Math.max(...a.map((v, i) => Math.abs(v - b[i])));
+  const matrixIgnored = vm.yes && apart(probeLifted, at(130, 85)) < apart(probeLifted, at(80, 85));
   if (!matrixIgnored && !near(onLayer, drawn, 3)) {
     fail(
       'the clip on a layer shows', onLayer, 'and copied into a bitmap', drawn,

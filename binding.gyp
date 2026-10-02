@@ -10,7 +10,8 @@
         "src/calendars.mm",
         "src/screencolor.mm",
         "src/threaded.mm",
-        "src/video.mm"
+        "src/video.mm",
+        "src/player.mm"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
@@ -31,6 +32,7 @@
           "-framework IOSurface",
           "-framework CoreVideo",
           "-framework VideoToolbox",
+          "-framework CoreMedia",
           "-framework UniformTypeIdentifiers",
           "-framework AVFoundation",
           "-framework CoreLocation",

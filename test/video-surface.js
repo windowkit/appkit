@@ -96,6 +96,33 @@ function readPng(file) {
   return { width, height, rgb };
 }
 
+// Whether this Mac is a guest of a hypervisor, and what said so: the
+// kernel's flag, the model Apple's Virtualization framework gives a guest
+// (VirtualMac2,1), a CPU brand ending "(Virtual)", or a paravirtual GPU in
+// the IO registry — CI's macOS runners are guests, and not every one sets
+// the first.
+function isVirtualMachine() {
+  const read = (name) => {
+    try {
+      return require('child_process').execSync(`sysctl -n ${name}`, { encoding: 'utf8' }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const flag = read('kern.hv_vmm_present');
+  const model = read('hw.model');
+  const brand = read('machdep.cpu.brand_string');
+  let paravirt = false;
+  try {
+    paravirt = require('child_process').execSync('ioreg -rc AppleParavirtGPU', { encoding: 'utf8' }).trim() !== '';
+  } catch {}
+  const yes = flag === '1' || /^VirtualMac/.test(model) || /\(Virtual\)/.test(brand) || paravirt;
+  return {
+    yes,
+    why: `kern.hv_vmm_present=${flag || '?'}, hw.model=${model || '?'}, cpu=${brand || '?'}, paravirtual GPU=${paravirt}`,
+  };
+}
+
 const expectThrow = (fn, phrase) => {
   try {
     fn();
@@ -248,11 +275,10 @@ const WIN_H = 10 + ROWS * (TILE + 8);
   // matrix cannot be compared, and is said not to have been. Only where the
   // machine is a VM *and* that is what it did: on hardware a surface showing
   // 601 for 709 is this bridge's bug, and fails.
-  let vm = false;
-  try {
-    vm = require('child_process').execSync('sysctl -n kern.hv_vmm_present', { encoding: 'utf8' }).trim() === '1';
-  } catch {}
-  const matrixIgnored = vm && near(lifted[0], drawn[2]) && !near(lifted[0], drawn[0]);
+  const vm = isVirtualMachine();
+  const matrixIgnored = vm.yes && near(lifted[0], drawn[2]) && !near(lifted[0], drawn[0]);
+  const evidence = () =>
+    `(${vm.why}; the BT.709 tile beside the same bytes converted under 601: ${JSON.stringify(drawn[2])})`;
   // the cases a matrix-blind compositor cannot show as named: YCbCr surfaces
   // tagged anything but 601 (a grey has no chroma for a matrix to act on)
   const blind = new Set(['NV12 bt709 video', 'I420 bt709 video', 'NV12 bt709 full', 'NV12 bt2020']);
@@ -261,7 +287,7 @@ const WIN_H = 10 + ROWS * (TILE + 8);
     if (near(lifted[i], white, 1)) fail(`${label}: the surface on a layer showed nothing`, lifted[i]);
     if (matrixIgnored && blind.has(label)) return;
     if (!near(lifted[i], drawn[i])) {
-      fail(`${label}: on a layer it shows`, lifted[i], 'and drawn into a bitmap', drawn[i]);
+      fail(`${label}: on a layer it shows`, lifted[i], 'and drawn into a bitmap', drawn[i], evidence());
     }
   });
   if (!near(lifted[0], lifted[1], 1)) fail('I420 interleaved into NV12 shows', lifted[1], 'where NV12 shows', lifted[0]);

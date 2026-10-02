@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/windowkit/appkit/compare/v0.19.0...v0.20.0) (2026-10-02)
+
+
+### Features
+
+* popUpMenu, a control's menu dropped from a frame in a window as an NSPopUpButton's drops, the current item over the control and checked, answering the id chosen or null, where a renderer had only menus it drew to look like one ([#101](https://github.com/windowkit/appkit/issues/101)) ([e0b4e7f](https://github.com/windowkit/appkit/commit/e0b4e7f0cfd6204f9990e54549db370ede5a0586))
+
 ## [0.19.0](https://github.com/windowkit/appkit/compare/v0.18.0...v0.19.0) (2026-10-02)
 
 

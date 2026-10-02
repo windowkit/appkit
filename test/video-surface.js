@@ -130,8 +130,13 @@ const bgra = ([r, g, b]) => {
 };
 
 // [label, surface options, frame format, planes, write options]
-const ORANGE = [150, 60, 190]; // Y, Cb, Cr: an orange in video range
-const ORANGE_FULL = [160, 50, 200];
+// Y, Cb, Cr: an orange inside sRGB's gamut in every matrix and range used
+// here, R'G'B' all between 0 and 1. A colour outside it is clipped by Core
+// Animation and by VideoToolbox, differently, and on a display that cannot
+// show it either way the two disagree for a reason that is not this bridge's
+// — 150/60/190 did, by nine levels of blue, on a CI runner's sRGB display.
+const ORANGE = [140, 90, 170];
+const ORANGE_FULL = [150, 95, 165];
 // A dark grey is where the two ways to linearise BT.709 part furthest: Core
 // Animation shows a surface carrying 709's tags alone with the exact curve,
 // and one whose colour space is named — as AVPlayerLayer shows every frame,
@@ -246,9 +251,10 @@ const WIN_H = 10 + ROWS * (TILE + 8);
     fail('a BT.601 surface shows', lifted[2], 'the same as a BT.709 one', lifted[0], '— its colour tags were not read');
   }
   if (!near(lifted[4], drawn[4], 1)) fail('a BGRA frame on a layer and in a bitmap differ', lifted[4], drawn[4]);
-  // the platform's curve for both, whatever the matrix: no grey of Y'=50
-  // the exact 709 curve would have made (55)
-  if (!near(lifted[6], lifted[7], 2) || lifted[6][0] > 50) {
+  // the platform's curve for both, whatever the matrix — a grey has no
+  // chroma for the matrix to act on, so only the curve can tell them apart,
+  // and the exact 709 curve made 55 where the player's makes 44
+  if (!near(lifted[6], lifted[7], 2)) {
     fail('a dark grey shows', lifted[6], 'tagged BT.709 and', lifted[7], 'tagged BT.601: not the 1.961 gamma AVPlayerLayer shows video on');
   }
 

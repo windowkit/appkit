@@ -374,4 +374,29 @@ async function run() {
   assert.deepStrictEqual(video, JSON.parse(pumpedVideo.stdout), 'video frames: the same pixels as pump mode');
   assert.notDeepStrictEqual(video.rec709, video.rec601, 'the two matrices');
   say('video surfaces: ok');
+
+  // --- a player ---------------------------------------------------------------
+  // From a worker the player is made on the UI thread and its layer is a
+  // handle answered at the call, placed by the layer verbs like any other;
+  // its events come through the channel, and a copy reads the frame showing
+  // on this thread.
+  const pw = native.createWindow2({ width: 200, height: 120, title: 'a player from a worker', x: 120, y: 140 });
+  native.showWindow(pw, false);
+  const player = native.createPlayer(path.join(__dirname, 'fixtures', 'clip.mp4'), { autoPlay: true, muted: true });
+  assert.strictEqual(typeof player.id, 'number', 'an id at the call');
+  native.setLayerProps(player.layer, { frame: [10, 10, 80, 45] });
+  native.addSublayer(native.windowRootLayer(pw), player.layer);
+  const meta = await until((ev) => ev.type === 'player-metadata' && ev.id === player.id, 'player-metadata from a worker');
+  assert.deepStrictEqual([meta.width, meta.height], [160, 90], 'the clip’s size');
+  await until((ev) => ev.type === 'player-state' && ev.id === player.id && ev.playing, 'player-state from a worker');
+  const into = native.createSurface(160, 90, 1);
+  let copied = null;
+  for (let i = 0; i < 300 && !copied; i++) {
+    copied = native.playerCopyFrame(player.id, into);
+    if (!copied) await sleep(10);
+  }
+  assert.ok(copied && copied.written, 'a frame copied on the worker');
+  native.releasePlayer(player.id);
+  native.destroyWindow2(pw);
+  say('player: ok');
 }

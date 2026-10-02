@@ -250,6 +250,8 @@ jobs:
         run: node test/surface-colorspace.js
       - name: A video frame shows the same colours on a layer as drawn into a bitmap
         run: node test/video-surface.js
+      - name: A file played by AVFoundation, on a layer and copied into a bitmap in the same colours
+        run: node test/player.js
       - name: Letter spacing and OpenType features on the text verbs
         run: node test/text-features.js
       - name: fontFromData reads a face and installs nothing — name matching never finds it

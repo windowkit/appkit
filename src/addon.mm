@@ -1721,6 +1721,9 @@ void InitThreaded(Napi::Env env, Napi::Object exports);
 // src/video.mm — video surfaces: a YCbCr or BGRA IOSurface a layer shows
 // as it is, frames written into it, and frames converted into a surface.
 void InitVideo(Napi::Env env, Napi::Object exports);
+// src/player.mm — a file or URL played by AVFoundation: an AVPlayer, its
+// AVPlayerLayer as a layer handle, and the frame showing copied into a surface.
+void InitPlayer(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1768,6 +1771,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitScreenColor(env, exports);
   InitThreaded(env, exports);
   InitVideo(env, exports);
+  InitPlayer(env, exports);
   return exports;
 }
 

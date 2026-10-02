@@ -388,7 +388,14 @@ space's midpoint.
 a layer's `backgroundColor`, `borderColor` and `shadowColor`, a shape's fill and stroke,
 a gradient's stops, an animation's `from`/`to`, a presentation value, a text span's ink
 and the surfaces `createSurface` makes. One space, so a colour set on a layer and the
-same colour rastered into a surface composite to the same pixels. (Before 0.6 the layer
+same colour rastered into a surface composite to the same pixels. An IOSurface says it
+itself: those `createSurfaceIOSurface` makes and `surfaceFromIOSurfaceID` draws into name
+sRGB as their colour space, and `setLayerContentsIOSurface` names one that names none — a
+GL target — so a surface presented on a layer is matched to the display as a layer colour
+is. Core Animation shows an IOSurface that names no space as the display's own numbers:
+until these named theirs, a window presented that way went out on a wide-gamut panel as
+the panel's own red, (255, 0, 0) in its space, beside a layer's sRGB red, (234, 51, 35),
+and on a monitor with a profile of its own even a grey differed. (Before 0.6 the layer
 half was Generic RGB, which the compositor converts on its way to the display: `#dbe7f4`
 on a layer showed as (228, 236, 245) beside a surface's (219, 231, 244), and a colour
 animation landed on a model value that did not match its own `to`. A caller that draws

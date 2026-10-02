@@ -1604,6 +1604,22 @@ static CALSurface* SurfaceFrom(Napi::Value v) {
   return s;
 }
 
+// A 2D surface's bitmap, for video.mm's writeVideoSurface: false, with a
+// JS error pending, when `v` is not a live surface handle.
+struct CALSurfaceBits {
+  uint8_t* data;
+  size_t width, height, bytesPerRow;
+};
+bool CALSurfaceBitmap(Napi::Value v, CALSurfaceBits* out) {
+  CALSurface* s = SurfaceFrom(v);
+  if (!s) return false;
+  out->data = (uint8_t*)CGBitmapContextGetData(s->ctx);
+  out->width = s->width;
+  out->height = s->height;
+  out->bytesPerRow = CGBitmapContextGetBytesPerRow(s->ctx);
+  return true;
+}
+
 // For the fire-and-forget drawing verbs: the context to draw into, or a
 // scratch bitmap when the surface is released (the error is already
 // pending; the stroke lands nowhere anyone looks).
@@ -1661,8 +1677,12 @@ static Napi::Value CreateSurface(const Napi::CallbackInfo& info) {
 // A surface this bridge draws into is named sRGB whatever it said before
 // (`keep` false): what is in it is what an sRGB context wrote. One it is
 // only handed to show (setLayerContentsIOSurface — a GL target, another
-// process's buffer) keeps a space its producer named, and is taken to be
-// sRGB, like everything else here, when it names none.
+// process's buffer, a video frame) keeps a space its producer named, and is
+// taken to be sRGB, like everything else here, when it names none. A video
+// frame names its colour the way CoreVideo writes a decoded buffer's
+// attachments onto its IOSurface — primaries and a transfer function, beside
+// the YCbCr matrix — and naming sRGB over those would show BT.709 video as
+// sRGB numbers, which is not what AVPlayerLayer shows for the same frame.
 void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep) {
   static const CFPropertyListRef srgb = [] {
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -1672,7 +1692,9 @@ void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep) {
   }();
   if (!ios || !srgb) return;
   if (keep) {
-    for (CFStringRef key : {kIOSurfaceColorSpace, kIOSurfaceICCProfile}) {
+    for (CFStringRef key : {kIOSurfaceColorSpace, kIOSurfaceICCProfile,
+                            CFSTR("IOSurfaceColorPrimaries"),
+                            CFSTR("IOSurfaceTransferFunction")}) {
       CFTypeRef named = IOSurfaceCopyValue(ios, key);
       if (!named) continue;
       CFRelease(named);

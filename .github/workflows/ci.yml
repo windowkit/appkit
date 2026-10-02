@@ -244,6 +244,8 @@ jobs:
         run: node test/surface-blit.js
       - name: Letter spacing and OpenType features on the text verbs
         run: node test/text-features.js
+      - name: fontFromData reads a face and installs nothing — name matching never finds it
+        run: node test/font-from-data.js
       - name: A layout's coverage, drawn nowhere — the outlines' own, from a worker too
         run: node test/text-coverage.js
       - name: A paragraph's typesetter, kept and laid out again at other widths

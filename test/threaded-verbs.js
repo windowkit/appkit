@@ -343,4 +343,35 @@ async function run() {
   const pumped = JSON.parse(pump.stdout);
   for (const j of jobs) assert.strictEqual(j.hash, pumped[j.kind], `${j.kind}: the same pixels as pump mode`);
   say(`bezels: ok (${jobs.map((j) => j.kind).join(', ')} identical to pump mode)`);
+
+  // --- video surfaces ----------------------------------------------------------
+  // On the calling thread, like every surface: a worker writes a frame into a
+  // video surface and converts one into its own bitmap — BT.709 and BT.601,
+  // through VideoToolbox on a session of the worker's own — to the same
+  // pixels as pump mode.
+  const videoFrame = `
+    const W = 64, H = 32;
+    const planes = [Buffer.alloc(W * H, 50), Buffer.alloc(W * 16 * 2, 0).map((_, i) => (i % 2 ? 190 : 60))];
+    const v = native.createVideoSurface(W, H);
+    native.writeVideoSurface(v.handle, 'NV12', planes);
+    const inUse = native.videoSurfaceIsInUse(v.handle);
+    native.releaseVideoSurface(v.handle);
+    const s = native.createSurface(W, H, 1);
+    native.writeVideoSurface(s, 'NV12', planes);
+    const rec709 = [...native.ctxGetImageData(s, 0, 0, 1, 1)];
+    native.writeVideoSurface(s, 'NV12', planes, { colorSpace: 'bt601' });
+    const rec601 = [...native.ctxGetImageData(s, 0, 0, 1, 1)];
+    const video = { inUse, rec709, rec601 };
+  `;
+  const video = new Function('native', 'Buffer', `${videoFrame}; return video;`)(native, Buffer);
+  assert.strictEqual(video.inUse, false, 'a video surface nothing shows is not in use');
+  const pumpedVideo = spawnSync(process.execPath, ['-e', `
+    const { native } = require(${JSON.stringify(path.join(__dirname, '..'))});
+    ${videoFrame}
+    process.stdout.write(JSON.stringify(video));
+  `], { encoding: 'utf8', timeout: 20000 });
+  assert.strictEqual(pumpedVideo.status, 0, `the pump-mode child: ${pumpedVideo.stderr}`);
+  assert.deepStrictEqual(video, JSON.parse(pumpedVideo.stdout), 'video frames: the same pixels as pump mode');
+  assert.notDeepStrictEqual(video.rec709, video.rec601, 'the two matrices');
+  say('video surfaces: ok');
 }

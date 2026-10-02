@@ -125,7 +125,7 @@ waits on the UI thread (`test/threaded-verbs.js` covers each row):
 
 | from a worker | verbs |
 | --- | --- |
-| unchanged, on the calling thread | surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
+| unchanged, on the calling thread | surfaces and video surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
 | a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardClear`, `cancelPanel`, `cancelPopUpMenu`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
 | a handle at the call | `createWindow2`, followed by `window-created { handle, windowNumber }`; every event about the window, input included, carries `handle`, so `ev.handle === win` |
 | | `windowRootLayer`, allocated with the window |
@@ -557,6 +557,55 @@ native.ctxSetBlendMode(win, 'source-over');
 native.ctxSetGlobalAlpha(win, 0.6);
 native.ctxDrawSurfaceFaded(win, card, 0, 0, 556, 300, 100, 100, 556, 300, 0.6);
 ```
+
+## Video surfaces
+
+A frame a decoder hands over as bytes — ffmpeg over a pipe, a WASM decoder, an addon —
+goes on the screen the way VideoToolbox's own output does: as a YCbCr IOSurface a plain
+layer shows, converted and scaled by the render server. The CPU's share is the copy in.
+
+- **`native.createVideoSurface(widthPx, heightPx, options?)`** → `{ handle, iosurfaceId }`.
+  `format` is `'NV12'` (the default: two planes, `420v`, or `420f` with `range: 'full'`)
+  or `'BGRA'`. `colorSpace` — `'bt709'` (the default), `'bt601'` or `'bt2020'` (SDR) — and
+  `range` — `'video'` (the default) or `'full'` — say what an NV12 surface's numbers mean,
+  and go on it as the attachments CoreVideo gives a decoded frame: the YCbCr matrix, the
+  primaries and the transfer function, which Core Animation reads. Shown through
+  `setLayerContentsIOSurface(layer, iosurfaceId)`, which keeps a colour a surface names
+  (or derives from CoreVideo's tags: see below). A new surface is black.
+- **`native.writeVideoSurface(target, format, planes, options?)`** — one frame, `planes`
+  an array of Buffers or typed arrays: `'NV12'` (Y, then CbCr pairs), `'I420'` (Y, Cb, Cr)
+  or `'BGRA'`, each plane `options.strides[i]` bytes a row (packed by default) and checked
+  to hold every row; a 4:2:0 chroma plane is `ceil(width / 2)` by `ceil(height / 2)`. An
+  NV12 surface takes NV12, and I420 with its chroma interleaved on the way in; a BGRA
+  surface takes BGRA, and YCbCr converted. `target` may also be a **2D surface**
+  (`createSurface`, `createSurfaceIOSurface`), for a renderer that draws the frame in its
+  own paint order — something is drawn over the video — rather than lifting it onto a
+  layer: the frame lands at the surface's top-left, `options.width`/`height` of it (the
+  surface's size by default), converted with `options.colorSpace` and `range`. A frame's
+  fourth byte is ignored: a frame is opaque.
+- **`native.videoSurfaceIsInUse(handle)`** — whether anything still reads the surface; a
+  renderer keeping a ring writes only into one this answers `false` for, and in threaded
+  mode `surface-released { id }` names the surface a frame took off a layer.
+- **`native.releaseVideoSurface(handle)`** — free it now; idempotent; a layer showing it
+  keeps it until it lets go. Every other verb on a released handle throws.
+- **`native.videoFormats()`** → `{ surfaces: ['NV12', 'BGRA'], frames: ['NV12', 'I420',
+  'BGRA'] }`, for a renderer to ask rather than assume.
+
+Two things the verbs exist to get right, both measured on screen (`test/video-surface.js`):
+
+- **Three planes draw nothing.** A layer shows `420v`, `420f` and `2vuy` surfaces and shows
+  `y420`/`f420` as transparent, so an I420 frame is interleaved into NV12, in the copy
+  the write makes anyway — 0.27ms at 1080p on an M1 Pro, against 0.07ms for NV12 as it is.
+- **The same colours on a layer, in a bitmap and under `AVPlayerLayer`.** An NV12 surface
+  is named the colour space CoreVideo makes of its tags, and `setLayerContentsIOSurface`
+  names one the same way for a tagged surface it is handed by id. Shown with the tags
+  alone, Core Animation linearises a frame tagged BT.709 throughout with the exact 709
+  curve, where `AVPlayerLayer` — the platform's player — VideoToolbox's pixel transfer
+  and Core Image all use Apple's 1.961 gamma: a video-range grey of Y′=50 was sRGB 55 on
+  such a layer and 44 everywhere else. Named, a frame on a layer, the same frame
+  converted into a bitmap by VideoToolbox (about 1ms at 1080p) and the player showing it
+  agree to within a level or two. What cannot match is gamut: a layer keeps a 2020
+  colour outside sRGB on a wide-gamut panel, and an sRGB bitmap clips it.
 
 ## Text: letter spacing and OpenType features
 

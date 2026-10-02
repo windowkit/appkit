@@ -9,7 +9,8 @@
         "src/notifications.mm",
         "src/calendars.mm",
         "src/screencolor.mm",
-        "src/threaded.mm"
+        "src/threaded.mm",
+        "src/video.mm"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
@@ -28,6 +29,8 @@
           "-framework CoreGraphics",
           "-framework ImageIO",
           "-framework IOSurface",
+          "-framework CoreVideo",
+          "-framework VideoToolbox",
           "-framework UniformTypeIdentifiers",
           "-framework AVFoundation",
           "-framework CoreLocation",

@@ -1718,6 +1718,9 @@ void InitScreenColor(Napi::Env env, Napi::Object exports);
 // src/threaded.mm — threaded mode: runMain parks the main thread in
 // [NSApp run], commands in through the main run loop, events out in batches.
 void InitThreaded(Napi::Env env, Napi::Object exports);
+// src/video.mm — video surfaces: a YCbCr or BGRA IOSurface a layer shows
+// as it is, frames written into it, and frames converted into a surface.
+void InitVideo(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1764,6 +1767,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitCalendars(env, exports);
   InitScreenColor(env, exports);
   InitThreaded(env, exports);
+  InitVideo(env, exports);
   return exports;
 }
 

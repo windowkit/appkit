@@ -1604,13 +1604,19 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
   return r;
 }
 
+// An IOSurface's colour space named sRGB, or kept as its producer named it
+// (backend.mm).
+void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep);
+
 // setLayerContentsIOSurface(layer, iosurfaceId) — the receiving end of an
 // IOSurface render target (x11-dri's appleCreateTarget): the id is process-
 // global, so the GPU addon and this one never share a pointer. The layer
 // retains the surface; our lookup reference goes with the change. From a
 // worker the flip happens when the frame applies, so the renderer may not
 // draw into the buffer it replaced until `surface-released` names it (or
-// surfaceIsInUse says it is off glass).
+// surfaceIsInUse says it is off glass). A surface that names no colour
+// space is named sRGB here: shown as it was, its numbers would be the
+// display's own and not the space the rest of the window is in.
 static Napi::Value SetLayerContentsIOSurface(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   id target = CALHandleTarget(info[0]);
@@ -1621,6 +1627,7 @@ static Napi::Value SetLayerContentsIOSurface(const Napi::CallbackInfo& info) {
         .ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  CALNameSurfaceSRGB(surface, true);
   id s = CFBridgingRelease(surface);  // held until the change has been made
   CALOnLayers(^{
     CALayer* L = CALResolve(target);

@@ -1647,6 +1647,41 @@ static Napi::Value CreateSurface(const Napi::CallbackInfo& info) {
   return WrapSurface(env, s, (int64_t)(CGBitmapContextGetBytesPerRow(ctx) * h));
 }
 
+// Name an IOSurface's colour space: sRGB, the space of the bitmap context
+// laid over it and of every colour this bridge makes. Core Animation
+// matches content that names its space to the display — a CGImage carries
+// its CGColorSpace, a layer colour is a CGColor — and shows an IOSurface
+// that names none as the display's own numbers. So on a display whose
+// profile is not sRGB the window's bitmap and a layer beside it disagreed:
+// on a MacBook's wide-gamut panel #ff0000 in the bitmap was the panel's own
+// red, (255, 0, 0) in its space, where the same red on a layer showed as
+// sRGB red, (234, 51, 35); on a monitor whose profile is its own, even
+// #808080 differed, (128, 128, 128) against (117, 117, 117).
+//
+// A surface this bridge draws into is named sRGB whatever it said before
+// (`keep` false): what is in it is what an sRGB context wrote. One it is
+// only handed to show (setLayerContentsIOSurface — a GL target, another
+// process's buffer) keeps a space its producer named, and is taken to be
+// sRGB, like everything else here, when it names none.
+void CALNameSurfaceSRGB(IOSurfaceRef ios, bool keep) {
+  static const CFPropertyListRef srgb = [] {
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CFPropertyListRef p = CGColorSpaceCopyPropertyList(cs);
+    CGColorSpaceRelease(cs);
+    return p;
+  }();
+  if (!ios || !srgb) return;
+  if (keep) {
+    for (CFStringRef key : {kIOSurfaceColorSpace, kIOSurfaceICCProfile}) {
+      CFTypeRef named = IOSurfaceCopyValue(ios, key);
+      if (!named) continue;
+      CFRelease(named);
+      return;
+    }
+  }
+  IOSurfaceSetValue(ios, kIOSurfaceColorSpace, srgb);
+}
+
 // createSurfaceIOSurface(widthPx, heightPx, scale)
 //   -> { handle, iosurfaceId }
 // The zero-copy presentation surface: the CG bitmap is laid directly over
@@ -1685,6 +1720,7 @@ static Napi::Value CreateSurfaceIOSurface(const Napi::CallbackInfo& info) {
     Napi::Error::New(env, "IOSurfaceCreate failed").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  CALNameSurfaceSRGB(ios, false);
   CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   CGContextRef ctx = CGBitmapContextCreateWithData(
       IOSurfaceGetBaseAddress(ios), w, h, 8, IOSurfaceGetBytesPerRow(ios), cs,
@@ -1723,6 +1759,7 @@ static Napi::Value SurfaceFromIOSurfaceID(const Napi::CallbackInfo& info) {
   }
   size_t w = IOSurfaceGetWidth(ios);
   size_t h = IOSurfaceGetHeight(ios);
+  CALNameSurfaceSRGB(ios, false);
   CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   CGContextRef ctx = CGBitmapContextCreateWithData(
       IOSurfaceGetBaseAddress(ios), w, h, 8, IOSurfaceGetBytesPerRow(ios), cs,

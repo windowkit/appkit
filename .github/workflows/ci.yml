@@ -244,6 +244,8 @@ jobs:
         run: node test/ignores-mouse-events.js
       - name: Surface blits and blend modes
         run: node test/surface-blit.js
+      - name: An IOSurface on a layer is colour-managed as a CGImage and a layer colour are
+        run: node test/surface-colorspace.js
       - name: Letter spacing and OpenType features on the text verbs
         run: node test/text-features.js
       - name: fontFromData reads a face and installs nothing — name matching never finds it

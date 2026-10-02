@@ -607,6 +607,39 @@ Two things the verbs exist to get right, both measured on screen (`test/video-su
   agree to within a level or two. What cannot match is gamut: a layer keeps a 2020
   colour outside sRGB on a wide-gamut panel, and an sRGB bitmap clips it.
 
+## Playing a file
+
+A file or URL played by AVFoundation — the platform's decoder, audio, seeking and HLS —
+for a renderer's `<video src>`, with the picture on a layer the renderer places among its
+own, and the frame showing drawable into a surface when something is drawn over it.
+
+- **`native.createPlayer(url, { autoPlay, loop, muted, volume, rate })`** →
+  `{ id, layer }`. `url` is a path, a `file://` URL or an `http(s)` one. `layer` is the
+  `AVPlayerLayer` that shows it, a handle every layer verb takes (`addSublayer`,
+  `setLayerProps`, `removeFromSuperlayer`); its `videoGravity` fills the layer, so the
+  renderer fits the picture itself. Nothing plays until `autoPlay` or `paused: false`.
+- **`native.playerSet(id, { paused, rate, volume, muted, loop })`** — what it names
+  changes, the rest stays; **`native.playerSeek(id, seconds)`** — exact, not to the
+  nearest keyframe.
+- **`native.playerCopyFrame(id, surface)`** → `{ width, height, time, written }`, or
+  `null` when no frame is newer than the last one copied: the frame showing now,
+  converted into a 2D surface of the frame's size in the colours the layer shows it in
+  (the same conversion as `writeVideoSurface`). A surface of another size is told the
+  size and left alone (`written: false`). It reads `AVPlayerItemVideoOutput` on the
+  calling thread, as a display link would, so a worker's renderer copies without a hop.
+- **`native.releasePlayer(id)`** — stopped, and everything it holds let go; its events
+  stop.
+
+Its events go through `setBackendEventCallback`, by `id`: `player-metadata { width,
+height, duration }` once the item is ready, and again if either moves (`duration` is
+`Infinity` for a live stream); `player-state { playing, rate }` when it starts or stops;
+`player-time { currentTime }` four times a second while it plays and once after a seek;
+`player-ended` at the end of an item that does not loop; `player-error { message }`.
+
+`test/player.js` plays `test/fixtures/clip.mp4` — 1.5s of one colour, 160x90 H.264
+tagged BT.709 — on a layer and copied into a surface beside it, and holds the two to
+the same colour on screen: 211, 127, 67 and 211, 127, 68 on an M1 Pro.
+
 ## Text: letter spacing and OpenType features
 
 The text verbs a renderer lays paragraphs out and shapes glyph runs with —

@@ -700,6 +700,100 @@ bool CALNameVideoColorSpace(IOSurfaceRef ios) {
   return true;
 }
 
+// A decoded frame — a player's, from AVPlayerItemVideoOutput (player.mm) —
+// into BGRA rows at `dst`, opaque, in sRGB: read in the colour its own
+// attachments name, which is what Core Animation shows the same buffer in on
+// a layer. YCbCr goes through the routes above; BGRA is copied. False, with
+// an error pending, for a layout neither takes. The caller holds no lock.
+bool CALPixelBufferToBGRA(Napi::Env env, const char* verb, CVPixelBufferRef pb, uint8_t* dst,
+                          size_t dstStride) {
+  OSType type = CVPixelBufferGetPixelFormatType(pb);
+  size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+  Format format;
+  Colour colour;
+  switch (type) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+      colour.full = true;
+      [[fallthrough]];
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+      format = Format::NV12;
+      break;
+    case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+      colour.full = true;
+      [[fallthrough]];
+    case kCVPixelFormatType_420YpCbCr8Planar:
+      format = Format::I420;
+      break;
+    case kCVPixelFormatType_32BGRA:
+      format = Format::BGRA;
+      break;
+    default:
+      Napi::Error::New(env, std::string(verb) + ": a frame in a layout this bridge does not read")
+          .ThrowAsJavaScriptException();
+      return false;
+  }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  CFTypeRef m = CVBufferGetAttachment(pb, kCVImageBufferYCbCrMatrixKey, nullptr);
+  CFTypeRef p = CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nullptr);
+  CFTypeRef t = CVBufferGetAttachment(pb, kCVImageBufferTransferFunctionKey, nullptr);
+#pragma clang diagnostic pop
+  // what a decoder said its frame is; untagged, it is taken to be 709, which
+  // is what an untagged HD stream is
+  for (CFStringRef known : {kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                            kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                            kCVImageBufferYCbCrMatrix_ITU_R_2020}) {
+    if (m && CFEqual(m, known)) colour.matrix = known;
+  }
+  for (CFStringRef known : {kCVImageBufferColorPrimaries_ITU_R_709_2,
+                            kCVImageBufferColorPrimaries_SMPTE_C,
+                            kCVImageBufferColorPrimaries_EBU_3213,
+                            kCVImageBufferColorPrimaries_ITU_R_2020}) {
+    if (p && CFEqual(p, known)) colour.primaries = known;
+  }
+  for (CFStringRef known : {kCVImageBufferTransferFunction_ITU_R_709_2,
+                            kCVImageBufferTransferFunction_ITU_R_2020,
+                            kCVImageBufferTransferFunction_sRGB}) {
+    if (t && CFEqual(t, known)) colour.transfer = known;
+  }
+  CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+  std::vector<Plane> planes;
+  if (format == Format::BGRA) {
+    planes.push_back({(const uint8_t*)CVPixelBufferGetBaseAddress(pb), 0,
+                      CVPixelBufferGetBytesPerRow(pb), w * 4, h});
+  } else {
+    size_t n = CVPixelBufferGetPlaneCount(pb);
+    for (size_t i = 0; i < n; i++) {
+      size_t pw = CVPixelBufferGetWidthOfPlane(pb, i);
+      planes.push_back({(const uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, i), 0,
+                        CVPixelBufferGetBytesPerRowOfPlane(pb, i),
+                        format == Format::NV12 && i == 1 ? pw * 2 : pw,
+                        CVPixelBufferGetHeightOfPlane(pb, i)});
+    }
+  }
+  bool ok;
+  if (format == Format::BGRA) {
+    CopyOpaqueRows(dst, dstStride, planes[0], w);
+    ok = true;
+  } else {
+    ok = ConvertToBGRA(env, verb, format, planes, w, h, colour, dst, dstStride);
+  }
+  CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+  return ok;
+}
+
+// A 2D surface's bitmap, for player.mm, which writes into one too.
+bool CALVideoTargetBitmap(Napi::Value v, uint8_t** data, size_t* width, size_t* height,
+                          size_t* bytesPerRow) {
+  CALSurfaceBits bits;
+  if (!CALSurfaceBitmap(v, &bits)) return false;
+  *data = bits.data;
+  *width = bits.width;
+  *height = bits.height;
+  *bytesPerRow = bits.bytesPerRow;
+  return true;
+}
+
 void InitVideo(Napi::Env env, Napi::Object exports) {
   exports.Set("createVideoSurface", Napi::Function::New(env, CreateVideoSurface));
   exports.Set("writeVideoSurface", Napi::Function::New(env, WriteVideoSurface));

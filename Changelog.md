@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/windowkit/appkit/compare/v0.22.0...v0.23.0) (2026-10-03)
+
+
+### Features
+
+* ctxSetImageSmoothing, how an image drawn scaled or turned is resampled, so a surface drawn a tile at a time through a perspective costs each tile its own pixels where it cost the whole surface: 784 tiles of a 1400x1120 surface in 27ms where they took 200 ([#109](https://github.com/windowkit/appkit/issues/109)) ([3d6b898](https://github.com/windowkit/appkit/commit/3d6b89878cddea8e3186bc661fab0bcfe575c63c))
+
 ## [0.22.0](https://github.com/windowkit/appkit/compare/v0.21.0...v0.22.0) (2026-10-02)
 
 

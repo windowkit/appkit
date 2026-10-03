@@ -4317,10 +4317,17 @@ static Napi::Value CtxStroke(const Napi::CallbackInfo& info) {
   KeepPathAround(s->ctx, ^{ CGContextStrokePath(s->ctx); });
   return info.Env().Undefined();
 }
+// ctxClip(surface, evenOdd): the flag ctxFill takes, so canvas's
+// clip(path, 'evenodd') — an SVG <clipPath> with clip-rule="evenodd" — cuts
+// a ring rather than the square around it. Absent is nonzero, as before.
 static Napi::Value CtxClip(const Napi::CallbackInfo& info) {
   CALSurface* s = SurfaceFrom(info[0]);
   if (!s) return info.Env().Undefined();
-  KeepPathAround(s->ctx, ^{ CGContextClip(s->ctx); });
+  bool evenOdd = info.Length() > 1 && info[1].ToBoolean().Value();
+  KeepPathAround(s->ctx, ^{
+    if (evenOdd) CGContextEOClip(s->ctx);
+    else CGContextClip(s->ctx);
+  });
   return info.Env().Undefined();
 }
 

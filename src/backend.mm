@@ -4192,6 +4192,24 @@ static Napi::Value CtxSetGlobalAlpha(const Napi::CallbackInfo& info) {
                     info[1].As<Napi::Number>().DoubleValue());
   return info.Env().Undefined();
 }
+// ctxSetImageSmoothing(surface, quality) — how an image drawn scaled or
+// turned is resampled: 'none' (the nearest pixel), 'low', 'medium' or
+// 'high', the 2D canvas's imageSmoothingEnabled and imageSmoothingQuality.
+// Part of the graphics state, so ctxSave/ctxRestore scope it. Every
+// context this bridge makes starts at 'medium', which resamples the whole
+// source image for a draw through a matrix whatever the clip: 784 tiles of
+// a 1400x1120 surface, each drawn under its own clip and matrix, took 214ms
+// on an M1 Pro, and 29.6ms at 'low', which is bilinear — what a layer in
+// perspective is drawn with.
+static Napi::Value CtxSetImageSmoothing(const Napi::CallbackInfo& info) {
+  std::string q = info[1].As<Napi::String>().Utf8Value();
+  CGContextSetInterpolationQuality(CtxOf(info[0]),
+                                   q == "none"     ? kCGInterpolationNone
+                                   : q == "low"    ? kCGInterpolationLow
+                                   : q == "high"   ? kCGInterpolationHigh
+                                                   : kCGInterpolationMedium);
+  return info.Env().Undefined();
+}
 static Napi::Value CtxSetLineCap(const Napi::CallbackInfo& info) {
   std::string cap = info[1].As<Napi::String>().Utf8Value();
   CGContextSetLineCap(CtxOf(info[0]),
@@ -7786,6 +7804,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("ctxSetStrokeColor", CtxSetStrokeColor);
   BFN("ctxSetLineWidth", CtxSetLineWidth);
   BFN("ctxSetGlobalAlpha", CtxSetGlobalAlpha);
+  BFN("ctxSetImageSmoothing", CtxSetImageSmoothing);
   BFN("ctxSetLineCap", CtxSetLineCap);
   BFN("ctxSetLineJoin", CtxSetLineJoin);
   BFN("ctxSetBlendMode", CtxSetBlendMode);

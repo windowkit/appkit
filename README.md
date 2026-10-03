@@ -558,6 +558,24 @@ native.ctxSetGlobalAlpha(win, 0.6);
 native.ctxDrawSurfaceFaded(win, card, 0, 0, 556, 300, 100, 100, 556, 300, 0.6);
 ```
 
+- **`native.ctxSetImageSmoothing(surface, quality)`** — how an image or a surface drawn
+  scaled or turned is resampled: `'none'` (the nearest pixel), `'low'`, `'medium'` or
+  `'high'`, the 2D canvas's `imageSmoothingEnabled` and `imageSmoothingQuality`. It is
+  part of the graphics state, so `ctxSave` and `ctxRestore` scope it, and every context
+  starts at `'medium'`. At `'medium'` CoreGraphics resamples the whole source image for a
+  draw through a matrix, whatever the clip, so a surface drawn a tile at a time — a box
+  in perspective, each tile under its own clip and the matrix of the plane over it —
+  costs each tile all of the surface: 784 tiles of a 1400x1120 surface take some 200ms
+  on an M1 Pro, and 27ms at `'low'`, which is bilinear, what a layer in perspective is
+  drawn with. A draw at 1:1 on whole pixels is the same at every quality.
+
+```js
+native.ctxSave(win);
+native.ctxSetImageSmoothing(win, 'low');
+// …the tiles…
+native.ctxRestore(win);
+```
+
 ## Video surfaces
 
 A frame a decoder hands over as bytes — ffmpeg over a pipe, a WASM decoder, an addon —

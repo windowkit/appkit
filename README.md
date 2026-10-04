@@ -746,6 +746,31 @@ one tree sets its text in the same place on both. Below 1 the same split takes r
 both sides and the glyphs overflow a short box evenly; `0` is a box of no height, as CSS's
 `line-height: 0` is. An absent multiplier is 1.
 
+## Text: justified lines
+
+`createLayout`'s `justify` sets lines to fill `maxWidth`: what a line leaves of the width is
+shared equally among its word separators, each space and no-break space before the white
+space it ends on that much wider — the white space it ends on hangs and takes none. That is
+CSS Text 3's `text-justify: auto` for the scripts that space their words, and it is how ntk
+justifies on X11 and Wayland. It is bits:
+
+- **`1`** — every line that goes on to another, CSS's `text-align: justify`;
+- **`2`** — the paragraph's last line and each a forced break ends (a line feed, a carriage
+  return or a paragraph separator; a line separator, U+2028, is not one);
+- **`3`** — every line.
+
+A line with no separator, or no width to spare, keeps the place `align` gives it, and a line
+an ellipsis ends is not justified. The lines are the ones the typesetter breaks at the
+width; justifying moves no break, and a kept typesetter (`keep`, below) laid out again at
+another width is broken and spaced again without shaping anything. A justified line is
+`maxWidth` wide, its runs, carets (`layoutCaret`) and hit tests (`layoutIndexAt`) are where
+the wider separators put them, and `drawLayout`, `drawLayoutGradient` and `layoutCoverage`
+draw its glyphs there.
+
+It is not `CTLineCreateJustifiedLine`. Once a line's spaces have taken some share of their
+own advance, CoreText's justification spaces the letters too, where a browser widens
+nothing but the separators; and it gives the space a line ends on no advance at all.
+
 ## Text: a layout's coverage
 
 - **`native.layoutCoverage(layout, pad?)`** — `{ width, height, data }`: how much of each

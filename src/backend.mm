@@ -31,7 +31,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <vector>
+#include <algorithm>
 #include <vector>
 
 #include "channel.h"
@@ -5593,7 +5593,40 @@ struct CALLine {
   // (BDrawGlyphsAtScale)
   bool bitmapsAtScale = false;
   std::vector<CALRun> runs;
+  // A justified line (`justify`): its word separators' left edges and
+  // widths as the typesetter set them, from the line's origin, in visual
+  // order, and the room each was widened by. Everything to a separator's
+  // right is that much further right, which every reader of the line adds
+  // (JustifiedX) or takes away (UnjustifiedX).
+  double justifyExtra = 0;
+  std::vector<double> sepX, sepW;
 };
+
+// Where a point of a justified line is, `ux` as the typesetter set it: the
+// room of every separator left of it added. A caret at a separator's left
+// edge is before it, and one at its right edge after it.
+static double JustifiedX(const CALLine& L, double ux) {
+  if (L.justifyExtra <= 0) return ux;
+  size_t k = std::lower_bound(L.sepX.begin(), L.sepX.end(), ux - 1e-6) -
+             L.sepX.begin();
+  return ux + L.justifyExtra * (double)k;
+}
+
+// The inverse, for a hit test: a point inside a widened separator is in it,
+// at its share of the separator's own advance.
+static double UnjustifiedX(const CALLine& L, double x) {
+  if (L.justifyExtra <= 0) return x;
+  const double e = L.justifyExtra;
+  for (size_t i = 0; i < L.sepX.size(); i++) {
+    const double left = L.sepX[i] + e * (double)i;
+    if (x < left) return x - e * (double)i;
+    const double width = L.sepW[i] + e;
+    if (x < left + width) {
+      return L.sepX[i] + (x - left) * (width > 0 ? L.sepW[i] / width : 0);
+    }
+  }
+  return x - e * (double)L.sepX.size();
+}
 
 struct CALLayout {
   std::vector<CALLine> lines;
@@ -5778,10 +5811,67 @@ static long UnfitClusterRunsOn(CTTypesetterRef ts, NSString* text,
   return std::max(count, end - start);
 }
 
+// A line set to fill `free` more of its width (`justify`): what it leaves
+// shared equally among its word separators, the spaces and no-break spaces
+// before the white space it ends on, which hangs and takes none — CSS Text
+// 3's `text-justify: auto` for the scripts that space their words, as
+// ntk's layout sets it. Not CTLineCreateJustifiedLine: CoreText spaces the
+// letters too once a line's spaces have taken some share of their own
+// advance, where a browser widens nothing but its separators, and gives the
+// space a line ends on no advance at all. The line keeps the typesetter's
+// glyphs; where they are drawn, measured and hit is moved by the separators
+// left of them (JustifiedX). False where it has no separator.
+static bool JustifyLine(CALLine& L, NSString* text, long start, long end,
+                        double free, std::vector<long>* sepIdx) {
+  long hang = end;
+  while (hang > start) {
+    unichar c = [text characterAtIndex:(NSUInteger)(hang - 1)];
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != 0x2028 &&
+        c != 0x2029)
+      break;
+    hang--;
+  }
+  std::vector<std::pair<double, double>> seps;
+  std::vector<CGPoint> positions;
+  CFArrayRef runs = CTLineGetGlyphRuns(L.line);
+  for (CFIndex ri = 0; ri < CFArrayGetCount(runs); ri++) {
+    CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, ri);
+    const CFIndex count = CTRunGetGlyphCount(run);
+    if (count <= 0) continue;
+    std::vector<CFIndex> indices((size_t)count);
+    CTRunGetStringIndices(run, CFRangeMake(0, 0), indices.data());
+    BRunPositions(run, &positions);
+    for (CFIndex g = 0; g < count; g++) {
+      const long at = (long)indices[(size_t)g];
+      if (at < start || at >= hang) continue;
+      unichar c = [text characterAtIndex:(NSUInteger)at];
+      if (c != ' ' && c != 0xA0) continue;
+      // one glyph for the one character: a space shaped into anything else
+      // is no separator to widen
+      if ((g + 1 < count && indices[(size_t)g + 1] == indices[(size_t)g]) ||
+          (g > 0 && indices[(size_t)g - 1] == indices[(size_t)g]))
+        continue;
+      const double w = CTRunGetTypographicBounds(run, CFRangeMake(g, 1),
+                                                 nullptr, nullptr, nullptr);
+      seps.push_back({positions[(size_t)g].x, w});
+      sepIdx->push_back(at);
+    }
+  }
+  if (seps.empty()) return false;
+  std::sort(seps.begin(), seps.end());
+  L.justifyExtra = free / (double)seps.size();
+  for (const auto& sep : seps) {
+    L.sepX.push_back(sep.first);
+    L.sepW.push_back(sep.second);
+  }
+  std::sort(sepIdx->begin(), sepIdx->end());
+  return true;
+}
+
 // createLayout({ spans: [{text, font (handle), color:[r,g,b,a]}],
 //                maxWidth?, align: 0 left | 0.5 center | 1 right,
 //                lineHeight?, maxLines?, ellipsis?, rtl?,
-//                keep?, typesetter?, packed? })
+//                keep?, typesetter?, packed?, justify? })
 // -> { handle, width, height,
 //      lines: [{x,y,width,height,baseline,descent,start,end,
 //               runs:[{x,width,start,end,rtl}]}],
@@ -5796,6 +5886,16 @@ static long UnfitClusterRunsOn(CTTypesetterRef ts, NSString* text,
 // x, y, width, height, baseline, ascent, descent, start, end and how many
 // runs it has — and `runData`, five a run in line order — x, width, start,
 // end, and 1 when it runs right to left.
+//
+// `justify` sets lines to fill `maxWidth` at their word separators
+// (JustifyLine), as bits: 1 for every line that goes on to another, 2 for
+// the paragraph's last and each a forced break ends — a line feed, a
+// carriage return or a paragraph separator, and not a line separator. A
+// line an ellipsis ends is not justified, and one with no separator keeps
+// `align`'s place. Its width is then `maxWidth`, and its runs, its carets,
+// its hit tests and its drawing are where the wider separators put them.
+// The breaks are the typesetter's at the width: a kept typesetter (`keep`)
+// is broken and spaced again at another, and nothing is shaped.
 static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   Napi::Object o = info[0].As<Napi::Object>();
@@ -5812,6 +5912,7 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
   bool rtl = BBoolOr(o, "rtl", false);
   bool keep = BBoolOr(o, "keep", false);
   bool packed = BBoolOr(o, "packed", false);
+  const int justify = (int)BNumOr(o, "justify", 0);
   if (ellipsis && maxLines <= 0) maxLines = 1;
 
   CALTypesetter* shaped = nullptr;
@@ -5906,13 +6007,28 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
       L.baseline = y + halfLeading + ascent;
       L.start = start;
       L.end = lineEnd;
+      bool stops = false;
       if (lineEnd > start) {
         unichar last = [[as string] characterAtIndex:(NSUInteger)(lineEnd - 1)];
         L.hardBreak =
             last == '\n' || last == '\r' || last == 0x2028 || last == 0x2029;
+        stops = last == '\n' || last == '\r' || last == 0x2029;
+      }
+      // the line's place in the paragraph, for `justify`: its last, which a
+      // `maxLines` cut leaves no line, or one a forced break ends
+      const int role = lineEnd >= total || stops ? 2 : 1;
+      std::vector<long> sepIdx;
+      double spread = 0;
+      if (bounded && (justify & role) && !elided && maxWidth - lw > 0 &&
+          JustifyLine(L, as.string, start, lineEnd, maxWidth - lw,
+                      &sepIdx)) {
+        spread = maxWidth - lw;
+        L.width = maxWidth;
       }
       if (bounded && flush > 0) {
-        L.x = CTLineGetPenOffsetForFlush(line, flush, maxWidth);
+        // as wide as the width now, where it was justified
+        L.x = CTLineGetPenOffsetForFlush(line, flush, maxWidth) -
+              flush * spread;
       }
       // runs, for selection bands
       CFArrayRef runs = CTLineGetGlyphRuns(line);
@@ -5943,15 +6059,23 @@ static Napi::Value CreateLayout(const Napi::CallbackInfo& info) {
           }
         }
         CALRun R;
-        R.x = rx;
+        R.x = JustifiedX(L, rx);
         R.width = rwidth;
         R.start = range.location;
         R.end = range.location + range.length;
+        if (!sepIdx.empty()) {
+          // and as much wider as its separators were widened
+          const auto from =
+              std::lower_bound(sepIdx.begin(), sepIdx.end(), (long)R.start);
+          const auto to =
+              std::lower_bound(sepIdx.begin(), sepIdx.end(), (long)R.end);
+          R.width += L.justifyExtra * (double)(to - from);
+        }
         R.rtl = (CTRunGetStatus(run) & kCTRunStatusRightToLeft) != 0;
         L.runs.push_back(R);
       }
       layout->lines.push_back(L);
-      layout->width = std::max(layout->width, lw);
+      layout->width = std::max(layout->width, L.width);
       y += advance;
       lineIndex++;
       start = lineEnd;
@@ -6053,7 +6177,8 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
   CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1, -1));
   std::vector<CGPoint> positions;
   for (const CALLine& L : layout->lines) {
-    if (!L.bitmapsAtScale) {
+    const bool justified = L.justifyExtra > 0;
+    if (!L.bitmapsAtScale && !justified) {
       CGContextSetTextPosition(ctx, x + L.x, y + L.baseline);
       CTLineDraw(L.line, ctx);
       continue;
@@ -6061,12 +6186,13 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
     // a line with a scaled face's bitmap glyphs in it is drawn a run at a
     // time, and a scaled run at its face's point size under a scaled CTM:
     // CTRunDraw, unlike CTLineDraw, does not draw through the font matrix
-    // either, outlines included
+    // either, outlines included. A justified line is drawn a run at a time
+    // too, each glyph where its line's separators move it (JustifiedX).
     CFArrayRef runs = CTLineGetGlyphRuns(L.line);
     for (CFIndex ri = 0; ri < CFArrayGetCount(runs); ri++) {
       CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, ri);
       CTFontRef font = BRunFont(run);
-      if (!font || BFontScale(font) == 1) {
+      if (!font || (BFontScale(font) == 1 && !justified)) {
         CGContextSetTextPosition(ctx, x + L.x, y + L.baseline);
         CTRunDraw(run, ctx, CFRangeMake(0, 0));
         continue;
@@ -6076,6 +6202,9 @@ static Napi::Value DrawLayout(const Napi::CallbackInfo& info) {
       std::vector<CGGlyph> glyphs((size_t)count);
       CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs.data());
       BRunPositions(run, &positions);
+      if (justified) {
+        for (CGPoint& p : positions) p.x = JustifiedX(L, p.x);
+      }
       CGContextSaveGState(ctx);
       CGColorRef ink = (CGColorRef)CFDictionaryGetValue(
           CTRunGetAttributes(run), kCTForegroundColorAttributeName);
@@ -6296,7 +6425,7 @@ static Napi::Value DrawLayoutGradient(const Napi::CallbackInfo& info) {
       BRunPositions(run, &positions);
       for (CFIndex g = 0; g < count; g++) {
         CGAffineTransform t = {1, 0, 0, -1,
-                               x + L.x + positions[(size_t)g].x,
+                               x + L.x + JustifiedX(L, positions[(size_t)g].x),
                                y + L.baseline - positions[(size_t)g].y};
         CGPathRef gp = CTFontCreatePathForGlyph(font, glyphs[(size_t)g], &t);
         if (gp) {
@@ -6572,7 +6701,7 @@ static Napi::Value LayoutCoverage(const Napi::CallbackInfo& info) {
         if (glyphs[g] == kCGFontIndexInvalid) continue;
         // positions are from the line's origin, y up; outlines are y up
         // from the glyph's origin, flipped here into canvas space
-        const double ox = pad + L.x + positions[g].x;
+        const double ox = pad + L.x + JustifiedX(L, positions[g].x);
         const double oy = pad + L.baseline - positions[g].y;
         const CGAffineTransform t = {1, 0, 0, -1, ox, oy};
         CGPathRef outline = CTFontCreatePathForGlyph(font, glyphs[g], &t);
@@ -6667,8 +6796,8 @@ static Napi::Value LayoutIndexAt(const Napi::CallbackInfo& info) {
       break;
     }
   }
-  CFIndex idx =
-      CTLineGetStringIndexForPosition(pick->line, CGPointMake(x - pick->x, 0));
+  CFIndex idx = CTLineGetStringIndexForPosition(
+      pick->line, CGPointMake(UnjustifiedX(*pick, x - pick->x), 0));
   if (idx == kCFNotFound) idx = pick->end;
   // Trailing-newline aware, ntk's contract: a hit at or past the right edge
   // of a hard-wrapped line answers the end of its VISIBLE content. The index
@@ -6705,7 +6834,8 @@ static Napi::Value LayoutCaret(const Napi::CallbackInfo& info) {
     }
   }
   const CALLine* pick = &layout->lines[li];
-  double x = CTLineGetOffsetForStringIndex(pick->line, idx, NULL);
+  double x =
+      JustifiedX(*pick, CTLineGetOffsetForStringIndex(pick->line, idx, NULL));
   r.Set("x", pick->x + x);
   r.Set("y", pick->y);
   r.Set("height", pick->height);

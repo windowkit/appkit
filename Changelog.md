@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.0](https://github.com/windowkit/appkit/compare/v0.25.0...v0.26.0) (2026-10-04)
+
+
+### Features
+
+* createLayout's `justify` sets lines to fill the width at their word separators after the typesetter breaks them, so a kept typesetter is justified again at another width without shaping anything ([#115](https://github.com/windowkit/appkit/issues/115)) ([6116d06](https://github.com/windowkit/appkit/commit/6116d06bc983e9f50c9f4fea2d6164fa0e4d8080))
+
 ## [0.25.0](https://github.com/windowkit/appkit/compare/v0.24.0...v0.25.0) (2026-10-04)
 
 

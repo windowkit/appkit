@@ -90,6 +90,11 @@ async function run() {
   // layer's least y, CA's `bottomLeft`
   native.setLayerProps(box, { contentsGravity: 'topLeft' });
   await settle(box, 'contentsGravity', (v) => v === 'bottomLeft', 'a gravity from a worker');
+  // a unit rect named as it looks, made Core Animation's on the UI thread
+  // the same way: under the flipped root, y down from the top as it was
+  // named
+  native.setLayerProps(box, { contentsRect: [0, 0, 0.5, 0.25] });
+  await settle(box, 'contentsRect', (v) => near(v, [0, 0, 0.5, 0.25]), 'a contents rect from a worker');
   say('one frame: ok');
 
   // --- the other layer kinds ----------------------------------------------------

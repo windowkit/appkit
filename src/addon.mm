@@ -585,6 +585,10 @@ struct LayerPropsSpec {
   CATransform3D transform = CATransform3DIdentity;
   bool hasGravity = false, badGravity = false;
   NSString* gravity = nil;  // as named: the window's top is `top`
+  // unit rects as named: y down from the window's top (`CALUnitRect`)
+  bool hasContentsRect = false, hasContentsCenter = false;
+  const char* badUnitRect = nullptr;  // the key of a value that is no unit rect
+  CGRect contentsRect = CGRectMake(0, 0, 1, 1), contentsCenter = CGRectMake(0, 0, 1, 1);
 };
 
 // `contentsGravity`: how a layer's contents sit in bounds that are not
@@ -624,6 +628,44 @@ static NSString* CALGravity(CALayer* L, NSString* name) {
   if ([name isEqualToString:@"resizeAspect"]) return kCAGravityResizeAspect;
   if ([name isEqualToString:@"resizeAspectFill"]) return kCAGravityResizeAspectFill;
   return kCAGravityResize;
+}
+
+// `contentsRect` and `contentsCenter`, rects in the unit square of a layer's
+// contents, [x, y, width, height]: four finite numbers, or null for the whole
+// square, which is Core Animation's default for both. `contentsRect` is the
+// part of the contents the layer shows. `contentsCenter` is the part that
+// stretches when the contents are scaled to bounds that are not their size —
+// what is outside it keeps its size, at its edge of the bounds — so a frame
+// whose bounds outgrew it can be shown at its size with its last column and
+// row carried over the rest, the way a page continues past its edge, where
+// gravity alone either stretches it or leaves a strip of whatever is under
+// it.
+static bool UnitRectFrom(Napi::Value v, CGRect* out) {
+  if (v.IsNull() || v.IsUndefined()) {
+    *out = CGRectMake(0, 0, 1, 1);
+    return true;
+  }
+  if (!v.IsArray() || v.As<Napi::Array>().Length() != 4) return false;
+  Napi::Array a = v.As<Napi::Array>();
+  double c[4];
+  for (uint32_t i = 0; i < 4; i++) {
+    Napi::Value e = a.Get(i);
+    if (!e.IsNumber()) return false;
+    c[i] = e.As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(c[i])) return false;
+  }
+  *out = CGRectMake(c[0], c[1], c[2], c[3]);
+  return true;
+}
+
+// A unit rect named as it looks, y down from the window's top, made Core
+// Animation's on the UI thread, where the layer can say whether its space is
+// flipped. CA's unit square is the layer's own space, as its gravities are
+// (`CALGravity`): its least y is the window's top where the contents are
+// flipped, under a window's geometry-flipped root, and the bottom elsewhere.
+static CGRect CALUnitRect(CALayer* L, CGRect r) {
+  if (L.contentsAreFlipped) return r;
+  return CGRectMake(r.origin.x, 1 - r.origin.y - r.size.height, r.size.width, r.size.height);
 }
 
 static LayerPropsSpec ParseLayerProps(Napi::Object o) {
@@ -694,6 +736,12 @@ static LayerPropsSpec ParseLayerProps(Napi::Object o) {
     s.gravity = g.IsString() ? ToNSString(g) : nil;
     s.badGravity = !CALGravityKnown(s.gravity);
   }
+  if ((s.hasContentsRect = o.Has("contentsRect")) &&
+      !UnitRectFrom(o.Get("contentsRect"), &s.contentsRect))
+    s.badUnitRect = "contentsRect";
+  if ((s.hasContentsCenter = o.Has("contentsCenter")) &&
+      !UnitRectFrom(o.Get("contentsCenter"), &s.contentsCenter))
+    s.badUnitRect = "contentsCenter";
   return s;
 }
 
@@ -724,6 +772,8 @@ static void ApplyLayerProps(CALayer* L, const LayerPropsSpec& s) {
     L.contents = nil;
   }
   if (s.hasGravity) L.contentsGravity = CALGravity(L, s.gravity);
+  if (s.hasContentsRect) L.contentsRect = CALUnitRect(L, s.contentsRect);
+  if (s.hasContentsCenter) L.contentsCenter = CALUnitRect(L, s.contentsCenter);
 }
 
 static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
@@ -731,6 +781,14 @@ static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
   LayerPropsSpec s = ParseLayerProps(info[1].As<Napi::Object>());
   if (s.badTransform) {
     Napi::TypeError::New(info.Env(), "transform: matrix is six finite numbers, matrix3d sixteen")
+        .ThrowAsJavaScriptException();
+    return info.Env().Undefined();
+  }
+  if (s.badUnitRect) {
+    Napi::TypeError::New(info.Env(),
+                         std::string(s.badUnitRect) +
+                             ": [x, y, width, height], four finite numbers in the unit "
+                             "square of the contents, y down from the top, or null")
         .ThrowAsJavaScriptException();
     return info.Env().Undefined();
   }

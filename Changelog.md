@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/windowkit/appkit/compare/v0.26.0...v0.27.0) (2026-10-04)
+
+
+### Features
+
+* setLayerProps' contentsRect and contentsCenter, the part of a layer's contents it shows and the part that stretches, named as they look, so a renderer can show a pane's last frame at its size with its last column and row carried over where its bounds outgrew it ([#117](https://github.com/windowkit/appkit/issues/117)) ([c369594](https://github.com/windowkit/appkit/commit/c36959402de6d8e5cef2ba1d24da55873b23a9ee))
+
 ## [0.26.0](https://github.com/windowkit/appkit/compare/v0.25.0...v0.26.0) (2026-10-04)
 
 

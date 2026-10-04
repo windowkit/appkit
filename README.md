@@ -417,6 +417,20 @@ positive angle turns clockwise and a positive translation moves down, with no si
 change on the way in. A matrix of the wrong length or with a number that is not finite
 is a `TypeError`, and nothing is applied.
 
+**Contents gravity.** `setLayerProps`' `contentsGravity` is how a layer's contents sit in
+bounds that are not their size: `resize`, Core Animation's default, stretches them;
+`resizeAspect` and `resizeAspectFill` scale them keeping their shape; `center`, `top`,
+`bottom`, `left`, `right`, `topLeft`, `topRight`, `bottomLeft` and `bottomRight` leave
+them at their size, anchored there. A window or a pane whose bounds grow before a frame
+of the new size is drawn shows its last frame by this: stretched by default — a page's
+left column scaled a little, then drawn back at its size — or anchored, a strip of what
+is under it showing where the new frame will be. The names are as they look, `top` being
+the window's top. Core Animation's own are in the layer's space, where `top` is the
+greatest y, which under a window's geometry-flipped root is the bottom of the screen, so
+the bridge turns them over where the layer's space is flipped; `presentationValue(layer,
+'contentsGravity')` answers Core Animation's name, `bottomLeft` for a `topLeft` here.
+Any other name, or a value that is not one, is a `TypeError`, and nothing is applied.
+
 **`native.transformForms()`** — `['translate', 'rotate', 'scale', 'matrix', 'matrix3d']`:
 the forms a transform takes on its way in. A caller that hands over matrices
 feature-detects `matrix` here; before 0.19 an object holding one was read as no transform

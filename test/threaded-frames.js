@@ -85,6 +85,11 @@ async function run() {
   // a change to a made layer, outside any txBegin: a command of its own
   native.setLayerProps(box, { cornerRadius: 9 });
   await settle(box, 'cornerRadius', (v) => v === 9, 'a change outside a frame');
+  // a gravity named as it looks, made Core Animation's on the UI thread,
+  // where the layer says its space is flipped: the window's top left is the
+  // layer's least y, CA's `bottomLeft`
+  native.setLayerProps(box, { contentsGravity: 'topLeft' });
+  await settle(box, 'contentsGravity', (v) => v === 'bottomLeft', 'a gravity from a worker');
   say('one frame: ok');
 
   // --- the other layer kinds ----------------------------------------------------

@@ -240,6 +240,8 @@ jobs:
         run: node test/layer-transform.js
       - name: Contents gravity, named as it looks, on the window's pixels
         run: node test/contents-gravity.js
+      - name: Contents rect and center, a grown frame's edge carried over, on the window's pixels
+        run: node test/contents-center.js
       - name: Accessibility display options and their change event
         run: node test/accessibility-display.js
       - name: A window the pointer passes through, and the hit test that shows it

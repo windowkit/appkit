@@ -431,6 +431,22 @@ the bridge turns them over where the layer's space is flipped; `presentationValu
 'contentsGravity')` answers Core Animation's name, `bottomLeft` for a `topLeft` here.
 Any other name, or a value that is not one, is a `TypeError`, and nothing is applied.
 
+**Contents rect and center.** `setLayerProps`' `contentsRect` is the part of a layer's
+contents it shows, and `contentsCenter` the part that stretches when they are scaled to
+bounds that are not their size — what is outside it keeps its size, at its edge of the
+bounds. Both are rects in the unit square of the contents, `[x, y, width, height]`, named
+as they look: `y` runs down from the window's top, where Core Animation's runs up from the
+layer's least `y`, so the bridge turns them over where the layer's space is not flipped,
+as it does gravities. `null` is the whole square, the default for both. Between them a
+frame whose bounds outgrew it can be shown at its size with its last column and row
+carried over the rest — the way a page continues past its edge, where a gravity either
+stretches the frame or leaves a strip of whatever is under it: `contentsRect` crops an
+axis the bounds shrank on, and `contentsCenter` names the last pixel. Name its middle, a
+sliver of it: a centre a whole pixel wide stretches what the filter makes of it and the
+pixel before it, a blend of the two, and Core Animation ignores a centre of no width.
+Four finite numbers or `null`, or the call is a `TypeError` naming the key, and nothing is
+applied.
+
 **`native.transformForms()`** — `['translate', 'rotate', 'scale', 'matrix', 'matrix3d']`:
 the forms a transform takes on its way in. A caller that hands over matrices
 feature-detects `matrix` here; before 0.19 an object holding one was read as no transform

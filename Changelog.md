@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/windowkit/appkit/compare/v0.24.0...v0.25.0) (2026-10-04)
+
+
+### Features
+
+* setLayerProps' contentsGravity, how a layer's contents sit in bounds not their size, named as they look, so a renderer can anchor a pane's last frame while it grows where Core Animation stretched it ([#113](https://github.com/windowkit/appkit/issues/113)) ([8a1c02a](https://github.com/windowkit/appkit/commit/8a1c02a6525be6a0fa0de1a33b9e50f33642908d))
+
 ## [0.24.0](https://github.com/windowkit/appkit/compare/v0.23.0...v0.24.0) (2026-10-03)
 
 

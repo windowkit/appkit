@@ -583,7 +583,48 @@ struct LayerPropsSpec {
   NSString* name = nil;
   id mask = nil;  // a layer target; nil clears
   CATransform3D transform = CATransform3DIdentity;
+  bool hasGravity = false, badGravity = false;
+  NSString* gravity = nil;  // as named: the window's top is `top`
 };
+
+// `contentsGravity`: how a layer's contents sit in bounds that are not
+// their size. Core Animation's default stretches them to the bounds, which
+// is what a window shows while it waits for a frame of its new size; the
+// others leave them at their size, anchored. Named as they look — `top` is
+// the window's top — where Core Animation's names are the layer's own
+// space, whose `top` is its greatest y: under the window's geometry-flipped
+// root, the bottom of the screen (`CALGravity`).
+static bool CALGravityKnown(NSString* name) {
+  static NSSet* known = [NSSet setWithArray:@[
+    @"resize", @"resizeAspect", @"resizeAspectFill", @"center", @"top", @"bottom",
+    @"left", @"right", @"topLeft", @"topRight", @"bottomLeft", @"bottomRight"
+  ]];
+  return name && [known containsObject:name];
+}
+
+// The constant for a gravity named as it looks, on the UI thread, where the
+// layer can say whether its space is flipped.
+static NSString* CALGravity(CALayer* L, NSString* name) {
+  bool flipped = L.contentsAreFlipped;
+  NSString* top = flipped ? kCAGravityBottom : kCAGravityTop;
+  NSString* bottom = flipped ? kCAGravityTop : kCAGravityBottom;
+  NSString* topLeft = flipped ? kCAGravityBottomLeft : kCAGravityTopLeft;
+  NSString* topRight = flipped ? kCAGravityBottomRight : kCAGravityTopRight;
+  NSString* bottomLeft = flipped ? kCAGravityTopLeft : kCAGravityBottomLeft;
+  NSString* bottomRight = flipped ? kCAGravityTopRight : kCAGravityBottomRight;
+  if ([name isEqualToString:@"top"]) return top;
+  if ([name isEqualToString:@"bottom"]) return bottom;
+  if ([name isEqualToString:@"topLeft"]) return topLeft;
+  if ([name isEqualToString:@"topRight"]) return topRight;
+  if ([name isEqualToString:@"bottomLeft"]) return bottomLeft;
+  if ([name isEqualToString:@"bottomRight"]) return bottomRight;
+  if ([name isEqualToString:@"left"]) return kCAGravityLeft;
+  if ([name isEqualToString:@"right"]) return kCAGravityRight;
+  if ([name isEqualToString:@"center"]) return kCAGravityCenter;
+  if ([name isEqualToString:@"resizeAspect"]) return kCAGravityResizeAspect;
+  if ([name isEqualToString:@"resizeAspectFill"]) return kCAGravityResizeAspectFill;
+  return kCAGravityResize;
+}
 
 static LayerPropsSpec ParseLayerProps(Napi::Object o) {
   LayerPropsSpec s;
@@ -648,6 +689,11 @@ static LayerPropsSpec ParseLayerProps(Napi::Object o) {
     else s.transform = TransformFrom(tv);
   }
   if (o.Has("contents")) s.clearContents = o.Get("contents").IsNull();
+  if ((s.hasGravity = o.Has("contentsGravity"))) {
+    Napi::Value g = o.Get("contentsGravity");
+    s.gravity = g.IsString() ? ToNSString(g) : nil;
+    s.badGravity = !CALGravityKnown(s.gravity);
+  }
   return s;
 }
 
@@ -677,6 +723,7 @@ static void ApplyLayerProps(CALayer* L, const LayerPropsSpec& s) {
     CALNoteContentsReplaced(L, nil);
     L.contents = nil;
   }
+  if (s.hasGravity) L.contentsGravity = CALGravity(L, s.gravity);
 }
 
 static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
@@ -684,6 +731,14 @@ static Napi::Value SetLayerProps(const Napi::CallbackInfo& info) {
   LayerPropsSpec s = ParseLayerProps(info[1].As<Napi::Object>());
   if (s.badTransform) {
     Napi::TypeError::New(info.Env(), "transform: matrix is six finite numbers, matrix3d sixteen")
+        .ThrowAsJavaScriptException();
+    return info.Env().Undefined();
+  }
+  if (s.badGravity) {
+    Napi::TypeError::New(info.Env(),
+                         "contentsGravity: resize, resizeAspect, resizeAspectFill, center, "
+                         "top, bottom, left, right, topLeft, topRight, bottomLeft or "
+                         "bottomRight")
         .ThrowAsJavaScriptException();
     return info.Env().Undefined();
   }
@@ -1192,6 +1247,8 @@ static Napi::Value RemoveAllAnimations(const Napi::CallbackInfo& info) {
 static Napi::Value JSFromCAValue(Napi::Env env, id v) {
   if (!v) return env.Null();
   if ([v isKindOfClass:[NSNumber class]]) return Napi::Number::New(env, [(NSNumber*)v doubleValue]);
+  // a name — `contentsGravity` is Core Animation's own, in the layer's space
+  if ([v isKindOfClass:[NSString class]]) return Napi::String::New(env, [(NSString*)v UTF8String]);
   if ([v isKindOfClass:[NSValue class]]) {
     NSValue* nv = (NSValue*)v;
     const char* t = nv.objCType;
@@ -1261,8 +1318,8 @@ static Napi::Value PresentationValue(const Napi::CallbackInfo& info) {
         v = nil;
       }
     }
-    // an NSNumber, an NSValue or a CGColor: immutable, made into JS on the
-    // caller's thread
+    // an NSNumber, an NSValue, a CGColor or a name: immutable, made into JS
+    // on the caller's thread
     return ^Napi::Value(Napi::Env e) { return JSFromCAValue(e, v); };
   });
 }

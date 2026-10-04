@@ -238,6 +238,8 @@ jobs:
         run: node test/animation.js
       - name: A layer transform as a matrix, read back and on the window's pixels
         run: node test/layer-transform.js
+      - name: Contents gravity, named as it looks, on the window's pixels
+        run: node test/contents-gravity.js
       - name: Accessibility display options and their change event
         run: node test/accessibility-display.js
       - name: A window the pointer passes through, and the hit test that shows it

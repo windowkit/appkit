@@ -7221,6 +7221,33 @@ static NSArray<NSPasteboardItem*>* BuildPasteboardItems(const PbItemsSpec& spec,
   return items;
 }
 
+// pasteboardWrite(items) — the general pasteboard's contents, replaced by
+// any number of representations at once: `{ 'public.png': bytes,
+// 'public.utf8-plain-text': 'caption' }` is one item a paste may take
+// either way, and an array is one entry per item. The same shape a drag
+// takes, so a copy and a drag of one payload are one vocabulary. Values are
+// strings or bytes (Buffer, typed array, ArrayBuffer); null is dropped,
+// since nothing would ever be asked to provide it. Read on the calling
+// thread, written on the UI thread, like pasteboardWriteText.
+static Napi::Value PbWriteFn(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env,
+                         "pasteboardWrite(items): items is { [type]: string "
+                         "| bytes } or an array of them")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  PbItemsSpec spec = ParsePasteboardItems(env, info[0], false);
+  CALOnUI(^{
+    NSPasteboard* pb = NSPasteboard.generalPasteboard;
+    [pb clearContents];
+    [pb writeObjects:BuildPasteboardItems(spec, nil)];
+    PublishPasteboardCount();
+  });
+  return env.Undefined();
+}
+
 // The drag image, from either bitmap this addon deals in: `surface`, a
 // surface handle (the renderer's own paint, its scale known, its pixels
 // copied as they are at the call), or `image`, a CGImage External — or the
@@ -7987,6 +8014,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("layoutCaret", LayoutCaret);
   BFN("layoutCoverage", LayoutCoverage);
   BFN("pasteboardWriteText", PbWriteTextFn);
+  BFN("pasteboardWrite", PbWriteFn);
   BFN("pasteboardReadText", PbReadTextFn);
   BFN("pasteboardClear", PbClearFn);
   BFN("pasteboardChangeCount", PbChangeCountFn);

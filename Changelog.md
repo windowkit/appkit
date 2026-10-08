@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.28.0](https://github.com/windowkit/appkit/compare/v0.27.0...v0.28.0) (2026-10-08)
+
+
+### Features
+
+* ctxFillRadialGradient fills canvas's two-circle radial gradient through CGContextDrawRadialGradient, through the current path or a rect, where a renderer had no radial fill to hand one to and drew every radial gradient flat ([#121](https://github.com/windowkit/appkit/issues/121)) ([4665335](https://github.com/windowkit/appkit/commit/4665335ab618d8c0ea6d1e9020c60265a736548e))
+* pasteboardWrite puts any number of representations on the general pasteboard at once, in the shape a drag already takes, so a renderer can copy an image (with a caption beside it) where pasteboardWriteText could only copy text ([#119](https://github.com/windowkit/appkit/issues/119)) ([35cfe62](https://github.com/windowkit/appkit/commit/35cfe62ed03f6bccf9155ec6ac1b0d0336bbdf78))
+
 ## [0.27.0](https://github.com/windowkit/appkit/compare/v0.26.0...v0.27.0) (2026-10-04)
 
 

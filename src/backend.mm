@@ -4371,16 +4371,9 @@ static Napi::Value CtxFillRects(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-// fillLinearGradient(surface, x0, y0, x1, y1, stops [offset,r,g,b,a,...],
-//                    mode: 0 = fill current path, 1 = fill rect args follow)
-static Napi::Value CtxFillLinearGradient(const Napi::CallbackInfo& info) {
-  CALSurface* s = SurfaceFrom(info[0]);
-  if (!s) return info.Env().Undefined();
-  double x0 = info[1].As<Napi::Number>().DoubleValue();
-  double y0 = info[2].As<Napi::Number>().DoubleValue();
-  double x1 = info[3].As<Napi::Number>().DoubleValue();
-  double y1 = info[4].As<Napi::Number>().DoubleValue();
-  Napi::Array stopsArr = info[5].As<Napi::Array>();
+// A gradient's stops, flat as [offset, r, g, b, a, ...] with each offset in
+// [0, 1], in sRGB: what fillLinearGradient and fillRadialGradient draw.
+static CGGradientRef GradientOfStops(Napi::Array stopsArr) {
   std::vector<CGFloat> locs;
   std::vector<CGFloat> comps;
   for (uint32_t i = 0; i + 4 < stopsArr.Length(); i += 5) {
@@ -4394,19 +4387,67 @@ static Napi::Value CtxFillLinearGradient(const Napi::CallbackInfo& info) {
   CGGradientRef grad = CGGradientCreateWithColorComponents(
       cs, comps.data(), locs.data(), locs.size());
   CGColorSpaceRelease(cs);
-  CGContextSaveGState(s->ctx);
-  if (info.Length() > 6 && info[6].IsNumber()) {
-    // clip to the given rect (fillRect with a gradient fillStyle)
-    CGContextClipToRect(s->ctx,
-                        CGRectMake(info[6].As<Napi::Number>().DoubleValue(),
-                                   info[7].As<Napi::Number>().DoubleValue(),
-                                   info[8].As<Napi::Number>().DoubleValue(),
-                                   info[9].As<Napi::Number>().DoubleValue()));
+  return grad;
+}
+
+// What a gradient fill is cut to, in a saved state: the rect whose x, y, w
+// and h start at argument `at` where one follows (fillRect with a gradient
+// fillStyle), else the current path, which is kept for after.
+static void ClipForGradient(CALSurface* s, const Napi::CallbackInfo& info,
+                            size_t at) {
+  if (info.Length() > at + 3 && info[at].IsNumber()) {
+    CGContextClipToRect(
+        s->ctx, CGRectMake(info[at].As<Napi::Number>().DoubleValue(),
+                           info[at + 1].As<Napi::Number>().DoubleValue(),
+                           info[at + 2].As<Napi::Number>().DoubleValue(),
+                           info[at + 3].As<Napi::Number>().DoubleValue()));
   } else {
     KeepPathAround(s->ctx, ^{ CGContextClip(s->ctx); });
   }
+}
+
+// fillLinearGradient(surface, x0, y0, x1, y1, stops [offset,r,g,b,a,...],
+//                    mode: 0 = fill current path, 1 = fill rect args follow)
+static Napi::Value CtxFillLinearGradient(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
+  double x0 = info[1].As<Napi::Number>().DoubleValue();
+  double y0 = info[2].As<Napi::Number>().DoubleValue();
+  double x1 = info[3].As<Napi::Number>().DoubleValue();
+  double y1 = info[4].As<Napi::Number>().DoubleValue();
+  CGGradientRef grad = GradientOfStops(info[5].As<Napi::Array>());
+  CGContextSaveGState(s->ctx);
+  ClipForGradient(s, info, 6);
   CGContextDrawLinearGradient(
       s->ctx, grad, CGPointMake(x0, y0), CGPointMake(x1, y1),
+      kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+  CGContextRestoreGState(s->ctx);
+  CGGradientRelease(grad);
+  return info.Env().Undefined();
+}
+
+// fillRadialGradient(surface, x0, y0, r0, x1, y1, r1,
+//                    stops [offset,r,g,b,a,...], x?, y?, w?, h?)
+//
+// canvas's createRadialGradient: the colours spread from the start circle to
+// the end one, and the end colours carried on past both, as canvas extends
+// them — the current path filled with it, or the rect that follows the
+// stops. CoreGraphics' two-circle gradient is canvas's: the same cone where
+// the circles do not nest, painted from the end circle in.
+static Napi::Value CtxFillRadialGradient(const Napi::CallbackInfo& info) {
+  CALSurface* s = SurfaceFrom(info[0]);
+  if (!s) return info.Env().Undefined();
+  double x0 = info[1].As<Napi::Number>().DoubleValue();
+  double y0 = info[2].As<Napi::Number>().DoubleValue();
+  double r0 = info[3].As<Napi::Number>().DoubleValue();
+  double x1 = info[4].As<Napi::Number>().DoubleValue();
+  double y1 = info[5].As<Napi::Number>().DoubleValue();
+  double r1 = info[6].As<Napi::Number>().DoubleValue();
+  CGGradientRef grad = GradientOfStops(info[7].As<Napi::Array>());
+  CGContextSaveGState(s->ctx);
+  ClipForGradient(s, info, 8);
+  CGContextDrawRadialGradient(
+      s->ctx, grad, CGPointMake(x0, y0), r0, CGPointMake(x1, y1), r1,
       kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
   CGContextRestoreGState(s->ctx);
   CGGradientRelease(grad);
@@ -7981,6 +8022,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("ctxClearRect", CtxClearRect);
   BFN("ctxFillRects", CtxFillRects);
   BFN("ctxFillLinearGradient", CtxFillLinearGradient);
+  BFN("ctxFillRadialGradient", CtxFillRadialGradient);
   BFN("ctxDrawSurface", CtxDrawSurface);
   BFN("ctxDrawSurfaceFaded", CtxDrawSurfaceFaded);
   BFN("ctxPutImageData", CtxPutImageData);

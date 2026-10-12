@@ -6930,6 +6930,22 @@ static Napi::Value PbChangeCountFn(const Napi::CallbackInfo& info) {
 }
 
 // ---------------------------------------------------------------------------
+// idle time
+// ---------------------------------------------------------------------------
+
+// lastInputMs() -> number: milliseconds since the last input event of any
+// kind in the login session — keyboard, mouse, trackpad, tablet — from any
+// app, the clock a screen saver keys off. CGEventSource keeps it per session,
+// so it asks nothing of AppKit or the window server's event stream and needs
+// no permission; it answers on whichever thread calls it, before initApp
+// and from a worker alike.
+static Napi::Value LastInputMsFn(const Napi::CallbackInfo& info) {
+  CFTimeInterval s = CGEventSourceSecondsSinceLastEventType(
+      kCGEventSourceStateCombinedSessionState, kCGAnyInputEventType);
+  return Napi::Number::New(info.Env(), s * 1000.0);
+}
+
+// ---------------------------------------------------------------------------
 // screens + cursors + appearance
 // ---------------------------------------------------------------------------
 
@@ -8060,6 +8076,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("pasteboardReadText", PbReadTextFn);
   BFN("pasteboardClear", PbClearFn);
   BFN("pasteboardChangeCount", PbChangeCountFn);
+  BFN("lastInputMs", LastInputMsFn);
   BFN("setMainMenu", SetMainMenuFn);
   BFN("mainMenuInfo", MainMenuInfoFn);
   BFN("activateMenuItem", ActivateMenuItemFn);

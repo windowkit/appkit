@@ -125,7 +125,7 @@ waits on the UI thread (`test/threaded-verbs.js` covers each row):
 
 | from a worker | verbs |
 | --- | --- |
-| unchanged, on the calling thread | surfaces and video surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace` |
+| unchanged, on the calling thread | surfaces and video surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace`, `lastInputMs` |
 | a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardWrite`, `pasteboardClear`, `cancelPanel`, `cancelPopUpMenu`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
 | a handle at the call | `createWindow2`, followed by `window-created { handle, windowNumber }`; every event about the window, input included, carries `handle`, so `ev.handle === win` |
 | | `windowRootLayer`, allocated with the window |
@@ -1598,6 +1598,23 @@ Mechanism only: what to do with `reduceMotion` is the renderer's (react-x11: loo
 `native.postAccessibilityDisplayChange()` posts the same notification through the same centre,
 so the observer path can be exercised without touching the user's settings — test-only, like
 `postAppleEvent`; `test/accessibility-display.js` is the check.
+
+## Idle time (an empty desk)
+
+How long the user has been away from the keyboard and pointer, across the whole session and
+every app — the clock a screen saver keys off (react-x11's `useIdle`,
+[react-x11#951](https://github.com/sidorares/react-x11/pull/951)):
+
+```js
+native.lastInputMs();   // -> 41250.3: ms since the last keyboard, mouse, trackpad or tablet event
+```
+
+It is `CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
+kCGAnyInputEventType)`, in milliseconds. There is no event: poll it. It asks nothing of AppKit and
+needs no permission, so it answers synchronously on whichever thread calls it — before
+`initApp`, in pump mode, and from a worker with the main thread parked in `runMain`. It is not
+`ioreg`'s `HIDIdleTime`: the two are kept apart, and while they agree at a desk, on CI's VMs this
+one ran 3–5 s longer. `test/last-input.js` is the check.
 
 ## Mapping to a React reconciler
 

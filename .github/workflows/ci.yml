@@ -290,6 +290,8 @@ jobs:
         run: node test/live-resize.js
       - name: The activation policy before launch — APPKIT_ACTIVATION_POLICY and runMain({ activationPolicy })
         run: node test/activation-policy.js
+      - name: The session's idle time — lastInputMs, before initApp and from a worker
+        run: node test/last-input.js
       - name: A worker that ends with answers in flight, from its own thread and others — dropped, not a fatal error or an abort
         run: node test/ending-worker.js
 

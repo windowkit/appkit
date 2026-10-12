@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/windowkit/appkit/compare/v0.28.0...v0.29.0) (2026-10-12)
+
+
+### Features
+
+* lastInputMs answers the session's idle time from CGEventSource, synchronously on any thread, so react-x11's useIdle reads it from the bridge where it shelled out to ioreg for HIDIdleTime ([#122](https://github.com/windowkit/appkit/issues/122)) ([3047bf0](https://github.com/windowkit/appkit/commit/3047bf05f334cd40015563da257820f28c938a8f))
+
 ## [0.28.0](https://github.com/windowkit/appkit/compare/v0.27.0...v0.28.0) (2026-10-08)
 
 

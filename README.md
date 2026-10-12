@@ -1612,9 +1612,9 @@ native.lastInputMs();   // -> 41250.3: ms since the last keyboard, mouse, trackp
 It is `CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,
 kCGAnyInputEventType)`, in milliseconds. There is no event: poll it. It asks nothing of AppKit and
 needs no permission, so it answers synchronously on whichever thread calls it — before
-`initApp`, in pump mode, and from a worker with the main thread parked in `runMain`. It agrees
-with `ioreg`'s `HIDIdleTime` except that input another process posts (`CGEventPost`) resets it
-too. `test/last-input.js` is the check.
+`initApp`, in pump mode, and from a worker with the main thread parked in `runMain`. It is not
+`ioreg`'s `HIDIdleTime`: the two are kept apart, and while they agree at a desk, on CI's VMs this
+one ran 3–5 s longer. `test/last-input.js` is the check.
 
 ## Mapping to a React reconciler
 

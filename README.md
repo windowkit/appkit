@@ -126,7 +126,7 @@ waits on the UI thread (`test/threaded-verbs.js` covers each row):
 | from a worker | verbs |
 | --- | --- |
 | unchanged, on the calling thread | surfaces and video surfaces, every `ctx*` (`ctxDrawSymbol` included), layouts and fonts, `symbolSize`, `pasteboardTypeForMIME`, `pasteboardTypeInfo`, `contentTypeFor`, `colorSpace`, `lastInputMs` |
-| a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardWrite`, `pasteboardClear`, `cancelPanel`, `cancelPopUpMenu`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
+| a command, answering nothing | `initApp`, `setActivationPolicy`, `setAppName`, `activateApp`, `showWindow`, `hideWindow`, `setWindowFrame`, `setWindowTitle`, `setWindowMinMax`, `setWindowFullScreen`, `setWindowZoomed`, `setWindowMiniaturized`, `setWindowIgnoresMouseEvents`, `invalidateWindowShadow`, `destroyWindow2`, `setCursor`, `setMainMenu`, `setDockMenu`, `setDockBadge`, `cancelUserAttention`, `setStatusItem`, `setStatusItemMenu`, `removeStatusItem`, `registerDropTypes`, `setDropResponse`, `pasteboardWriteText`, `pasteboardWrite`, `pasteboardClear`, `cancelPanel`, `cancelPopUpMenu`; the test posts `postMouseEvent`, `postKeyEvent`, `postAppleEvent`, `postAccessibilityDisplayChange` |
 | a handle at the call | `createWindow2`, followed by `window-created { handle, windowNumber }`; every event about the window, input included, carries `handle`, so `ev.handle === win` |
 | | `windowRootLayer`, allocated with the window |
 | | `createStatusItem`: its clicks carry the handle, and it is held until `removeStatusItem` |
@@ -187,6 +187,23 @@ handshake the edge moves first while the content catches up a frame or more behi
   modes (windowkit/appkit#63). AppKit calls nothing when the pointer stops or lifts, so the
   end is how a renderer knows to run the measured layout it deferred during the drag. The
   published window state (`getWindowFrame`, `windowState`) carries `liveResize` too.
+
+**Window states.** What the title bar's buttons do to a window can be asked for and is
+reported back:
+
+- `setWindowFullScreen(win, on)` takes a window into a full-screen Space of its own and back,
+  as the green button does. The transition is bracketed by
+  `window-fullscreen { fullscreen, phase: 'begin' | 'end' }`. The begin comes before the
+  animation, so a renderer can take its window chrome away while the window grows rather
+  than after it; a transition AppKit could not finish ends with the state it started from.
+  AppKit drops a toggle during a transition, so one asked for then is applied when it ends.
+  A transition is also a live resize, and comes inside `window-live-resize`'s two ends.
+- `setWindowZoomed(win, on)` zooms to the standard frame and back (the green button with
+  Option held). AppKit sends nothing for a zoom but the resize, so read it back then.
+- `setWindowMiniaturized(win, on)` minimizes to the Dock and back, reported as
+  `window-miniaturize { miniaturized }`.
+- The published window state carries `fullscreen`, `zoomed` and `miniaturized`.
+  `fullscreen` says the target from a transition's begin; `zoomed` is false while full screen.
 
 JS never waits on the UI thread, so the worst case is the deadline. A frame that misses it
 shows the last frame at the new size, with the root layer's `backgroundColor` in the newly

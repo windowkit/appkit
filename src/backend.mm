@@ -225,6 +225,9 @@ struct PubWindow {
   double x = 0, y = 0, width = 0, height = 0, scale = 1;
   bool visible = false, occluded = false, key = false, ignoresMouseEvents = false;
   bool liveResize = false;  // inside a live resize (windowkit/appkit#63)
+  // what the window manager did with the window: full screen in a Space of
+  // its own, zoomed to its standard frame, minimized to the Dock
+  bool fullscreen = false, zoomed = false, miniaturized = false;
 };
 
 struct PubScreen {
@@ -273,6 +276,21 @@ static void PublishBadge() {
   gPubBadge = [badge copy];
 }
 
+// Full screen as the window's delegate last said it, from the start of a
+// transition (see windowWillEnterFullScreen:). NSWindowStyleMaskFullScreen
+// says it only once AppKit has put the window in its Space, and a renderer
+// told at the end hides its window chrome after the animation has shown it
+// shrinking away; nil where nothing has been said, and the mask answers.
+static char kFullScreenKey;
+// set from a full-screen transition's begin to its end
+static char kFullScreenTransitionKey;
+
+static bool WindowFullScreen(NSWindow* win) {
+  NSNumber* said = objc_getAssociatedObject(win, &kFullScreenKey);
+  if (said) return said.boolValue;
+  return (win.styleMask & NSWindowStyleMaskFullScreen) != 0;
+}
+
 static bool WindowOnGlass(NSWindow* win) {
   return (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
 }
@@ -292,6 +310,14 @@ static PubWindow WindowStateOf(NSWindow* win) {
   s.key = win.isKeyWindow;
   s.ignoresMouseEvents = win.ignoresMouseEvents;
   s.liveResize = win.inLiveResize;
+  s.fullscreen = WindowFullScreen(win);
+  s.miniaturized = win.isMiniaturized;
+  // a full-screen window fills its screen, which isZoomed would call zoomed
+  // — through the exit animation too, where `fullscreen` already says false
+  // and the window is still the screen's size
+  bool transition = objc_getAssociatedObject(win, &kFullScreenTransitionKey) != nil;
+  s.zoomed = !s.fullscreen && !s.miniaturized && !transition &&
+             (win.styleMask & NSWindowStyleMaskResizable) && win.isZoomed;
   return s;
 }
 
@@ -308,6 +334,9 @@ static Napi::Object WindowStateObject(Napi::Env env, const PubWindow& s) {
   r.Set("key", s.key);
   r.Set("ignoresMouseEvents", s.ignoresMouseEvents);
   r.Set("liveResize", s.liveResize);
+  r.Set("fullscreen", s.fullscreen);
+  r.Set("zoomed", s.zoomed);
+  r.Set("miniaturized", s.miniaturized);
   return r;
 }
 
@@ -683,6 +712,10 @@ static Napi::Value PostAccessibilityDisplayChange(const Napi::CallbackInfo& info
 @interface CALBackendDelegate : NSObject <NSWindowDelegate> {
  @public
   double handshakeMs_;  // setResizeHandshake's budget; 0 is off
+  // setWindowFullScreen during a transition, which AppKit ignores a toggle
+  // in: -1 for none, else the state to toggle to once it ends
+  int wantFullScreen_;
+  bool inFullScreenTransition_;
 }
 @end
 
@@ -786,6 +819,64 @@ static void AwaitFrameForResize(NSWindow* win, double waitMs) {
   PublishWindow(win);
   CALEvent ev = WindowEvent(win, "window-occlusion");
   ev.Bool("visible", WindowOnGlass(win));
+  CALEmit(std::move(ev));
+}
+// Full screen (windowkit/appkit#15's remainder): window-fullscreen
+// { fullscreen, phase: 'begin' | 'end' }. The begin is AppKit's will-enter
+// or will-exit, before the animation, so a renderer can take its chrome
+// away while the window grows rather than after; the published state says
+// the target from then on. A transition AppKit could not finish ends with
+// the state it started from.
+- (void)fullScreen:(NSWindow*)win is:(bool)on phase:(const char*)phase {
+  objc_setAssociatedObject(win, &kFullScreenKey, @(on), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  objc_setAssociatedObject(win, &kFullScreenTransitionKey,
+                           inFullScreenTransition_ ? @YES : nil,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  PublishWindow(win);
+  CALEvent ev = WindowEvent(win, "window-fullscreen");
+  ev.Bool("fullscreen", on).Str("phase", phase);
+  CALEmit(std::move(ev));
+}
+- (void)endFullScreen:(NSWindow*)win is:(bool)on {
+  inFullScreenTransition_ = false;
+  [self fullScreen:win is:on phase:"end"];
+  int want = wantFullScreen_;
+  wantFullScreen_ = -1;
+  if (want >= 0 && (bool)want != on) [win toggleFullScreen:nil];
+}
+- (void)windowWillEnterFullScreen:(NSNotification*)n {
+  inFullScreenTransition_ = true;
+  [self fullScreen:n.object is:true phase:"begin"];
+}
+- (void)windowDidEnterFullScreen:(NSNotification*)n {
+  [self endFullScreen:n.object is:true];
+}
+- (void)windowDidFailToEnterFullScreen:(NSWindow*)win {
+  [self endFullScreen:win is:false];
+}
+- (void)windowWillExitFullScreen:(NSNotification*)n {
+  inFullScreenTransition_ = true;
+  [self fullScreen:n.object is:false phase:"begin"];
+}
+- (void)windowDidExitFullScreen:(NSNotification*)n {
+  [self endFullScreen:n.object is:false];
+}
+- (void)windowDidFailToExitFullScreen:(NSWindow*)win {
+  [self endFullScreen:win is:true];
+}
+// Minimized to the Dock and back: window-miniaturize { miniaturized }.
+- (void)windowDidMiniaturize:(NSNotification*)n {
+  NSWindow* win = n.object;
+  PublishWindow(win);
+  CALEvent ev = WindowEvent(win, "window-miniaturize");
+  ev.Bool("miniaturized", true);
+  CALEmit(std::move(ev));
+}
+- (void)windowDidDeminiaturize:(NSNotification*)n {
+  NSWindow* win = n.object;
+  PublishWindow(win);
+  CALEvent ev = WindowEvent(win, "window-miniaturize");
+  ev.Bool("miniaturized", false);
   CALEmit(std::move(ev));
 }
 - (void)windowDidChangeBackingProperties:(NSNotification*)n {
@@ -996,6 +1087,7 @@ static NSWindow* BuildWindow(const WindowSpec& spec) {
     }
 
     CALBackendDelegate* delegate = [[CALBackendDelegate alloc] init];
+    delegate->wantFullScreen_ = -1;
     win.delegate = delegate;
     objc_setAssociatedObject(win, &kDelegateKey, delegate,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1167,6 +1259,46 @@ static Napi::Value WindowNumberAtPoint(const Napi::CallbackInfo& info) {
             belowWindowWithWindowNumber:below];
     return ^Napi::Value(Napi::Env e) { return Napi::Number::New(e, (double)hit); };
   });
+}
+
+// setWindowFullScreen(win, on) — into or out of a full-screen Space, as the
+// title bar's green button takes it; window-fullscreen reports the
+// transition. A no-op where the window already is, and one asked for during
+// a transition is applied when it ends, since AppKit drops a toggle then.
+static Napi::Value SetWindowFullScreen(const Napi::CallbackInfo& info) {
+  bool on = info.Length() > 1 && info[1].ToBoolean().Value();
+  OnWindow(info[0], ^(NSWindow* win) {
+    CALBackendDelegate* d = objc_getAssociatedObject(win, &kDelegateKey);
+    if (d && d->inFullScreenTransition_) {
+      d->wantFullScreen_ = on;
+      return;
+    }
+    if (WindowFullScreen(win) != on) [win toggleFullScreen:nil];
+  });
+  return info.Env().Undefined();
+}
+
+// setWindowZoomed(win, on) — to the window's standard frame and back, the
+// green button with Option held. AppKit sends no notification for a zoom,
+// only the resize, so the published `zoomed` is read back at each one.
+static Napi::Value SetWindowZoomed(const Napi::CallbackInfo& info) {
+  bool on = info.Length() > 1 && info[1].ToBoolean().Value();
+  OnWindow(info[0], ^(NSWindow* win) {
+    if (WindowFullScreen(win) || win.isMiniaturized) return;
+    if ((bool)win.isZoomed != on) [win zoom:nil];
+  });
+  return info.Env().Undefined();
+}
+
+// setWindowMiniaturized(win, on) — to the Dock and back; window-miniaturize
+// reports it.
+static Napi::Value SetWindowMiniaturized(const Napi::CallbackInfo& info) {
+  bool on = info.Length() > 1 && info[1].ToBoolean().Value();
+  OnWindow(info[0], ^(NSWindow* win) {
+    if (on && !win.isMiniaturized) [win miniaturize:nil];
+    else if (!on && win.isMiniaturized) [win deminiaturize:nil];
+  });
+  return info.Env().Undefined();
 }
 
 static Napi::Value SetWindowMinMax(const Napi::CallbackInfo& info) {
@@ -7988,6 +8120,9 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("getWindowFrame", GetWindowFrame);
   BFN("windowState", WindowStateFn);
   BFN("setWindowMinMax", SetWindowMinMax);
+  BFN("setWindowFullScreen", SetWindowFullScreen);
+  BFN("setWindowZoomed", SetWindowZoomed);
+  BFN("setWindowMiniaturized", SetWindowMiniaturized);
   BFN("setResizeHandshake", SetResizeHandshake);
   BFN("destroyWindow2", DestroyWindow2);
   BFN("invalidateWindowShadow", InvalidateWindowShadow);

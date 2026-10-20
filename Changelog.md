@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.0](https://github.com/windowkit/appkit/compare/v0.29.0...v0.30.0) (2026-10-20)
+
+
+### Features
+
+* full screen, zoom and the Dock — setWindowFullScreen, setWindowZoomed and setWindowMiniaturized, window-fullscreen and window-miniaturize events, and fullscreen/zoomed/miniaturized in the published window state ([#124](https://github.com/windowkit/appkit/issues/124)) ([817c8b2](https://github.com/windowkit/appkit/commit/817c8b2b32ec4e25cd558b2039006c21ed475637))
+
 ## [0.29.0](https://github.com/windowkit/appkit/compare/v0.28.0...v0.29.0) (2026-10-12)
 
 

@@ -1581,6 +1581,35 @@ static Napi::Value SetContentsImage(const Napi::CallbackInfo& info) {
 // native controls: NSCell rendered offscreen (the WebKit/Firefox technique)
 // ---------------------------------------------------------------------------
 
+// A view control drawn into the current NSGraphicsContext, filling (0, 0, w,
+// h) points over pw x ph pixels. Through a bitmap rep rather than
+// displayRectIgnoringOpacity:inContext:, which under the macOS 26 design (a
+// process linked against the 26 SDK — Bun is) draws NSSlider and NSSwitch
+// through their layers and leaves a foreign context empty.
+// cacheDisplayInRect: renders the layer tree, and on the older design gives
+// the pixels displayRect did.
+static void DrawViewControl(NSControl* v, double w, double h, size_t pw, size_t ph) {
+  NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
+      initWithBitmapDataPlanes:NULL
+                    pixelsWide:(NSInteger)pw
+                    pixelsHigh:(NSInteger)ph
+                 bitsPerSample:8
+               samplesPerPixel:4
+                      hasAlpha:YES
+                      isPlanar:NO
+                colorSpaceName:NSDeviceRGBColorSpace
+                   bytesPerRow:0
+                  bitsPerPixel:0];
+  rep.size = NSMakeSize(w, h);
+  [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
+  [rep drawInRect:NSMakeRect(0, 0, w, h)
+           fromRect:NSZeroRect
+          operation:NSCompositingOperationSourceOver
+           fraction:1
+     respectFlipped:YES
+              hints:nil];
+}
+
 static NSView* DummyDrawView() {
   // Cells only use the view for flippedness/appearance queries; it never needs
   // to be in a window.
@@ -1631,7 +1660,7 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
 
   // Controls whose cells no longer draw offscreen (NSSliderCell renders via
   // the view's layer machinery) or that have no cell at all (NSSwitch): use a
-  // real offscreen NSControl and displayRectIgnoringOpacity:inContext:.
+  // real offscreen NSControl, captured with DrawViewControl.
   NSControl* viewControl = nil;
   if ([kind isEqualToString:@"slider"]) {
     NSSlider* s = [[NSSlider alloc] init];
@@ -1697,7 +1726,7 @@ static Napi::Value DrawControl(const Napi::CallbackInfo& info) {
     viewControl.frame = NSMakeRect(0, 0, w, h);
     viewControl.appearance = ap;
     [viewControl layoutSubtreeIfNeeded];
-    [viewControl displayRectIgnoringOpacity:viewControl.bounds inContext:g];
+    DrawViewControl(viewControl, w, h, pw, ph);
   } else {
     [ap performAsCurrentDrawingAppearance:^{
       [cell drawWithFrame:NSMakeRect(0, 0, w, h) inView:DummyDrawView()];

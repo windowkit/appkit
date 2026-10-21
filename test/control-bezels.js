@@ -4,7 +4,7 @@
 // button stretched to its frame, where `push` keeps one height and draws it
 // centred in a taller frame.
 //
-// Checked: both kinds measure and an unknown one still throws; the push's
+// Checked: every kind draws ink; both kinds measure and an unknown one still throws; the push's
 // ink is the same 22pt (18 small) in every frame, while the flexible push
 // inks its frame to the same margins however tall it is; at the push's own
 // height the two draw the same pixels over the same ink box, plain, pressed
@@ -77,6 +77,18 @@ for (const controlSize of ['regular', 'small']) {
     threw = err;
   }
   ok(threw && /unknown control kind/.test(threw.message), 'an unknown kind throws', threw);
+}
+
+// --- every kind draws -------------------------------------------------------
+// NSSlider and NSSwitch are views, not cells, and under the macOS 26 design
+// (a process linked against the 26 SDK — Bun, say) a view drawn with
+// displayRectIgnoringOpacity:inContext: came out empty: no ink at all.
+for (const kind of ['push', 'flexiblePush', 'checkbox', 'radio', 'popup', 'slider', 'switch']) {
+  for (const appearance of ['light', 'dark']) {
+    const m = n.measureControl({ kind });
+    const d = draw({ kind, state: 1, value: 0.5, appearance }, m.width, m.height);
+    ok(d.ink.x1 >= 0, `${kind} draws (${appearance})`);
+  }
 }
 
 // --- one height, or stretched to the frame ------------------------------------

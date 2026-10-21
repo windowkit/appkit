@@ -3911,10 +3911,39 @@ static NSView* BezelDrawView() {
   return v;
 }
 
+// A view control drawn into the current NSGraphicsContext, filling (0, 0, w,
+// h) points over pw x ph pixels. Through a bitmap rep rather than
+// displayRectIgnoringOpacity:inContext:, which under the macOS 26 design (a
+// process linked against the 26 SDK — Bun is) draws NSSlider and NSSwitch
+// through their layers and leaves a foreign context empty.
+// cacheDisplayInRect: renders the layer tree, and on the older design gives
+// the pixels displayRect did.
+static void BDrawViewControl(NSControl* v, double w, double h, size_t pw, size_t ph) {
+  NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
+      initWithBitmapDataPlanes:NULL
+                    pixelsWide:(NSInteger)pw
+                    pixelsHigh:(NSInteger)ph
+                 bitsPerSample:8
+               samplesPerPixel:4
+                      hasAlpha:YES
+                      isPlanar:NO
+                colorSpaceName:NSDeviceRGBColorSpace
+                   bytesPerRow:0
+                  bitsPerPixel:0];
+  rep.size = NSMakeSize(w, h);
+  [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
+  [rep drawInRect:NSMakeRect(0, 0, w, h)
+           fromRect:NSZeroRect
+          operation:NSCompositingOperationSourceOver
+           fraction:1
+     respectFlipped:YES
+              hints:nil];
+}
+
 // The two render paths AppKit leaves us: classic cells draw offscreen via
 // drawWithFrame:, while NSSlider's cell now renders through the view's layer
 // machinery and NSSwitch has no cell at all — those go through a real
-// offscreen NSControl and displayRectIgnoringOpacity:inContext:.
+// offscreen NSControl, captured with BDrawViewControl.
 struct BezelControl {
   NSCell* cell = nil;
   NSControl* view = nil;
@@ -4100,7 +4129,7 @@ static Napi::Value DrawControlIntoSurface(const Napi::CallbackInfo& info) {
       c.view.frame = NSMakeRect(0, 0, w, h);
       c.view.appearance = ap;
       [c.view layoutSubtreeIfNeeded];
-      [c.view displayRectIgnoringOpacity:c.view.bounds inContext:g];
+      BDrawViewControl(c.view, w, h, pw, ph);
     } else if (c.cell) {
       NSCell* cell = c.cell;
       [ap performAsCurrentDrawingAppearance:^{

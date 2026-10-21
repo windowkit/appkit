@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.1](https://github.com/windowkit/appkit/compare/v0.30.0...v0.30.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* NSSwitch and NSSlider bezels draw under the macOS 26 design, where displayRectIgnoringOpacity left them empty ([#126](https://github.com/windowkit/appkit/issues/126)) ([b5ef662](https://github.com/windowkit/appkit/commit/b5ef66219ddd88344f8769b9ace6bb807cde5887))
+
 ## [0.30.0](https://github.com/windowkit/appkit/compare/v0.29.0...v0.30.0) (2026-10-20)
 
 

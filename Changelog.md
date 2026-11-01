@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.2](https://github.com/windowkit/appkit/compare/v0.30.1...v0.30.2) (2026-11-01)
+
+
+### Bug Fixes
+
+* a vp09 track plays, where createPlayer asked for no VP9 decoder and the item had a picture of no size ([#128](https://github.com/windowkit/appkit/issues/128)) ([0127f38](https://github.com/windowkit/appkit/commit/0127f38db969018d46bcbb42008a35c758954a41))
+
 ## [0.30.1](https://github.com/windowkit/appkit/compare/v0.30.0...v0.30.1) (2026-10-21)
 
 

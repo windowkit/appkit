@@ -31,6 +31,7 @@
 
 #include <napi.h>
 #import <AVFoundation/AVFoundation.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
@@ -259,8 +260,21 @@ static void Apply(CALPlayer* p, const PlayerSettings& s) {
   }
 }
 
+// VP9 is one of VideoToolbox's supplemental decoders, which a process has to
+// ask for before AVFoundation can use one. Without this a `vp09` track in an
+// MP4 opens and comes ready, and reports a picture of no size and hands out
+// no frames, with no error anywhere. Asked once, and of nothing on a Mac that
+// has no such decoder: its VP9 then fails as any format it cannot play does.
+static void RegisterSupplementalDecoders() {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+  });
+}
+
 static Napi::Value CreatePlayer(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  RegisterSupplementalDecoders();
   if (!info[0].IsString() || info[0].As<Napi::String>().Utf8Value().empty()) {
     Napi::TypeError::New(env, "createPlayer(url, options): url is a path or a URL string")
         .ThrowAsJavaScriptException();

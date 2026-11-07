@@ -1868,6 +1868,9 @@ void InitVideo(Napi::Env env, Napi::Object exports);
 // src/player.mm — a file or URL played by AVFoundation: an AVPlayer, its
 // AVPlayerLayer as a layer handle, and the frame showing copied into a surface.
 void InitPlayer(Napi::Env env, Napi::Object exports);
+// src/capture.mm — cameras, microphones, speakers and an audio out on one
+// voice-processing engine, and ScreenCaptureKit's screenshots.
+void InitCapture(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1916,6 +1919,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitThreaded(env, exports);
   InitVideo(env, exports);
   InitPlayer(env, exports);
+  InitCapture(env, exports);
   return exports;
 }
 

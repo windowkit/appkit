@@ -11,7 +11,8 @@
         "src/screencolor.mm",
         "src/threaded.mm",
         "src/video.mm",
-        "src/player.mm"
+        "src/player.mm",
+        "src/capture.mm"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"
@@ -39,7 +40,10 @@
           "-framework IOKit",
           "-framework ApplicationServices",
           "-framework UserNotifications",
-          "-framework EventKit"
+          "-framework EventKit",
+          "-framework CoreAudio",
+          "-framework AudioToolbox",
+          "-weak_framework ScreenCaptureKit"
         ]
       }
     }

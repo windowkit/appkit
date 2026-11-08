@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.0](https://github.com/windowkit/appkit/compare/v0.30.2...v0.31.0) (2026-11-08)
+
+
+### Features
+
+* capture verbs — cameras, microphones and the audio out on one voice-processing engine, screenshots, and setWindowSharing ([#130](https://github.com/windowkit/appkit/issues/130)) ([8d1c642](https://github.com/windowkit/appkit/commit/8d1c642a200ff7c4c9f64e2e119e838b440a89b7))
+
 ## [0.30.2](https://github.com/windowkit/appkit/compare/v0.30.1...v0.30.2) (2026-11-01)
 
 

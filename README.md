@@ -705,6 +705,104 @@ height, duration }` once the item is ready, and again if either moves (`duration
 tagged BT.709 — on a layer and copied into a surface beside it, and holds the two to
 the same colour on screen: 211, 127, 67 and 211, 127, 68 on an M1 Pro.
 
+## Capture: cameras, microphones, the audio out, the screen
+
+The devices a renderer's media capture lists and opens (react-x11's
+`getUserMedia`, `<video srcObject>`, `createAudioFrames`, `captureScreenshot`).
+Listing asks for nothing and raises no prompt; opening a camera or a microphone
+needs the grant `authorizationStatus` reads, and a renderer asks for it first
+(`requestAuthorization`) so the open never has to.
+
+**Devices.**
+
+- **`native.captureDevices()`** → `[{ id, kind, name, isDefault, groupId?,
+  position?, formats? }]`, or **`native.captureDevices(cb)`**, which lists on a
+  queue of its own: the first listing in a process loads AVFoundation's camera
+  plug-ins, 100 ms to over a second that a UI thread should not wait out. `kind`
+  is `'camera'`, `'microphone'` or `'speaker'`; `id` is stable across launches
+  (a microphone's is its CoreAudio UID); a camera's `formats` are `[{ width,
+  height, minFrameRate, maxFrameRate }]` and its `position` `'front'`,
+  `'back'`, `'external'` or `'unspecified'`; `groupId` is set where a camera and
+  a microphone share a model. The private aggregate devices an audio engine
+  makes for itself are left out.
+- Event **`capture-devices`** whenever a device comes or goes or the default
+  input or output moves — from the first listing on, and only when what a
+  listing shows changed.
+
+**A camera.**
+
+- **`native.openCamera(deviceId | null, { width, height, frameRate })`** →
+  `{ id, layer, width, height, frameRate, format, range, colorSpace }`: the
+  device's format nearest the size asked (a 4:2:0 YCbCr one where it has one —
+  every Mac camera seen so far has only those — so nothing is converted on the
+  way) at the rate asked, clamped to it; nothing asked is the largest within
+  1280x720. The session starts on a queue of its own, and `camera-started { id }`
+  or `camera-error { id, name, message }` follows — `name` is Media Capture's:
+  `NotFoundError`, `NotAllowedError`, `NotReadableError`. `layer` is an
+  `AVCaptureVideoPreviewLayer`, a handle every layer verb takes, filling its
+  bounds and never mirrored; the renderer fits and flips.
+- **`native.cameraFrames(id, on)`** — while on, `camera-frame { id, width,
+  height, format, range, colorSpace, planes, strides, time }`: the frame's own
+  planes (NV12: Y, then CbCr) as `Buffer` copies, `time` in seconds on the
+  capture clock. The newest frame only: one that arrives while the last is
+  still on its way replaces it, in pump mode and through the channel alike.
+  Off by default, so a preview on the layer costs nothing in JS.
+- **`native.cameraCopyFrame(id, surface)`** — `playerCopyFrame`'s contract:
+  the newest frame into a 2D surface of its size, in the layer's colours, or
+  `null` when none is newer than the last one copied.
+- Events `camera-muted { id, muted }` (the session interrupted — another app
+  took the camera — and resumed) and `camera-ended { id }` (unplugged, or a
+  runtime error). **`native.closeCamera(id)`**.
+
+**The audio.** One `AVAudioEngine` for every microphone and every output: an
+echo canceller needs the far-end signal, so while an echo-cancelled microphone
+is open voice processing is on for the engine's input and output both, and
+every output plays through it.
+
+- **`native.openMicrophone(deviceId | null, { sampleRate, channels,
+  echoCancellation, noiseSuppression, autoGainControl })`** → `{ id,
+  sampleRate, channels, echoCancellation, noiseSuppression, autoGainControl }`,
+  what was asked. The audio is resampled and mixed down here, so `{ sampleRate:
+  16000, channels: 1 }` arrives as asked. `microphone-started { id,
+  echoCancellation, noiseSuppression, autoGainControl, sampleRate, channels,
+  latency }` says what the engine did — voice processing engaged or not — and
+  `microphone-error { id, name, message }` what went wrong; then `audio-input
+  { id, sampleRate, channels, frames, time, dropped? }` every 10 ms, a
+  `Float32Array` a channel. Nothing is dropped short of two seconds of chunks
+  waiting; past that, `dropped` counts them. One input device at a time.
+  **`native.closeMicrophone(id)`**.
+- **`native.openAudioOutput({ sampleRate, channels, deviceId })`** → `{ id,
+  sampleRate, channels }`; **`native.audioOutputWrite(id, [Float32Array, …])`**
+  → frames now queued (ten seconds at most); **`native.audioOutputState(id)`**
+  → `{ currentTime, queued, latency }`, `currentTime` the seconds the device has
+  played since the first write, silence where the queue ran dry included;
+  **`native.closeAudioOutput(id)`**. One output device for the engine: the
+  first output's `deviceId` picks it.
+
+**The screen.**
+
+- **`native.captureScreenshot({ display, window, rect, cursor }, cb)`** — one
+  picture through ScreenCaptureKit (macOS 14): `cb({ width, height, scale,
+  data })` with `data` straight RGBA in sRGB, or `cb({ error, name })` —
+  `NotAllowedError` without the Screen Recording grant, `NotFoundError` for a
+  display or window that is not there, `NotSupportedError` before macOS 14.
+  `display` is a `screenCaptureDisplays` id (the main display without one),
+  `window` a window number, `rect` points within the display.
+- **`native.screenCaptureDisplays()`** → `[{ id, name, x, y, width, height,
+  scale }]`, points from the top left of the main display; through a callback
+  off the main thread.
+- **`native.setWindowSharing(win, 'none' | 'readOnly')`** — `NSWindow.sharingType`:
+  `'none'` keeps the window out of every screenshot and recording, this app's
+  own included. On macOS 15 such a window comes back with every pixel clear.
+
+`test/capture.js` lists the devices both ways, opens a camera and a microphone
+that are not there (refused by name, nothing prompted), plays 0.2 s through an
+output on the device's clock, and — where Screen Recording is allowed — reads a
+red window back as red and an excluded one as clear. A camera and a microphone
+that this process may use are opened and read from; where it may not they are
+skipped, never prompted. `test/capture-threaded.js` does the same from a
+worker.
+
 ## Text: at a display's scale
 
 A text verb's size is the caller's pixels, and a renderer that draws in device pixels hands

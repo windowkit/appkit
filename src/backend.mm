@@ -1197,6 +1197,21 @@ static Napi::Value SetWindowIgnoresMouseEvents(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// setWindowSharing(win, 'none' | 'readOnly') — NSWindow.sharingType: 'none'
+// keeps the window out of every screenshot and screen recording, this app's
+// own included; 'readOnly' is the default.
+static Napi::Value SetWindowSharing(const Napi::CallbackInfo& info) {
+  std::string mode = info.Length() > 1 && info[1].IsString() ? info[1].As<Napi::String>().Utf8Value() : "";
+  if (mode != "none" && mode != "readOnly") {
+    Napi::TypeError::New(info.Env(), "setWindowSharing(win, mode): mode is 'none' or 'readOnly'")
+        .ThrowAsJavaScriptException();
+    return info.Env().Undefined();
+  }
+  NSWindowSharingType type = mode == "none" ? NSWindowSharingNone : NSWindowSharingReadOnly;
+  OnWindow(info[0], ^(NSWindow* win) { win.sharingType = type; });
+  return info.Env().Undefined();
+}
+
 // setWindowFrame(win, x, y, w, h) — any argument may be null to keep it.
 // x/y are the content's top-left in global top-left coordinates, points.
 static Napi::Value SetWindowFrame(const Napi::CallbackInfo& info) {
@@ -8143,6 +8158,7 @@ void InitBackend(Napi::Env env, Napi::Object exports) {
   BFN("showWindow", ShowWindowFn);
   BFN("hideWindow", HideWindowFn);
   BFN("setWindowTitle", SetWindowTitle);
+  BFN("setWindowSharing", SetWindowSharing);
   BFN("setWindowIgnoresMouseEvents", SetWindowIgnoresMouseEvents);
   BFN("windowNumberAtPoint", WindowNumberAtPoint);
   BFN("setWindowFrame", SetWindowFrame);

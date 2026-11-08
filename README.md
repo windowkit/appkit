@@ -809,6 +809,44 @@ the chunks that went to JS.
 - **`native.setWindowSharing(win, 'none' | 'readOnly')`** — `NSWindow.sharingType`:
   `'none'` keeps the window out of every screenshot and recording, this app's
   own included. On macOS 15 such a window comes back with every pixel clear.
+- **`native.screenCaptureWindows(cb)`** — the windows a person would share:
+  `cb([{ id, title, app: { name, bundleId, pid }, x, y, width, height, active
+  }])`, on screen at the normal level and at least 40 points a side,
+  frontmost first, points from the top left of the main display; `id` is the
+  window number `captureScreenshot` and `openDisplayStream` take. Or
+  `cb({ error, name })`, `NotAllowedError` without Screen Recording.
+
+**A display or a window as a stream** — ScreenCaptureKit's `SCStream`, macOS
+14, what a camera is with the screen behind it: shown on a layer of its own,
+its frames handed to JS only on request.
+
+- **`native.openDisplayStream({ display?, window?, width?, height?, frameRate?,
+  cursor? })`** → `{ id, layer }`, answered at once: a display (the main one
+  without either) or one window. The stream starts on a queue of its own, and
+  `display-started { id, width, height, frameRate }` or `display-error { id,
+  name, message }` says how — `NotAllowedError` without Screen Recording,
+  `NotFoundError` for a display or window that is not there,
+  `NotSupportedError` before macOS 14. Frames are the source's pixels, fitted
+  into `width` x `height` with the aspect kept (a width or a height alone
+  sets the other), even numbers both; at `frameRate` at most (30 if not said)
+  and only when something changed. `layer` shows the newest, filling its
+  bounds; `cursor` defaults to true.
+- **`native.displayStreamFrames(id, on)`** — while on, `display-frame { id,
+  width, height, format: 'BGRA', planes, strides, time }`, copies in sRGB, the
+  newest only.
+- **`native.displayStreamCopyFrame(id, surface)`** → `{ width, height, time,
+  written } | null`: `cameraCopyFrame`'s contract.
+- **`native.displayStreamConfigure(id, { width?, height?, frameRate? })`** —
+  another size or rate without stopping, answered by `display-configured {
+  id, width, height, frameRate }`, or `display-configured { id, error, name }`
+  with the stream running as it was.
+- Events **`display-muted { id, muted }`** — the window minimized, hidden or on
+  another space, no frames until it is back — and **`display-ended { id,
+  name?, message? }`** — the window closed (said within a second; ScreenCaptureKit
+  suspends a closed window's stream as it does a minimized one's and says
+  nothing more, so the window is looked for), the display went, or the user
+  stopped the sharing from the menu bar (`NotAllowedError`).
+  **`native.closeDisplayStream(id)`**.
 
 **Other applications' sound** — CoreAudio's process taps, macOS 14.2 (these
 three verbs are not exported before it, which is how a renderer tells). A tap

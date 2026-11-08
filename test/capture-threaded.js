@@ -3,7 +3,8 @@
 // thread parked in runMain, the same verbs answer the same way, and what
 // AVFoundation and CoreAudio report from their own queues comes through the
 // channel — a camera that is not there, the devices listed through a
-// callback, an output's queue played out, a camera's layer as a handle.
+// callback, an output's queue played out, a camera's layer as a handle, and
+// a display's stream started, its layer a handle too.
 // Exits 0 when every expectation held.
 
 const assert = require('assert');
@@ -90,5 +91,32 @@ async function run() {
   const displays = await answer((cb) => native.screenCaptureDisplays(cb));
   assert(displays.length > 0, 'displays through a callback');
   assert.throws(() => native.screenCaptureDisplays(), TypeError, 'and not synchronously off the main thread');
+
+  // a display's stream (src/displaystream.mm): a window that is not there
+  // refused through the channel, and the main display streamed where Screen
+  // Recording is allowed — its layer a handle at the call, its frames
+  // crossing as Buffers
+  const missing = native.openDisplayStream({ window: 0x7ffffff0 });
+  assert.strictEqual(typeof missing.layer, 'object', 'a stream’s layer is a handle at the call');
+  if (native.authorizationStatus('screen-recording') === 'authorized') {
+    const gone = await until((e) => e.type === 'display-error' && e.id === missing.id, 'display-error');
+    assert.strictEqual(gone.name, 'NotFoundError', 'a missing window, through the channel');
+    const s = native.openDisplayStream({ width: 320, frameRate: 10 });
+    const started = await until(
+      (e) => (e.type === 'display-started' || e.type === 'display-error') && e.id === s.id,
+      'the display',
+    );
+    assert.strictEqual(started.type, 'display-started', JSON.stringify(started));
+    assert.strictEqual(started.width, 320, 'at the width asked');
+    native.displayStreamFrames(s.id, true);
+    // the main display changes by itself only sometimes; a frame is asked for
+    // where one comes, and the stream closes either way
+    const f = await until((e) => e.type === 'display-frame' && e.id === s.id, 'a display frame', 3000).catch(
+      () => null,
+    );
+    if (f) assert(Buffer.isBuffer(f.planes[0]) && f.format === 'BGRA', 'display planes cross as Buffers');
+    native.closeDisplayStream(s.id);
+  }
+  native.closeDisplayStream(missing.id);
   say('ok');
 }

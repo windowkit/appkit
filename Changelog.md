@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.33.0](https://github.com/windowkit/appkit/compare/v0.32.0...v0.33.0) (2026-11-08)
+
+
+### Features
+
+* a display or a window as a ScreenCaptureKit stream — shown on a layer, frames on request, configured live, muted while minimized, ended when the window goes — and the windows to share ([#135](https://github.com/windowkit/appkit/issues/135)) ([ff0a7f5](https://github.com/windowkit/appkit/commit/ff0a7f57232fd3b74094d6f116f86c837dfbf734))
+
 ## [0.32.0](https://github.com/windowkit/appkit/compare/v0.31.0...v0.32.0) (2026-11-08)
 
 

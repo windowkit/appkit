@@ -736,9 +736,12 @@ needs the grant `authorizationStatus` reads, and a renderer asks for it first
   device's format nearest the size asked (a 4:2:0 YCbCr one where it has one —
   every Mac camera seen so far has only those — so nothing is converted on the
   way) at the rate asked, clamped to it; nothing asked is the largest within
-  1280x720. The session starts on a queue of its own, and `camera-started { id }`
-  or `camera-error { id, name, message }` follows — `name` is Media Capture's:
-  `NotFoundError`, `NotAllowedError`, `NotReadableError`. `layer` is an
+  1280x720. The rate is set from the format's own frame rate ranges, so the
+  fastest a format lists is asked for exactly. The session starts on a queue of
+  its own, and `camera-started { id, frameRate }` or `camera-error { id, name,
+  message }` follows — `name` is Media Capture's: `NotFoundError`,
+  `NotAllowedError`, `NotReadableError`, the last also for a configuration
+  AVFoundation would not take. `layer` is an
   `AVCaptureVideoPreviewLayer`, a handle every layer verb takes, filling its
   bounds and never mirrored; the renderer fits and flips.
 - **`native.cameraFrames(id, on)`** — while on, `camera-frame { id, width,
@@ -771,6 +774,13 @@ every output plays through it.
   `Float32Array` a channel. Nothing is dropped short of two seconds of chunks
   waiting; past that, `dropped` counts them. One input device at a time.
   **`native.closeMicrophone(id)`**.
+
+  Where voice processing will not start on an input — some Bluetooth headsets'
+  microphones — or keeps reconfiguring the device (three configuration
+  changes in five seconds), the microphone runs without it and
+  `microphone-started` says `echoCancellation: false`, until every microphone
+  closes. A microphone that was live and whose engine cannot come back after a
+  configuration change ends: `microphone-ended { id }`.
 - **`native.openAudioOutput({ sampleRate, channels, deviceId })`** → `{ id,
   sampleRate, channels }`; **`native.audioOutputWrite(id, [Float32Array, …])`**
   → frames now queued (ten seconds at most); **`native.audioOutputState(id)`**
@@ -778,6 +788,11 @@ every output plays through it.
   played since the first write, silence where the queue ran dry included;
   **`native.closeAudioOutput(id)`**. One output device for the engine: the
   first output's `deviceId` picks it.
+
+`APPKIT_DEBUG_AUDIO=1` writes what the engine does to stderr: each rebuild and
+why, whether voice processing engaged, the input's format, each start and its
+error, configuration changes, and once a second the frames the input gave and
+the chunks that went to JS.
 
 **The screen.**
 

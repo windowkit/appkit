@@ -722,9 +722,37 @@ static AVCaptureDeviceFormat* ChooseFormat(AVCaptureDevice* d, double w, double 
   return best;
 }
 
+// The frame duration `f` runs `rate` at, from the range of its own that holds
+// the rate — and at a range's ends, that range's own duration exactly. A
+// duration worked out from the rate is rounded to its timescale: 1/30 s in
+// microseconds is 33333 µs, 30.0003 frames a second, and AVFoundation throws
+// for a rate a hair past the format's fastest rather than clamping it.
+static CMTime FrameDuration(AVCaptureDeviceFormat* f, double rate) {
+  AVFrameRateRange* best = nil;
+  double nearest = INFINITY;
+  for (AVFrameRateRange* r in f.videoSupportedFrameRateRanges) {
+    double off = rate < r.minFrameRate   ? r.minFrameRate - rate
+                 : rate > r.maxFrameRate ? rate - r.maxFrameRate
+                                         : 0;
+    if (off < nearest) {
+      nearest = off;
+      best = r;
+    }
+  }
+  if (!best) return kCMTimeInvalid;
+  if (rate >= best.maxFrameRate - 1e-3) return best.minFrameDuration;
+  if (rate <= best.minFrameRate + 1e-3) return best.maxFrameDuration;
+  CMTime d = CMTimeMakeWithSeconds(1.0 / rate, 1000000);
+  if (CMTimeCompare(d, best.minFrameDuration) < 0) return best.minFrameDuration;
+  if (CMTimeCompare(d, best.maxFrameDuration) > 0) return best.maxFrameDuration;
+  return d;
+}
+
 static void CameraError(double cid, const char* name, NSString* message) {
   Send(std::move(CALEvent("camera-error").Num("id", cid).Str("name", name).Str("message", message.UTF8String)));
 }
+
+static void StartSession(CALCamera* c);
 
 // On the camera's queue: the session put together and started.
 static void StartCamera(CALCamera* c) {
@@ -752,6 +780,21 @@ static void StartCamera(CALCamera* c) {
                              }];
     return;
   }
+  // AVFoundation reports a configuration it will not take by throwing, on
+  // this queue, where nothing above would catch it and the process ends: it
+  // is the open's error instead, and the app goes on
+  @try {
+    StartSession(c);
+  } @catch (NSException* e) {
+    CameraError(cid, "NotReadableError",
+                [NSString stringWithFormat:@"the camera could not be configured: %@", e.reason ?: e.name]);
+  }
+}
+
+// On the camera's queue, allowed: the input, the output, the format and the
+// rate, then the session running.
+static void StartSession(CALCamera* c) {
+  double cid = c.cid;
   NSError* err = nil;
   AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:c.device error:&err];
   if (!input) {
@@ -778,11 +821,16 @@ static void StartCamera(CALCamera* c) {
   c.output = out;
   [s commitConfiguration];
   if ([c.device lockForConfiguration:&err]) {
-    c.device.activeFormat = c.format;
-    CMTime d = CMTimeMakeWithSeconds(1.0 / c.frameRate, 1000000);
-    c.device.activeVideoMinFrameDuration = d;
-    c.device.activeVideoMaxFrameDuration = d;
-    [c.device unlockForConfiguration];
+    @try {
+      c.device.activeFormat = c.format;
+      CMTime d = FrameDuration(c.format, c.frameRate);
+      if (CMTIME_IS_VALID(d)) {
+        c.device.activeVideoMinFrameDuration = d;
+        c.device.activeVideoMaxFrameDuration = d;
+      }
+    } @finally {
+      [c.device unlockForConfiguration];
+    }
   }
   NSNotificationCenter* nc = NSNotificationCenter.defaultCenter;
   __weak CALCamera* weak = c;
@@ -821,7 +869,9 @@ static void StartCamera(CALCamera* c) {
     CameraError(cid, "NotReadableError", @"the capture session did not start — the camera may be in use");
     return;
   }
-  Send(std::move(CALEvent("camera-started").Num("id", cid)));
+  CMTime ran = c.device.activeVideoMinFrameDuration;
+  double rate = CMTIME_IS_VALID(ran) && ran.value > 0 ? (double)ran.timescale / ran.value : c.frameRate;
+  Send(std::move(CALEvent("camera-started").Num("id", cid).Num("frameRate", rate)));
 }
 
 static Napi::Value OpenCamera(const Napi::CallbackInfo& info) {
@@ -1042,7 +1092,31 @@ static AVAudioSinkNode* gSink;
 static std::unique_ptr<Ring> gInputRing;  // the input's samples, from the render thread
 static AVAudioFormat* gInputFormat;
 static dispatch_source_t gDrain;
+// APPKIT_DEBUG_AUDIO=1: what the engine does, on stderr — its rebuilds and
+// why, voice processing engaging or not, the input's format, each start and
+// its error, configuration changes, and once a second what the input gave and
+// what reached JS. For a machine the audio cannot be watched on otherwise.
+static const bool gDebugAudio = [] {
+  const char* v = getenv("APPKIT_DEBUG_AUDIO");
+  return v && *v && strcmp(v, "0") != 0;
+}();
+#define AUDIO_LOG(...)                                         \
+  do {                                                         \
+    if (gDebugAudio) {                                         \
+      fprintf(stderr, "@windowkit/appkit audio: " __VA_ARGS__); \
+      fputc('\n', stderr);                                     \
+    }                                                          \
+  } while (0)
+static std::atomic<uint64_t> gSinkFrames{0};  // frames the input gave, from the render thread
+static uint64_t gChunksSent = 0;              // the audio queue's
+static double gLastReport = 0;
+// configuration changes lately, for the loop guard
+static std::vector<double> gChanges;
 static BOOL gVoice;
+// Voice processing would not start on this input — some Bluetooth headsets'
+// microphones, -10875 from the engine — so the microphone runs without it
+// until the input changes or every microphone closes.
+static BOOL gVoiceRefused;
 static NSString* gInputUID;
 static NSMutableDictionary<NSNumber*, CALMicrophone*>* gMics;
 static id gConfigNote;
@@ -1076,6 +1150,26 @@ static void SetUnitDevice(AudioUnit unit, NSString* uid) {
 }
 
 static void DrainInput();
+static void SafeRewire();
+static void Rewire();
+
+// The engine taken down, and what was wired to it forgotten, so the next
+// Rewire builds a new one from what is open.
+static void TearDownEngine() {
+  if (gEngine) [gEngine stop];
+  if (gConfigNote) [NSNotificationCenter.defaultCenter removeObserver:gConfigNote];
+  gConfigNote = nil;
+  if (gDrain) dispatch_source_cancel(gDrain);
+  gDrain = nil;
+  gEngine = nil;
+  gSink = nil;
+  gInputRing.reset();
+  gVoice = NO;
+  gInputUID = nil;
+  gOutputLatency = 0;
+  for (CALOutput* o in OutputsNow(nullptr)) o.node = nil;
+  for (CALMicrophone* m in gMics.allValues) m.converter = nil;
+}
 
 static void MicrophoneError(double mid, const char* name, NSString* message) {
   Send(std::move(
@@ -1095,28 +1189,21 @@ static void Rewire() {
     wantVoice = wantVoice || m.echoCancellation;
     if (!wantUID) wantUID = m.deviceUID;
   }
+  if (!wantInput) gVoiceRefused = NO;
+  wantVoice = wantVoice && !gVoiceRefused;
   NSString* outputUID = nil;
   NSArray<CALOutput*>* outputs = OutputsNow(&outputUID);
   bool wantOutputs = outputs.count > 0;
   if (!wantInput && !wantOutputs) {
-    if (gEngine) {
-      [gEngine stop];
-      if (gConfigNote) [NSNotificationCenter.defaultCenter removeObserver:gConfigNote];
-      gConfigNote = nil;
-      if (gDrain) dispatch_source_cancel(gDrain);
-      gDrain = nil;
-      gEngine = nil;
-      gSink = nil;
-      gInputRing.reset();
-      gVoice = NO;
-      gInputUID = nil;
-      gOutputLatency = 0;
-    }
+    TearDownEngine();
     return;
   }
   bool hadInput = gSink != nil;
   bool rebuild = !gEngine || hadInput != wantInput || (wantInput && gVoice != wantVoice) ||
                  (wantInput && ![wantUID ?: @"" isEqualToString:gInputUID ?: @""]);
+  AUDIO_LOG("rewire: %lu microphone(s), %lu output(s), voice wanted %d (refused %d) — %s",
+            (unsigned long)gMics.count, (unsigned long)outputs.count, wantVoice, (int)gVoiceRefused,
+            rebuild ? (gEngine ? "rebuilding the engine" : "building the engine") : "same engine");
   if (rebuild) {
     if (gEngine) [gEngine stop];
     if (gConfigNote) [NSNotificationCenter.defaultCenter removeObserver:gConfigNote];
@@ -1133,22 +1220,61 @@ static void Rewire() {
       if (wantVoice) {
         NSError* err = nil;
         gVoice = [input setVoiceProcessingEnabled:YES error:&err];
+        AUDIO_LOG("voice processing %s%s", gVoice ? "on" : "refused: ",
+                  gVoice ? "" : (err.localizedDescription ?: @"no reason").UTF8String);
       }
+      // The input's format is whatever the device and voice processing make
+      // of it: the built-in microphone array is several channels under voice
+      // processing, and no format at all where there is no input. Only the
+      // first channel is kept under voice processing — its output, the
+      // voice — and at most two otherwise: a standard format is only made
+      // for one or two channels, and a converter handed the nil one gets for
+      // more ends the process (a segfault, no exception to catch).
       AVAudioFormat* hw = [input outputFormatForBus:0];
-      gInputFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:hw.sampleRate
-                                                                    channels:hw.channelCount];
-      gInputRing = std::make_unique<Ring>(hw.channelCount, (size_t)(hw.sampleRate * 2));
+      if (!hw || hw.sampleRate <= 0 || hw.channelCount == 0) {
+        [NSException raise:NSInternalInconsistencyException
+                    format:@"the input has no audio format — is a microphone connected?"];
+      }
+      AVAudioChannelCount kept = gVoice ? 1 : MIN(hw.channelCount, (AVAudioChannelCount)2);
+      AUDIO_LOG("input: %g Hz, %u channel(s)%s, keeping %u", hw.sampleRate, hw.channelCount,
+                hw.isInterleaved ? " interleaved" : "", kept);
+      gInputFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:hw.sampleRate channels:kept];
+      if (!gInputFormat) {
+        [NSException raise:NSInternalInconsistencyException
+                    format:@"no format for the input at %g Hz", hw.sampleRate];
+      }
+      gInputRing = std::make_unique<Ring>(kept, (size_t)(hw.sampleRate * 2));
       Ring* ring = gInputRing.get();
+      // an interleaved input arrives as one buffer of every channel: its
+      // first `kept` are pulled apart here, into room made now, since the
+      // render thread allocates nothing
+      bool interleaved = hw.isInterleaved;
+      UInt32 stride = hw.channelCount;
+      auto scratch = std::make_shared<std::vector<float>>(2 * 8192);
       gSink = [[AVAudioSinkNode alloc] initWithReceiverBlock:^OSStatus(const AudioTimeStamp*, AVAudioFrameCount n,
                                                                        const AudioBufferList* in) {
-        const float* ch[16] = {nullptr};
-        UInt32 count = in->mNumberBuffers < 16 ? in->mNumberBuffers : 16;
+        const float* ch[2] = {nullptr, nullptr};
+        if (interleaved && in->mNumberBuffers >= 1) {
+          const float* all = (const float*)in->mBuffers[0].mData;
+          AVAudioFrameCount m = n < 8192 ? n : 8192;
+          for (UInt32 c = 0; c < kept; c++) {
+            float* out = scratch->data() + c * 8192;
+            for (AVAudioFrameCount i = 0; i < m; i++) out[i] = all[i * stride + c];
+            ch[c] = out;
+          }
+          ring->write(ch, m);
+          gSinkFrames.fetch_add(m, std::memory_order_relaxed);
+          return noErr;
+        }
+        UInt32 count = in->mNumberBuffers < kept ? in->mNumberBuffers : kept;
         for (UInt32 i = 0; i < count; i++) ch[i] = (const float*)in->mBuffers[i].mData;
         ring->write(ch, n);
+        gSinkFrames.fetch_add(n, std::memory_order_relaxed);
         return noErr;
       }];
       [gEngine attachNode:gSink];
-      [gEngine connect:input to:gSink format:gInputFormat];
+      // at the input's own format: the sink takes what the device gives
+      [gEngine connect:input to:gSink format:hw];
     }
     if (outputUID) SetUnitDevice(gEngine.outputNode.audioUnit, outputUID);
     gConfigNote = [NSNotificationCenter.defaultCenter
@@ -1159,14 +1285,22 @@ static void Rewire() {
                   // a device came or went under the engine: wired again, at
                   // the formats there are now
                   dispatch_async(AudioQueue(), ^{
-                    if (gEngine) {
-                      [gEngine stop];
-                      gEngine = nil;
-                      gSink = nil;
-                      for (CALOutput* o in OutputsNow(nullptr)) o.node = nil;
-                      for (CALMicrophone* m in gMics.allValues) m.converter = nil;
-                    }
-                    Rewire();
+                    // Voice processing can switch a Bluetooth headset between
+                    // its profiles, which is itself a configuration change:
+                    // rebuilt with it again, the engine changed the device
+                    // again, and a microphone never settled long enough to
+                    // give a sample while the outputs played on. Three in a
+                    // few seconds under voice processing, and it is given up
+                    // for as long as a microphone stays open.
+                    double now = CACurrentMediaTime();
+                    gChanges.push_back(now);
+                    while (!gChanges.empty() && now - gChanges.front() > 5) gChanges.erase(gChanges.begin());
+                    bool looping = gVoice && gChanges.size() >= 3;
+                    AUDIO_LOG("configuration changed under the engine (%zu in 5 s)%s", gChanges.size(),
+                              looping ? ": giving up on voice processing" : "");
+                    if (looping) gVoiceRefused = YES;
+                    TearDownEngine();
+                    SafeRewire();
                   });
                 }];
     for (CALOutput* o in outputs) o.node = nil;
@@ -1198,24 +1332,68 @@ static void Rewire() {
   }
   // microphones: a converter each, from the input's format to theirs
   for (CALMicrophone* m in gMics.allValues) {
-    if (m.converter) continue;
+    if (m.converter || !gInputFormat) continue;
     m.format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:m.sampleRate channels:m.channels];
-    m.converter = [[AVAudioConverter alloc] initFromFormat:gInputFormat toFormat:m.format];
-    if (m.channels < gInputFormat.channelCount && m.channels == 1) {
+    m.converter = m.format ? [[AVAudioConverter alloc] initFromFormat:gInputFormat toFormat:m.format] : nil;
+    if (!m.converter) {
+      [gMics removeObjectForKey:@(m.mid)];
+      MicrophoneError(m.mid, "NotReadableError",
+                      [NSString stringWithFormat:@"no conversion from the input, %u channel(s) at %g Hz, "
+                                                 @"to %u at %g Hz",
+                                                 gInputFormat.channelCount, gInputFormat.sampleRate,
+                                                 m.channels, m.sampleRate]);
+      continue;
+    }
+    if (m.channels < gInputFormat.channelCount) {
       m.converter.downmix = YES;
+    } else if (m.channels > gInputFormat.channelCount) {
+      // one channel in, two out: the voice on both sides
+      m.converter.channelMap = @[ @0, @0 ];
     }
   }
   if (!gEngine.isRunning) {
     [gEngine prepare];
     NSError* err = nil;
     if (![gEngine startAndReturnError:&err]) {
-      for (CALMicrophone* m in gMics.allValues) {
-        if (!m.started) MicrophoneError(m.mid, "NotReadableError", err.localizedDescription ?: @"the engine did not start");
+      AUDIO_LOG("engine did not start (%ld): %s%s", (long)err.code,
+                (err.localizedDescription ?: @"no reason").UTF8String,
+                gVoice ? " — trying again without voice processing" : "");
+      if (gVoice) {
+        // voice processing would not start on this input: the microphone
+        // runs without it, and microphone-started says echoCancellation false
+        gVoiceRefused = YES;
+        TearDownEngine();
+        Rewire();
+        return;
       }
+      // a microphone that would not start is not open: it fails, once, and
+      // goes — left in the list, it refused every microphone after it as
+      // "another microphone is open"
+      NSString* why = [NSString stringWithFormat:@"the audio engine did not start: %@",
+                                                 err.localizedDescription ?: @"no reason given"];
+      // and one that was live has stopped: it ends, said, rather than
+      // going quiet while its track still reads live
+      bool dropped = false;
+      for (CALMicrophone* m in gMics.allValues) {
+        [gMics removeObjectForKey:@(m.mid)];
+        if (m.started) {
+          double mid = m.mid;
+          Send(std::move(CALEvent("microphone-ended").Num("id", mid)));
+        } else {
+          MicrophoneError(m.mid, "NotReadableError", why);
+        }
+        dropped = true;
+      }
+      TearDownEngine();
+      // what is left — the outputs, the microphones already running — once
+      // more; with nothing left to drop this ends here
+      if (dropped) Rewire();
       return;
     }
   }
   gOutputLatency = gEngine.outputNode.presentationLatency;
+  AUDIO_LOG("engine running, voice processing %s, output latency %.1f ms", gVoice ? "on" : "off",
+            gOutputLatency.load() * 1000);
   if (wantInput && !gDrain) {
     gDrain = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, AudioQueue());
     dispatch_source_set_timer(gDrain, dispatch_time(DISPATCH_TIME_NOW, 0), 10 * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
@@ -1247,9 +1425,36 @@ static void Rewire() {
   }
 }
 
+// Rewire, with what AVAudioEngine throws — a connection at a format it will
+// not take, an input on a machine with none — caught on the audio queue,
+// where nothing else would, and said to every microphone still opening.
+static void SafeRewire() {
+  @try {
+    Rewire();
+  } @catch (NSException* e) {
+    NSString* why = e.reason ?: e.name;
+    for (CALMicrophone* m in gMics.allValues) {
+      if (m.started) continue;
+      [gMics removeObjectForKey:@(m.mid)];
+      MicrophoneError(m.mid, "NotReadableError",
+                      [NSString stringWithFormat:@"the audio engine could not be set up: %@", why]);
+    }
+  }
+}
+
 // Every 10 ms on the audio queue: what the input gave, converted for each
 // microphone, out in 10 ms chunks.
 static void DrainInput() {
+  if (gDebugAudio) {
+    double now = CACurrentMediaTime();
+    if (now - gLastReport >= 1) {
+      gLastReport = now;
+      AUDIO_LOG("last second: %llu frame(s) from the input, %llu chunk(s) to JS, engine %s",
+                (unsigned long long)gSinkFrames.exchange(0), (unsigned long long)gChunksSent,
+                gEngine.isRunning ? "running" : "STOPPED");
+      gChunksSent = 0;
+    }
+  }
   Ring* ring = gInputRing.get();
   if (!ring || !gInputFormat) return;
   size_t n = ring->available();
@@ -1296,6 +1501,7 @@ static void DrainInput() {
         continue;
       }
       int dropped = m->dropped.exchange(0);
+      gChunksSent++;
       auto inflight = m->inflight;
       inflight->fetch_add(1);
       double mid = m.mid, rate = m.sampleRate;
@@ -1384,12 +1590,7 @@ static Napi::Value OpenMicrophone(const Napi::CallbackInfo& info) {
       m.deviceUID = deviceUID;
       if (!gMics) gMics = [NSMutableDictionary dictionary];
       gMics[@(mid)] = m;
-      @try {
-        Rewire();
-      } @catch (NSException* e) {
-        [gMics removeObjectForKey:@(mid)];
-        MicrophoneError(mid, "NotReadableError", e.reason ?: @"the microphone could not be opened");
-      }
+      SafeRewire();
     };
     if (status == AVAuthorizationStatusNotDetermined) {
       [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
@@ -1418,7 +1619,7 @@ static Napi::Value CloseMicrophone(const Napi::CallbackInfo& info) {
   dispatch_async(AudioQueue(), ^{
     if (!gMics[@(mid)]) return;
     [gMics removeObjectForKey:@(mid)];
-    Rewire();
+    SafeRewire();
   });
   return env.Undefined();
 }
@@ -1452,11 +1653,8 @@ static Napi::Value OpenAudioOutput(const Napi::CallbackInfo& info) {
     gOutputs[@(oid)] = o;
   }
   dispatch_async(AudioQueue(), ^{
-    @try {
-      Rewire();
-    } @catch (NSException*) {
-      // an engine that would not wire plays nothing; its state says so
-    }
+    // an engine that would not wire plays nothing; its state says so
+    SafeRewire();
   });
   Napi::Object out = Napi::Object::New(env);
   out.Set("id", oid);
@@ -1527,12 +1725,21 @@ static Napi::Value CloseAudioOutput(const Napi::CallbackInfo& info) {
   }
   if (!o) return env.Undefined();
   dispatch_async(AudioQueue(), ^{
-    if (o.node && gEngine) {
-      [gEngine disconnectNodeOutput:o.node];
-      [gEngine detachNode:o.node];
+    // The node is this engine's only while the engine it was attached to is
+    // the one running. One rebuilt since — a device change, a headset
+    // switching profiles — took it down with it, and it was off the list by
+    // then so nothing let go of it; asking the new engine to disconnect it
+    // throws, on this queue, and ended the process.
+    @try {
+      if (o.node && gEngine && [gEngine.attachedNodes containsObject:o.node]) {
+        [gEngine disconnectNodeOutput:o.node];
+        [gEngine detachNode:o.node];
+      }
+    } @catch (NSException*) {
+      // gone already, which is what this was for
     }
     o.node = nil;
-    Rewire();
+    SafeRewire();
   });
   return env.Undefined();
 }

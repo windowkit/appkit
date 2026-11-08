@@ -1915,6 +1915,11 @@ static Napi::Value CaptureScreenshot(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+// systemaudio.mm's taps are captures too: their ids come from the same count,
+// so an event's id names one thing, and they cross to JS the same way.
+double CALNextCaptureId() { return (double)(++gNextCapture); }
+bool CALCaptureDeliver(dispatch_block_t block) { return Deliver(block); }
+
 void InitCapture(Napi::Env env, Napi::Object exports) {
   // The delivery function is the main thread's, made the once, for the
   // reason InitNotifications gives: pump mode's listener is called there.

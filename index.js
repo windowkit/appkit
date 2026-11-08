@@ -188,7 +188,8 @@ const controls = {
 };
 
 // Privacy (TCC) authorizations. kind: 'camera' | 'microphone' |
-// 'screen-recording' | 'accessibility' | 'input-monitoring' | 'location' |
+// 'screen-recording' | 'system-audio-recording' | 'accessibility' |
+// 'input-monitoring' | 'location' |
 // 'automation' (with { target: bundleId }) | 'calendars' | 'reminders'
 // (EventKit; calendars takes { access: 'full' | 'write-only' }, full by
 // default). Status and request never touch policy: the renderer decides when
@@ -197,7 +198,9 @@ const permissions = {
   // -> 'authorized' | 'denied' | 'restricted' | 'notDetermined', or
   // 'writeOnly' for calendars and reminders on macOS 14+: the app may save
   // items it cannot read, which is granted to a writer and denied to a reader
-  // — the word crosses as it is so the caller can decide. Never prompts.
+  // — the word crosses as it is so the caller can decide; and 'unknown' for
+  // system-audio-recording where nothing can read it (before macOS 14.2, or a
+  // TCC without the calls). Never prompts.
   status: (kind, opts) => native.authorizationStatus(kind, opts),
   // Raises the system prompt where macOS has one; resolves to granted — the
   // level asked for is held afterwards (for calendars with

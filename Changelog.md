@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.32.0](https://github.com/windowkit/appkit/compare/v0.31.0...v0.32.0) (2026-11-08)
+
+
+### Features
+
+* system audio — CoreAudio process taps of every app but this one or of one application, the processes that play listed, and the System Audio Recording permission ([#134](https://github.com/windowkit/appkit/issues/134)) ([f1edad8](https://github.com/windowkit/appkit/commit/f1edad8ad8da6a5c4dcaeecc1f060c8a34ae00fc))
+
+
+### Bug Fixes
+
+* a camera at 30 frames a second and an echo-cancelled microphone open, where each ended the process ([#132](https://github.com/windowkit/appkit/issues/132)) ([4d5f97f](https://github.com/windowkit/appkit/commit/4d5f97fd738072ae597eacee8859adaad917e181))
+
 ## [0.31.0](https://github.com/windowkit/appkit/compare/v0.30.2...v0.31.0) (2026-11-08)
 
 

@@ -810,13 +810,56 @@ the chunks that went to JS.
   `'none'` keeps the window out of every screenshot and recording, this app's
   own included. On macOS 15 such a window comes back with every pixel clear.
 
+**Other applications' sound** — CoreAudio's process taps, macOS 14.2 (these
+three verbs are not exported before it, which is how a renderer tells). A tap
+is private to this process, sits in an aggregate device of its own with
+nothing else in it — no output device beside it, whose input streams would be
+opened too: a headset's microphone, a Bluetooth headset switched into its call
+profile by that — and leaves what it taps audible.
+
+- **`native.audioProcesses()`** → `[{ pid, bundleId, name, playing, app? }]`,
+  or **`native.audioProcesses(cb)`** from a queue of its own: every process
+  connected to the audio server, not only the ones playing. `playing` is
+  whether it has output running now. `app` is the outermost application bundle
+  its executable sits in, `{ bundleId, name, regular }` (`regular`: it has a
+  Dock icon) — a browser's renderers and an Electron app's helpers play under
+  helper bundle ids of their own, `com.google.Chrome.helper`, and `app` is
+  what a person would call them. A tool in no bundle (`afplay`) has an empty
+  `bundleId` and no `app`.
+- Event **`audio-processes`** whenever a process connects or goes, or starts or
+  stops playing — from the first listing on.
+- **`native.openSystemAudio({ pid?, bundleId?, exclude?, sampleRate, channels
+  })`** → `{ id, sampleRate, channels }`. With neither `pid` nor `bundleId`, every
+  process but this one and the pids in `exclude`; with `pid`, that process;
+  with `bundleId`, every process whose own bundle id or `app` is that one. A
+  bundle id's tap follows the application — a helper that starts later joins
+  it, an application that is not running is silence until it is — and the tap
+  of everything leaves this process out once it has connected.
+  `system-audio-started { id, sampleRate, channels, latency }` or
+  `system-audio-error { id, name, message }` answers it: `NotFoundError` for a
+  pid with no audio (said before anything is asked of the user),
+  `NotAllowedError`, `NotReadableError` for CoreAudio saying no. Then
+  `audio-input` every 10 ms, a microphone's event exactly — resampled and
+  mixed to what was asked, silence included while nothing plays, nothing
+  dropped short of two seconds waiting — and `system-audio-ended { id }` when
+  the one process tapped has gone. **`native.closeSystemAudio(id)`**.
+
+The grant is System Audio Recording (`authorizationStatus('system-audio-recording')`,
+below), and a tap without it is no error: it delivers silence. So an open reads
+the status first, refuses a denial by name and asks where nobody has been
+asked, before the tap is made.
+
 `test/capture.js` lists the devices both ways, opens a camera and a microphone
 that are not there (refused by name, nothing prompted), plays 0.2 s through an
 output on the device's clock, and — where Screen Recording is allowed — reads a
 red window back as red and an excluded one as clear. A camera and a microphone
 that this process may use are opened and read from; where it may not they are
 skipped, never prompted. `test/capture-threaded.js` does the same from a
-worker.
+worker. `test/system-audio.js` lists the processes both ways, plays a file of
+silence through `afplay` and sees it announced coming and going, refuses a
+process with no audio, and — only where System Audio Recording is allowed —
+taps everything and one process; `test/system-audio-threaded.js` lists and
+refuses from a worker.
 
 ## Text: at a display's scale
 
@@ -1277,6 +1320,7 @@ native.openPrivacySettings(kind?);                                // no kind: th
 | ------------------------ | ---------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `camera`, `microphone`   | `AVCaptureDevice authorizationStatusForMediaType:` | `requestAccessForMediaType:`           | all four statuses; the prompt is in-process and the answer arrives when the user clicks                                                                            |
 | `screen-recording`       | `CGPreflightScreenCaptureAccess`               | `CGRequestScreenCaptureAccess`             | a bool, so never `notDetermined`; the "prompt" is the system's go-to-Settings dialog (shown once) and the request resolves at once. A new grant needs a process restart |
+| `system-audio-recording` | `TCCAccessPreflight` for `kTCCServiceAudioCapture` | `TCCAccessRequest`                     | macOS 14.2, for `openSystemAudio`. There is no public call to read or ask for this one, so TCC's own pair is found at run time; where it is not there — and before 14.2 — the status is `unknown` and a tap's first read is the prompt. A refusal is not an error from a tap but silence, which is why the status is worth reading. The bundle's key is `NSAudioCaptureUsageDescription`; Settings › Privacy & Security › Screen & System Audio Recording holds the switch (`Privacy_AudioCapture`) |
 | `accessibility`          | `AXIsProcessTrusted`                           | `AXIsProcessTrustedWithOptions` + prompt   | a bool, so never `notDetermined`; go-to-Settings dialog, resolves at once, the grant applies live                                                                   |
 | `input-monitoring`       | `IOHIDCheckAccess` (listen)                    | `IOHIDRequestAccess`                       | granted / denied / unknown → `notDetermined`; the request posts the prompt and resolves at once, `notDetermined` while it is still up                              |
 | `automation`             | `AEDeterminePermissionToAutomateTarget`        | the same, asking                           | needs `{ target: bundleId }` of a **running** app, otherwise throws — TCC only answers for a running target. Asking blocks until answered, so it runs off the main thread |
@@ -1289,7 +1333,8 @@ native.openPrivacySettings(kind?);                                // no kind: th
   process* (Terminal, an IDE) or to `node` itself, and prompts with no
   usage-description strings. A bundled app must carry the keys
   (`NSCameraUsageDescription`, `NSMicrophoneUsageDescription`,
-  `NSLocationUsageDescription`, `NSAppleEventsUsageDescription`; for
+  `NSAudioCaptureUsageDescription`, `NSLocationUsageDescription`,
+  `NSAppleEventsUsageDescription`; for
   EventKit on macOS 14+ `NSCalendarsFullAccessUsageDescription`,
   `NSCalendarsWriteOnlyAccessUsageDescription` and
   `NSRemindersFullAccessUsageDescription`, and before 14

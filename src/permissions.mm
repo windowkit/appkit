@@ -11,6 +11,11 @@
 //                        thread-safe function
 //   screen-recording     CGPreflightScreenCaptureAccess /
 //                        CGRequestScreenCaptureAccess
+//   system-audio-recording
+//                        TCC's own TCCAccessPreflight / TCCAccessRequest for
+//                        kTCCServiceAudioCapture (macOS 14.2: a tap of other
+//                        processes' sound, systemaudio.mm), which has no
+//                        public call to read or to ask — found at run time
 //   accessibility        AXIsProcessTrusted / AXIsProcessTrustedWithOptions
 //                        with the prompt option
 //   input-monitoring     IOHIDCheckAccess / IOHIDRequestAccess (listen)
@@ -31,7 +36,9 @@
 // Every status that crosses to JS is one of 'authorized' | 'denied' |
 // 'restricted' | 'notDetermined' — plus 'writeOnly', which only calendars
 // and reminders can answer: macOS 14's partial grant (the app may save items
-// it cannot read back). It crosses as its own word rather than as either
+// it cannot read back), and 'unknown', which only system-audio-recording
+// answers, where there is nothing to read it with: before macOS 14.2, or a
+// TCC without the calls. It crosses as its own word rather than as either
 // side, because whether it counts as granted depends on what the consumer
 // wanted to do — a writer has what it needs, a reader does not — and that is
 // the renderer's decision. Screen recording and accessibility only ever
@@ -45,6 +52,7 @@
 // inside the requesting call — and a pending request holds the event loop
 // open like pending I/O until the user has answered.
 
+#include <dlfcn.h>
 #include <napi.h>
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
@@ -68,11 +76,13 @@ static const char* const kDenied = "denied";
 static const char* const kRestricted = "restricted";
 static const char* const kNotDetermined = "notDetermined";
 static const char* const kWriteOnly = "writeOnly";
+static const char* const kUnknown = "unknown";
 
 enum class Kind {
   Camera,
   Microphone,
   ScreenRecording,
+  SystemAudioRecording,
   Accessibility,
   InputMonitoring,
   Automation,
@@ -82,13 +92,15 @@ enum class Kind {
 };
 
 static const char* const kKindNames =
-    "camera, microphone, screen-recording, accessibility, input-monitoring, "
-    "automation, location, calendars, reminders";
+    "camera, microphone, screen-recording, system-audio-recording, "
+    "accessibility, input-monitoring, automation, location, calendars, "
+    "reminders";
 
 static bool ParseKind(const std::string& s, Kind* out) {
   if (s == "camera") *out = Kind::Camera;
   else if (s == "microphone") *out = Kind::Microphone;
   else if (s == "screen-recording") *out = Kind::ScreenRecording;
+  else if (s == "system-audio-recording") *out = Kind::SystemAudioRecording;
   else if (s == "accessibility") *out = Kind::Accessibility;
   else if (s == "input-monitoring") *out = Kind::InputMonitoring;
   else if (s == "automation") *out = Kind::Automation;
@@ -254,6 +266,48 @@ EKEventStore* CALEventStore() {
 // mapping stays here, in the one place that knows it.
 const char* CALEventsAuthorizationStatus() { return EKStatus(EKEntityTypeEvent); }
 
+// System Audio Recording has no public call to read it or to ask for it: the
+// first read of a tap raises the prompt, and a refusal is not an error but a
+// tap that delivers silence — a recording of nothing, for as long as anyone
+// lets it run. So it is read and asked through TCC's own TCCAccessPreflight
+// and TCCAccessRequest, private, the pair every recorder of other apps' sound
+// uses, found at run time: nothing links against them, and where they are not
+// there the status is 'unknown' and the tap's own prompt is the only one.
+// Preflight answers 0 for a grant, 1 for a refusal and 2 for not asked yet.
+// Exported for systemaudio.mm, which reads it before it makes a tap.
+static void* TCCSymbol(const char* name) {
+  static void* handle =
+      dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_LAZY | RTLD_LOCAL);
+  return handle ? dlsym(handle, name) : nullptr;
+}
+
+static const CFStringRef kAudioCaptureService = CFSTR("kTCCServiceAudioCapture");
+
+const char* CALAudioCaptureStatus() {
+  if (@available(macOS 14.2, *)) {
+    auto preflight = (int (*)(CFStringRef, CFDictionaryRef))TCCSymbol("TCCAccessPreflight");
+    if (!preflight) return kUnknown;
+    switch (preflight(kAudioCaptureService, nullptr)) {
+      case 0: return kAuthorized;
+      case 1: return kDenied;
+      case 2: return kNotDetermined;
+      default: return kUnknown;
+    }
+  }
+  return kUnknown;
+}
+
+// The prompt where nobody has been asked, then `done` on any thread; at once
+// where the status is decided or cannot be read.
+void CALAudioCaptureRequest(void (^done)(void)) {
+  auto request = (void (*)(CFStringRef, CFDictionaryRef, void (^)(Boolean)))TCCSymbol("TCCAccessRequest");
+  if (!request || CALAudioCaptureStatus() != kNotDetermined) {
+    done();
+    return;
+  }
+  request(kAudioCaptureService, nullptr, ^(Boolean) { done(); });
+}
+
 // TCC's answer for sending Apple Events to `bundleId`. With `ask`, the call
 // blocks while the consent dialog is up. procNotFound means the target is
 // not running — TCC only answers for a running target, so the caller turns
@@ -379,6 +433,7 @@ static Napi::Value AuthorizationStatus(const Napi::CallbackInfo& info) {
       case Kind::ScreenRecording:
         s = CGPreflightScreenCaptureAccess() ? kAuthorized : kDenied;
         break;
+      case Kind::SystemAudioRecording: s = CALAudioCaptureStatus(); break;
       case Kind::Accessibility:
         s = AXIsProcessTrusted() ? kAuthorized : kDenied;
         break;
@@ -436,6 +491,11 @@ static Napi::Value RequestAuthorization(const Napi::CallbackInfo& info) {
         // returns the current grant either way
         Answer(tsfn, CGRequestScreenCaptureAccess() ? kAuthorized : kDenied);
         break;
+      case Kind::SystemAudioRecording: {
+        // the prompt where nobody was asked, the status after it either way
+        CALAudioCaptureRequest(^{ Answer(tsfn, CALAudioCaptureStatus()); });
+        break;
+      }
       case Kind::Accessibility: {
         NSDictionary* opts =
             @{(__bridge NSString*)kAXTrustedCheckOptionPrompt : @YES};
@@ -519,6 +579,7 @@ static Napi::Value OpenPrivacySettings(const Napi::CallbackInfo& info) {
   else if (kind == "camera") anchor = "Privacy_Camera";
   else if (kind == "microphone") anchor = "Privacy_Microphone";
   else if (kind == "screen-recording") anchor = "Privacy_ScreenCapture";
+  else if (kind == "system-audio-recording") anchor = "Privacy_AudioCapture";
   else if (kind == "accessibility") anchor = "Privacy_Accessibility";
   else if (kind == "input-monitoring") anchor = "Privacy_ListenEvent";
   else if (kind == "automation") anchor = "Privacy_Automation";

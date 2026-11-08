@@ -1871,6 +1871,7 @@ void InitPlayer(Napi::Env env, Napi::Object exports);
 // src/capture.mm — cameras, microphones, speakers and an audio out on one
 // voice-processing engine, and ScreenCaptureKit's screenshots.
 void InitCapture(Napi::Env env, Napi::Object exports);
+void InitSystemAudio(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1920,6 +1921,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitVideo(env, exports);
   InitPlayer(env, exports);
   InitCapture(env, exports);
+  InitSystemAudio(env, exports);
   return exports;
 }
 

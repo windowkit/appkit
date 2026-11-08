@@ -13,7 +13,8 @@
         "src/video.mm",
         "src/player.mm",
         "src/capture.mm",
-        "src/systemaudio.mm"
+        "src/systemaudio.mm",
+        "src/displaystream.mm"
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")"

@@ -1872,6 +1872,8 @@ void InitPlayer(Napi::Env env, Napi::Object exports);
 // voice-processing engine, and ScreenCaptureKit's screenshots.
 void InitCapture(Napi::Env env, Napi::Object exports);
 void InitSystemAudio(Napi::Env env, Napi::Object exports);
+// src/displaystream.mm — a display or a window as ScreenCaptureKit's stream.
+void InitDisplayStream(Napi::Env env, Napi::Object exports);
 
 static Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #define FN(js, fn) exports.Set(js, Napi::Function::New(env, fn))
@@ -1922,6 +1924,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   InitPlayer(env, exports);
   InitCapture(env, exports);
   InitSystemAudio(env, exports);
+  InitDisplayStream(env, exports);
   return exports;
 }
 

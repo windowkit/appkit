@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.33.1](https://github.com/windowkit/appkit/compare/v0.33.0...v0.33.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* a window resized under a still pointer tells no mouseleave and mouseenter at each step, its view's tracking area made once ([#137](https://github.com/windowkit/appkit/issues/137)) ([d1a8b09](https://github.com/windowkit/appkit/commit/d1a8b091a1c23ab2a23699bd8ad532379de2e2cf))
+
 ## [0.33.0](https://github.com/windowkit/appkit/compare/v0.32.0...v0.33.0) (2026-11-08)
 
 

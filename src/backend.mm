@@ -913,9 +913,14 @@ static char kDelegateKey;
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)isFlipped { return YES; }
 - (void)keyDown:(NSEvent*)event { (void)event; }  // no beep; JS observes keys
+// AppKit asks again at every change of the view's geometry, which is every
+// step of a live resize. An area of `NSTrackingInVisibleRect` follows the
+// visible rect by itself, so it is made once: made again, each step crossed
+// the pointer out of the view and back in, which a window answers as a leave
+// and an enter where the pointer never moved.
 - (void)updateTrackingAreas {
   [super updateTrackingAreas];
-  if (tracking_) [self removeTrackingArea:tracking_];
+  if (tracking_) return;
   tracking_ = [[NSTrackingArea alloc]
       initWithRect:NSZeroRect
            options:(NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved |

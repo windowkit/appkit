@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.0](https://github.com/windowkit/appkit/compare/v0.33.1...v0.34.0) (2026-11-10)
+
+
+### Features
+
+* ctxDrawSurfaceFiltered, a surface drawn through a CSS filter list by vImage ([#139](https://github.com/windowkit/appkit/issues/139)) ([f5a12f3](https://github.com/windowkit/appkit/commit/f5a12f35b60647af120921088d1b2ee6b069b077))
+
 ## [0.33.1](https://github.com/windowkit/appkit/compare/v0.33.0...v0.33.1) (2026-11-09)
 
 

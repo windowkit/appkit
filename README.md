@@ -605,6 +605,28 @@ native.ctxSetGlobalAlpha(win, 0.6);
 native.ctxDrawSurfaceFaded(win, card, 0, 0, 556, 300, 100, 100, 556, 300, 0.6);
 ```
 
+- **`native.ctxDrawSurfaceFiltered(dst, src, sx, sy, sw, sh, dx, dy, dw, dh, filter)`** —
+  `ctxDrawSurface` through a CSS filter list, canvas's `filter`: `filter` is
+  `{ matrices, alpha, blur }`, the colour functions in the order written (each twelve
+  numbers, three rows of red, green and blue weights and an offset over straight colour
+  in 0–1, clamped to 0–1 before the next), what alpha is multiplied by, and the standard
+  deviation of a Gaussian blur in source pixels. The blur is of premultiplied colour with
+  nothing past the source rect, so the drawing reaches three deviations past the
+  destination rect. Run by vImage on the calling thread, and drawn under the
+  destination's state as `ctxDrawSurface` draws: a 1281x961 surface in 2.6ms through a
+  colour function and 3.9ms through a blur on an M1 Pro, where reading the pixels back and
+  filtering them in JavaScript took 15. Answers true where it drew and false where there
+  was nothing to draw, so a caller can feature-detect the verb and keep its own path.
+
+```js
+const grayscale = [0.2126, 0.7152, 0.0722, 0, 0.2126, 0.7152, 0.0722, 0, 0.2126, 0.7152, 0.0722, 0];
+native.ctxDrawSurfaceFiltered(win, card, 0, 0, 556, 300, 100, 100, 556, 300, {
+  matrices: [grayscale],
+  alpha: 1,
+  blur: 3,
+});
+```
+
 - **`native.ctxSetImageSmoothing(surface, quality)`** — how an image or a surface drawn
   scaled or turned is resampled: `'none'` (the nearest pixel), `'low'`, `'medium'` or
   `'high'`, the 2D canvas's `imageSmoothingEnabled` and `imageSmoothingQuality`. It is

@@ -29,6 +29,7 @@
         "libraries": [
           "-framework Cocoa",
           "-framework QuartzCore",
+          "-framework Accelerate",
           "-framework CoreText",
           "-framework CoreGraphics",
           "-framework ImageIO",
